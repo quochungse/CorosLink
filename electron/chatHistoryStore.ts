@@ -1002,13 +1002,18 @@ export function saveChatSession(
     row.title === DEFAULT_SESSION_TITLE
       ? deriveSessionTitleFromEntries(normalizedEntries)
       : row.title;
+  const messagesJson = JSON.stringify(normalizedEntries);
+
+  // Opening a conversation replays its transcript back through this path, so
+  // without this guard simply reading a chat would give it a fresh updatedAt
+  // and jump it to the top of the sidebar. Both sides are normalized before
+  // serializing, so the comparison sees canonical key order.
+  if (messagesJson === row.messages_json && title === row.title) {
+    return toSessionSummary(row);
+  }
+
   const updatedAt = new Date().toISOString();
-  database.updateSession(
-    id,
-    title,
-    JSON.stringify(normalizedEntries),
-    updatedAt
-  );
+  database.updateSession(id, title, messagesJson, updatedAt);
   const nextRow = database.getSession(id);
   return nextRow ? toSessionSummary(nextRow) : null;
 }

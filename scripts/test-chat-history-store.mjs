@@ -328,6 +328,46 @@ assert.equal(setChatSessionPinned("missing-session", true, db), null);
 
 deleteChatSession(pinTarget.id, db);
 
+// Opening a conversation replays its stored transcript back through
+// saveChatSession; that must not count as a change and reorder the sidebar.
+const replayTarget = createChatSession("chatgpt", db);
+saveChatSession(
+  replayTarget.id,
+  [{ kind: "message", role: "user", content: "Replay me" }],
+  db
+);
+const storedRow = db.getSession(replayTarget.id);
+const backdated = "2020-01-01T00:00:00.000Z";
+db.updateSession(
+  replayTarget.id,
+  storedRow.title,
+  storedRow.messages_json,
+  backdated
+);
+
+const replayed = saveChatSession(
+  replayTarget.id,
+  getChatSession(replayTarget.id, db),
+  db
+);
+assert.equal(replayed.updatedAt, backdated);
+assert.equal(replayed.title, storedRow.title);
+assert.equal(replayed.messageCount, 1);
+
+// A genuine edit still writes.
+const appended = saveChatSession(
+  replayTarget.id,
+  [
+    ...getChatSession(replayTarget.id, db),
+    { kind: "message", role: "assistant", content: "Sure thing." }
+  ],
+  db
+);
+assert.notEqual(appended.updatedAt, backdated);
+assert.equal(appended.messageCount, 2);
+
+deleteChatSession(replayTarget.id, db);
+
 const claude = createChatSession("claude-code", db);
 saveChatSession(
   claude.id,
