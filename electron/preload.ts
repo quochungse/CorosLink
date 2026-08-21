@@ -85,6 +85,8 @@ import type {
   YouTubeMusicLibrary,
   YouTubeMusicStatus,
   YouTubeMusicSyncResult,
+  AnthropicApiConfig,
+  AnthropicApiConnectionTest,
   AppleMusicPlaylist,
   AppleMusicStatus,
   ApplePodcastShow,
@@ -912,6 +914,12 @@ const api = {
     config?: LocalChatConfig
   ): Promise<LocalChatConnectionTest> =>
     ipcRenderer.invoke("chat:testLocalConnection", config),
+  testAnthropicConnection: (
+    config?: Partial<AnthropicApiConfig>
+  ): Promise<AnthropicApiConnectionTest> =>
+    ipcRenderer.invoke("chat:testAnthropicConnection", config),
+  openAnthropicKeyGuide: (): Promise<void> =>
+    ipcRenderer.invoke("chat:openAnthropicKeyGuide"),
   detectLocalChatServers: (apiKey?: string): Promise<LocalChatDiscovery> =>
     ipcRenderer.invoke("chat:detectLocalServers", apiKey),
   testOpenRouterConnection: (

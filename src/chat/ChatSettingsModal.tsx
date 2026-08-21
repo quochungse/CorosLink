@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { Settings2, X } from "lucide-react";
 import type {
+  AnthropicApiConnectionTest,
   ChatAuthStatus,
   ChatSettings,
   ClaudeCodeStatus,
@@ -47,6 +48,15 @@ export function ChatSettingsModal({
   onClearOpenRouterApiKey,
   onOpenOpenRouterKeys,
   onOpenOpenRouterModels,
+  anthropicApiKey,
+  anthropicConnection,
+  testingAnthropic,
+  onAnthropicApiKeyChange,
+  onUpdateAnthropic,
+  onTestAnthropicConnection,
+  onSaveAnthropicSettings,
+  onClearAnthropicApiKey,
+  onOpenAnthropicKeyGuide,
   onLocalApiKeyChange,
   onUpdateLocalDraft,
   onDetectLocalServers,
@@ -95,6 +105,15 @@ export function ChatSettingsModal({
   onClearOpenRouterApiKey: () => void;
   onOpenOpenRouterKeys: () => void;
   onOpenOpenRouterModels: () => void;
+  anthropicApiKey: string;
+  anthropicConnection: AnthropicApiConnectionTest | null;
+  testingAnthropic: boolean;
+  onAnthropicApiKeyChange: (value: string) => void;
+  onUpdateAnthropic: (patch: Partial<ChatSettings["anthropic"]>) => void;
+  onTestAnthropicConnection: () => void;
+  onSaveAnthropicSettings: () => void;
+  onClearAnthropicApiKey: () => void;
+  onOpenAnthropicKeyGuide: () => void;
   onLocalApiKeyChange: (value: string) => void;
   onUpdateLocalDraft: (patch: Partial<ChatSettings["local"]>) => void;
   onDetectLocalServers: () => void;
@@ -184,6 +203,15 @@ export function ChatSettingsModal({
             onClearOpenRouterApiKey={onClearOpenRouterApiKey}
             onOpenOpenRouterKeys={onOpenOpenRouterKeys}
             onOpenOpenRouterModels={onOpenOpenRouterModels}
+            anthropicApiKey={anthropicApiKey}
+            anthropicConnection={anthropicConnection}
+            testingAnthropic={testingAnthropic}
+            onAnthropicApiKeyChange={onAnthropicApiKeyChange}
+            onUpdateAnthropic={onUpdateAnthropic}
+            onTestAnthropicConnection={onTestAnthropicConnection}
+            onSaveAnthropicSettings={onSaveAnthropicSettings}
+            onClearAnthropicApiKey={onClearAnthropicApiKey}
+            onOpenAnthropicKeyGuide={onOpenAnthropicKeyGuide}
             onLocalApiKeyChange={onLocalApiKeyChange}
             onUpdateLocalDraft={onUpdateLocalDraft}
             onDetectLocalServers={onDetectLocalServers}

@@ -2359,7 +2359,12 @@ export interface CoachInputPrompt {
   answeredAt?: number;
 }
 
-export type ChatProvider = "chatgpt" | "claude-code" | "openrouter" | "local";
+export type ChatProvider =
+  | "chatgpt"
+  | "claude-api"
+  | "claude-code"
+  | "openrouter"
+  | "local";
 
 export type ClaudeCodeConnectionState =
   | "not-installed"
@@ -2403,6 +2408,29 @@ export interface ClaudeCodeConnectionTest {
   ok: boolean;
   status: ClaudeCodeStatus;
   message: string;
+}
+
+/** Reasoning effort forwarded as output_config.effort on the Messages API. */
+export type AnthropicEffort = "low" | "medium" | "high" | "xhigh" | "max";
+
+/** Direct Claude access with the athlete's own Anthropic API key. */
+export interface AnthropicApiConfig {
+  /** Messages API model id, e.g. claude-opus-5. */
+  model: string;
+  effort: AnthropicEffort;
+  /** True when an encrypted key is stored; key material is never returned. */
+  hasApiKey: boolean;
+  /** Only read when saving or testing settings; never returned by get. */
+  apiKey?: string;
+  /** Set true when saving to remove any stored key. */
+  clearApiKey?: boolean;
+}
+
+export interface AnthropicApiConnectionTest {
+  ok: boolean;
+  message: string;
+  /** Model id the key was verified against. */
+  model?: string;
 }
 
 export interface LocalChatConfig {
@@ -2455,6 +2483,7 @@ export const MAX_CUSTOM_COACH_INSTRUCTIONS = 4000;
 export interface ChatSettings {
   provider: ChatProvider;
   chatgpt: ChatGptConfig;
+  anthropic: AnthropicApiConfig;
   claudeCode: ClaudeCodeConfig;
   openRouter: OpenRouterConfig;
   local: LocalChatConfig;

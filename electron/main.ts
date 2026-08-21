@@ -311,6 +311,7 @@ import {
   saveChatSettings,
   streamChat,
   testClaudeCodeConnection,
+  testAnthropicApiConnection,
   testLocalChatConnection,
   testOpenRouterConnection,
   uploadTrainingPlanDraft,
@@ -349,6 +350,7 @@ import {
 import { getTrainingDailyHealthData } from "./dailyHealthDataService";
 import { getTrainingSleepData } from "./sleepDataService";
 import type {
+  AnthropicApiConfig,
   ChatMessage,
   ChatProvider,
   ChatSettings,
@@ -1310,6 +1312,16 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle("chat:testLocalConnection", (_event, config?: LocalChatConfig) =>
     testLocalChatConnection(config)
+  );
+
+  ipcMain.handle(
+    "chat:testAnthropicConnection",
+    (_event, config?: Partial<AnthropicApiConfig>) =>
+      testAnthropicApiConnection(config)
+  );
+
+  ipcMain.handle("chat:openAnthropicKeyGuide", () =>
+    shell.openExternal("https://console.anthropic.com/settings/keys")
   );
 
   ipcMain.handle("chat:detectLocalServers", (_event, apiKey?: string) =>

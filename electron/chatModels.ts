@@ -12,6 +12,16 @@ export const CHATGPT_MODEL_OPTIONS: ChatModelOption[] = [
   { value: "gpt-5.4", label: "GPT-5.4" }
 ];
 
+/** Default Messages API model for the direct Claude (API key) provider. */
+export const DEFAULT_ANTHROPIC_MODEL = "claude-opus-5";
+
+export const ANTHROPIC_MODEL_OPTIONS: ChatModelOption[] = [
+  { value: "claude-opus-5", label: "Claude Opus 5" },
+  { value: "claude-fable-5", label: "Claude Fable 5 (most capable)" },
+  { value: "claude-sonnet-5", label: "Claude Sonnet 5" },
+  { value: "claude-haiku-4-5", label: "Claude Haiku 4.5 (fastest)" }
+];
+
 export const CLAUDE_MODEL_OPTIONS: ChatModelOption[] = [
   { value: "", label: "Account default" },
   { value: "opus", label: "Claude Opus" },
@@ -52,5 +62,6 @@ export function getChatGptModelCandidates(
 export function getChatModelOptions(provider: string): ChatModelOption[] {
   if (provider === "claude-code") return CLAUDE_MODEL_OPTIONS;
   if (provider === "openrouter") return OPENROUTER_MODEL_OPTIONS;
+  if (provider === "claude-api") return ANTHROPIC_MODEL_OPTIONS;
   return CHATGPT_MODEL_OPTIONS;
 }

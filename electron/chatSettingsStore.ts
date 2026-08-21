@@ -1,16 +1,23 @@
-import type { ChatProvider, ChatSettings } from "./types";
+import type { AnthropicEffort, ChatProvider, ChatSettings } from "./types";
 import { MAX_CUSTOM_COACH_INSTRUCTIONS } from "./types";
 import {
   DEFAULT_LOCAL_CHAT_BASE_URL,
   normalizeLocalChatBaseUrl
 } from "./localChatProvider";
 import { DEFAULT_OPENROUTER_MODEL } from "./openRouterProvider";
+import {
+  DEFAULT_ANTHROPIC_EFFORT,
+  DEFAULT_ANTHROPIC_MODEL
+} from "./anthropicChatProvider";
 
 export const CHAT_SETTINGS_KEYS = {
   provider: "chat.provider",
   chatgptModel: "chat.chatgpt.model",
   openRouterModel: "chat.openRouter.model",
   openRouterApiKey: "chat.openRouter.apiKey",
+  anthropicModel: "chat.anthropic.model",
+  anthropicEffort: "chat.anthropic.effort",
+  anthropicApiKey: "chat.anthropic.apiKey",
   claudeExecutablePath: "chat.claudeCode.executablePath",
   claudeModel: "chat.claudeCode.model",
   claudeLastConnectionStatus: "chat.claudeCode.lastConnectionStatus",
@@ -41,10 +48,20 @@ export interface ChatApiKeyStore {
   clearApiKey(): void;
 }
 
+/** One encrypted key store per provider that needs a bring-your-own-key secret. */
+export interface ChatApiKeyStores {
+  local: ChatApiKeyStore;
+  anthropic: ChatApiKeyStore;
+  openRouter: ChatApiKeyStore;
+}
+
 export function readChatSettingsFromStore(
   store: ChatSettingsStore,
-  localApiKeyStore: Pick<ChatApiKeyStore, "hasApiKey">,
-  openRouterApiKeyStore: Pick<ChatApiKeyStore, "hasApiKey">
+  apiKeyStores: {
+    local: Pick<ChatApiKeyStore, "hasApiKey">;
+    anthropic: Pick<ChatApiKeyStore, "hasApiKey">;
+    openRouter: Pick<ChatApiKeyStore, "hasApiKey">;
+  }
 ): ChatSettings {
   return {
     provider: normalizeProvider(store.get(CHAT_SETTINGS_KEYS.provider)),
@@ -55,7 +72,15 @@ export function readChatSettingsFromStore(
       model:
         store.get(CHAT_SETTINGS_KEYS.openRouterModel) ??
         DEFAULT_OPENROUTER_MODEL,
-      hasApiKey: openRouterApiKeyStore.hasApiKey()
+      hasApiKey: apiKeyStores.openRouter.hasApiKey()
+    },
+    anthropic: {
+      model:
+        store.get(CHAT_SETTINGS_KEYS.anthropicModel) || DEFAULT_ANTHROPIC_MODEL,
+      effort: normalizeAnthropicEffort(
+        store.get(CHAT_SETTINGS_KEYS.anthropicEffort)
+      ),
+      hasApiKey: apiKeyStores.anthropic.hasApiKey()
     },
     claudeCode: {
       executablePath:
@@ -83,7 +108,7 @@ export function readChatSettingsFromStore(
       baseUrl:
         store.get(CHAT_SETTINGS_KEYS.localBaseUrl) ?? DEFAULT_LOCAL_CHAT_BASE_URL,
       model: store.get(CHAT_SETTINGS_KEYS.localModel) ?? "",
-      hasApiKey: localApiKeyStore.hasApiKey(),
+      hasApiKey: apiKeyStores.local.hasApiKey(),
       toolsEnabled: store.get(CHAT_SETTINGS_KEYS.localToolsEnabled) !== "false"
     },
     sidebarOpen: store.get(CHAT_SETTINGS_KEYS.sidebarOpen) !== "false",
@@ -96,8 +121,7 @@ export function readChatSettingsFromStore(
 
 export function saveChatSettingsToStore(
   store: ChatSettingsStore,
-  localApiKeyStore: ChatApiKeyStore,
-  openRouterApiKeyStore: ChatApiKeyStore,
+  apiKeyStores: ChatApiKeyStores,
   settings: ChatSettings
 ): ChatSettings {
   store.set(CHAT_SETTINGS_KEYS.provider, normalizeProvider(settings.provider));
@@ -111,6 +135,14 @@ export function saveChatSettingsToStore(
   store.set(
     CHAT_SETTINGS_KEYS.openRouterModel,
     openRouterModel || DEFAULT_OPENROUTER_MODEL
+  );
+  store.set(
+    CHAT_SETTINGS_KEYS.anthropicModel,
+    settings.anthropic.model.trim() || DEFAULT_ANTHROPIC_MODEL
+  );
+  store.set(
+    CHAT_SETTINGS_KEYS.anthropicEffort,
+    normalizeAnthropicEffort(settings.anthropic.effort)
   );
   const executablePath = settings.claudeCode?.executablePath?.trim();
   if (executablePath) {
@@ -191,34 +223,50 @@ export function saveChatSettingsToStore(
   }
 
   if (settings.local.clearApiKey) {
-    localApiKeyStore.clearApiKey();
+    apiKeyStores.local.clearApiKey();
   } else if (
     typeof settings.local.apiKey === "string" &&
     settings.local.apiKey.trim()
   ) {
-    localApiKeyStore.saveApiKey(settings.local.apiKey.trim());
+    apiKeyStores.local.saveApiKey(settings.local.apiKey.trim());
+  }
+
+  if (settings.anthropic.clearApiKey) {
+    apiKeyStores.anthropic.clearApiKey();
+  } else if (
+    typeof settings.anthropic.apiKey === "string" &&
+    settings.anthropic.apiKey.trim()
+  ) {
+    apiKeyStores.anthropic.saveApiKey(settings.anthropic.apiKey.trim());
   }
 
   if (settings.openRouter?.clearApiKey) {
-    openRouterApiKeyStore.clearApiKey();
+    apiKeyStores.openRouter.clearApiKey();
   } else if (
     typeof settings.openRouter?.apiKey === "string" &&
     settings.openRouter.apiKey.trim()
   ) {
-    openRouterApiKeyStore.saveApiKey(settings.openRouter.apiKey.trim());
+    apiKeyStores.openRouter.saveApiKey(settings.openRouter.apiKey.trim());
   }
 
-  return readChatSettingsFromStore(
-    store,
-    localApiKeyStore,
-    openRouterApiKeyStore
-  );
+  return readChatSettingsFromStore(store, apiKeyStores);
+}
+
+function normalizeAnthropicEffort(value: unknown): AnthropicEffort {
+  return value === "low" ||
+    value === "medium" ||
+    value === "high" ||
+    value === "xhigh" ||
+    value === "max"
+    ? value
+    : DEFAULT_ANTHROPIC_EFFORT;
 }
 
 function normalizeProvider(value: unknown): ChatProvider {
   if (
     value === "local" ||
     value === "claude-code" ||
+    value === "claude-api" ||
     value === "openrouter"
   ) {
     return value;

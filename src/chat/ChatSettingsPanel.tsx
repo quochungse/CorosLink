@@ -13,6 +13,8 @@ import {
   X
 } from "lucide-react";
 import type {
+  AnthropicApiConnectionTest,
+  AnthropicEffort,
   ChatAuthStatus,
   ChatSettings,
   ClaudeCodeStatus,
@@ -21,8 +23,20 @@ import type {
   OpenRouterConnectionTest
 } from "../../electron/types";
 import { MAX_CUSTOM_COACH_INSTRUCTIONS } from "../../electron/types";
+import { ANTHROPIC_MODEL_OPTIONS } from "../../electron/chatModels";
 import { McpServersPanel } from "./McpServersPanel";
 import type { CorosLinkApi } from "../coroslink-api";
+
+const ANTHROPIC_EFFORT_OPTIONS: Array<{
+  value: AnthropicEffort;
+  label: string;
+}> = [
+  { value: "low", label: "Low — fastest and cheapest" },
+  { value: "medium", label: "Medium" },
+  { value: "high", label: "High — default" },
+  { value: "xhigh", label: "Extra high" },
+  { value: "max", label: "Max — most thorough" }
+];
 
 function claudeStatusLabel(status: ClaudeCodeStatus | null): string {
   if (!status) return "Not checked";
@@ -68,6 +82,15 @@ export function ChatSettingsPanel({
   onClearOpenRouterApiKey,
   onOpenOpenRouterKeys,
   onOpenOpenRouterModels,
+  anthropicApiKey,
+  anthropicConnection,
+  testingAnthropic,
+  onAnthropicApiKeyChange,
+  onUpdateAnthropic,
+  onTestAnthropicConnection,
+  onSaveAnthropicSettings,
+  onClearAnthropicApiKey,
+  onOpenAnthropicKeyGuide,
   onLocalApiKeyChange,
   onUpdateLocalDraft,
   onDetectLocalServers,
@@ -114,6 +137,15 @@ export function ChatSettingsPanel({
   onClearOpenRouterApiKey: () => void;
   onOpenOpenRouterKeys: () => void;
   onOpenOpenRouterModels: () => void;
+  anthropicApiKey: string;
+  anthropicConnection: AnthropicApiConnectionTest | null;
+  testingAnthropic: boolean;
+  onAnthropicApiKeyChange: (value: string) => void;
+  onUpdateAnthropic: (patch: Partial<ChatSettings["anthropic"]>) => void;
+  onTestAnthropicConnection: () => void;
+  onSaveAnthropicSettings: () => void;
+  onClearAnthropicApiKey: () => void;
+  onOpenAnthropicKeyGuide: () => void;
   onLocalApiKeyChange: (value: string) => void;
   onUpdateLocalDraft: (patch: Partial<ChatSettings["local"]>) => void;
   onDetectLocalServers: () => void;
@@ -566,6 +598,130 @@ export function ChatSettingsPanel({
           their tools to Claude. Drafts stay local until you click an upload or
           delete button.
         </p>
+      </section>
+
+      <section className="chat-settings-section chat-claude-section">
+        <h3>Claude API key</h3>
+        <p className="chat-settings-copy">
+          Talks to the Anthropic API directly with your own key, billed per
+          token to your Anthropic account. Nothing needs to be installed, and
+          the key is stored encrypted on this computer only.
+        </p>
+
+        <div className="chat-local-settings chat-local-settings-panel">
+          <label className="chat-local-field chat-local-field-key">
+            <span>API key</span>
+            <div className="chat-local-key-row">
+              <KeyRound size={14} aria-hidden="true" />
+              <input
+                value={anthropicApiKey}
+                onChange={(event) =>
+                  onAnthropicApiKeyChange(event.target.value)
+                }
+                placeholder={
+                  chatSettings.anthropic.hasApiKey ? "Saved key" : "sk-ant-…"
+                }
+                type="password"
+                spellCheck={false}
+              />
+              {chatSettings.anthropic.hasApiKey ? (
+                <button
+                  type="button"
+                  onClick={onClearAnthropicApiKey}
+                  disabled={savingSettings}
+                >
+                  Clear
+                </button>
+              ) : null}
+            </div>
+          </label>
+
+          <label className="chat-local-field">
+            <span>Model</span>
+            <select
+              value={chatSettings.anthropic.model}
+              onChange={(event) =>
+                onUpdateAnthropic({ model: event.target.value })
+              }
+            >
+              {ANTHROPIC_MODEL_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <label className="chat-local-field">
+            <span>Reasoning effort</span>
+            <select
+              value={chatSettings.anthropic.effort}
+              onChange={(event) =>
+                onUpdateAnthropic({
+                  effort: event.target.value as AnthropicEffort
+                })
+              }
+            >
+              {ANTHROPIC_EFFORT_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <p className="chat-settings-copy">
+            Higher effort spends more tokens on reasoning before answering.
+            Lower effort is cheaper and faster for routine questions.
+          </p>
+
+          <div className="chat-local-actions">
+            <button
+              type="button"
+              className="chat-local-action"
+              onClick={onOpenAnthropicKeyGuide}
+            >
+              <ExternalLink size={14} aria-hidden="true" />
+              Get a key
+            </button>
+            <button
+              type="button"
+              className="chat-local-action"
+              onClick={onTestAnthropicConnection}
+              disabled={testingAnthropic || busy}
+            >
+              {testingAnthropic ? (
+                <Loader2 className="chat-spinner" size={14} aria-hidden="true" />
+              ) : (
+                <Bot size={14} aria-hidden="true" />
+              )}
+              Test
+            </button>
+            <button
+              type="button"
+              className="chat-local-action primary"
+              onClick={onSaveAnthropicSettings}
+              disabled={savingSettings || busy}
+            >
+              {savingSettings ? (
+                <Loader2 className="chat-spinner" size={14} aria-hidden="true" />
+              ) : (
+                <Save size={14} aria-hidden="true" />
+              )}
+              Save
+            </button>
+          </div>
+          {anthropicConnection ? (
+            <p
+              className={
+                anthropicConnection.ok
+                  ? "chat-local-result is-ready"
+                  : "chat-local-result is-error"
+              }
+            >
+              {anthropicConnection.message}
+            </p>
+          ) : null}
+        </div>
       </section>
 
       <section className="chat-settings-section">

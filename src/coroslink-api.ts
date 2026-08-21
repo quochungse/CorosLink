@@ -101,6 +101,8 @@ import type {
   ChatStreamDone,
   ChatStreamError,
   ChatStreamInfo,
+  AnthropicApiConfig,
+  AnthropicApiConnectionTest,
   LocalChatConfig,
   LocalChatConnectionTest,
   LocalChatDiscovery,
@@ -584,6 +586,10 @@ export interface CorosLinkApi {
   testLocalChatConnection: (
     config?: LocalChatConfig
   ) => Promise<LocalChatConnectionTest>;
+  testAnthropicConnection: (
+    config?: Partial<AnthropicApiConfig>
+  ) => Promise<AnthropicApiConnectionTest>;
+  openAnthropicKeyGuide: () => Promise<void>;
   detectLocalChatServers: (apiKey?: string) => Promise<LocalChatDiscovery>;
   testOpenRouterConnection: (
     config?: OpenRouterConfig

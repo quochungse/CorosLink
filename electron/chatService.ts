@@ -60,6 +60,12 @@ import {
   testOpenRouterConnectionRequest
 } from "./openRouterProvider";
 import {
+  AnthropicProviderError,
+  streamAnthropicChatCompletion,
+  testAnthropicApiConnectionRequest,
+  type AnthropicRuntimeConfig
+} from "./anthropicChatProvider";
+import {
   ClaudeCodeProviderError,
   getClaudeCodeStatus as inspectClaudeCodeStatus,
   launchClaudeCodeLogin,
@@ -71,6 +77,7 @@ import {
   readChatSettingsFromStore,
   saveChatSettingsToStore,
   type ChatApiKeyStore,
+  type ChatApiKeyStores,
   type ChatSettingsStore
 } from "./chatSettingsStore";
 import { getChatGptModelCandidates } from "./chatModels";
@@ -82,6 +89,8 @@ import {
   saveChatSession
 } from "./chatHistoryStore";
 import type {
+  AnthropicApiConfig,
+  AnthropicApiConnectionTest,
   ChatAuthStatus,
   ChatSettings,
   ChatProvider,
@@ -154,19 +163,19 @@ const activeStreams = new Map<string, AbortController>();
 // ----- Provider settings -----
 
 export function getChatSettings(): ChatSettings {
-  return readChatSettingsFromStore(
-    chatSettingsStore,
-    localApiKeyStore,
-    openRouterApiKeyStore
-  );
+  return readChatSettingsFromStore(chatSettingsStore, chatApiKeyStores);
 }
 
 export function saveChatSettings(settings: ChatSettings): ChatSettings {
-  return saveChatSettingsToStore(
-    chatSettingsStore,
-    localApiKeyStore,
-    openRouterApiKeyStore,
-    settings
+  return saveChatSettingsToStore(chatSettingsStore, chatApiKeyStores, settings);
+}
+
+export async function testAnthropicApiConnection(
+  config?: Partial<AnthropicApiConfig>
+): Promise<AnthropicApiConnectionTest> {
+  const saved = getChatSettings().anthropic;
+  return testAnthropicApiConnectionRequest(
+    getAnthropicRuntimeConfig({ ...saved, ...config })
   );
 }
 
@@ -295,20 +304,28 @@ function getLocalRuntimeConfig(config = getLocalConfig()): LocalChatRuntimeConfi
   };
 }
 
-function storeEncryptedChatApiKey(
-  settingKey: string,
-  label: string,
-  apiKey: string
-): void {
-  if (!safeStorage.isEncryptionAvailable()) {
-    throw new Error(`Secure ${label} API key storage is not available on this system.`);
-  }
-  const encrypted = safeStorage.encryptString(apiKey).toString("base64");
-  setSetting(settingKey, encrypted);
+function getAnthropicRuntimeConfig(
+  config = getChatSettings().anthropic
+): AnthropicRuntimeConfig {
+  return {
+    model: config.model,
+    effort: config.effort,
+    apiKey:
+      typeof config.apiKey === "string" && config.apiKey.trim()
+        ? config.apiKey.trim()
+        : readEncryptedSecret(CHAT_SETTINGS_KEYS.anthropicApiKey)
+  };
 }
 
-function readStoredChatApiKey(settingKey: string): string | undefined {
-  const encoded = getSetting(settingKey);
+function storeEncryptedSecret(key: string, secret: string, label: string): void {
+  if (!safeStorage.isEncryptionAvailable()) {
+    throw new Error(`Secure ${label} storage is not available on this system.`);
+  }
+  setSetting(key, safeStorage.encryptString(secret).toString("base64"));
+}
+
+function readEncryptedSecret(key: string): string | undefined {
+  const encoded = getSetting(key);
   if (!encoded || !safeStorage.isEncryptionAvailable()) {
     return undefined;
   }
@@ -320,11 +337,11 @@ function readStoredChatApiKey(settingKey: string): string | undefined {
 }
 
 function readStoredLocalApiKey(): string | undefined {
-  return readStoredChatApiKey(CHAT_SETTINGS_KEYS.localApiKey);
+  return readEncryptedSecret(CHAT_SETTINGS_KEYS.localApiKey);
 }
 
 function readStoredOpenRouterApiKey(): string | undefined {
-  return readStoredChatApiKey(CHAT_SETTINGS_KEYS.openRouterApiKey);
+  return readEncryptedSecret(CHAT_SETTINGS_KEYS.openRouterApiKey);
 }
 
 const chatSettingsStore: ChatSettingsStore = {
@@ -336,19 +353,40 @@ const chatSettingsStore: ChatSettingsStore = {
 const localApiKeyStore: ChatApiKeyStore = {
   hasApiKey: () => Boolean(getSetting(CHAT_SETTINGS_KEYS.localApiKey)),
   saveApiKey: (apiKey) =>
-    storeEncryptedChatApiKey(CHAT_SETTINGS_KEYS.localApiKey, "local", apiKey),
+    storeEncryptedSecret(
+      CHAT_SETTINGS_KEYS.localApiKey,
+      apiKey,
+      "local API key"
+    ),
   clearApiKey: () => deleteSettings([CHAT_SETTINGS_KEYS.localApiKey])
+};
+
+const anthropicApiKeyStore: ChatApiKeyStore = {
+  hasApiKey: () => Boolean(getSetting(CHAT_SETTINGS_KEYS.anthropicApiKey)),
+  saveApiKey: (apiKey) =>
+    storeEncryptedSecret(
+      CHAT_SETTINGS_KEYS.anthropicApiKey,
+      apiKey,
+      "Anthropic API key"
+    ),
+  clearApiKey: () => deleteSettings([CHAT_SETTINGS_KEYS.anthropicApiKey])
 };
 
 const openRouterApiKeyStore: ChatApiKeyStore = {
   hasApiKey: () => Boolean(getSetting(CHAT_SETTINGS_KEYS.openRouterApiKey)),
   saveApiKey: (apiKey) =>
-    storeEncryptedChatApiKey(
+    storeEncryptedSecret(
       CHAT_SETTINGS_KEYS.openRouterApiKey,
-      "OpenRouter",
-      apiKey
+      apiKey,
+      "OpenRouter API key"
     ),
   clearApiKey: () => deleteSettings([CHAT_SETTINGS_KEYS.openRouterApiKey])
+};
+
+const chatApiKeyStores: ChatApiKeyStores = {
+  local: localApiKeyStore,
+  anthropic: anthropicApiKeyStore,
+  openRouter: openRouterApiKeyStore
 };
 
 // ----- Auth status -----
@@ -742,7 +780,8 @@ export async function streamChat(
       }
       const { text: instructions, hasData } = await buildTrainingContext(
         undefined,
-        unitSystem
+        unitSystem,
+        settings.customInstructions
       );
 
       await ensureAllMcpConnected();
@@ -797,6 +836,76 @@ export async function streamChat(
           const args = parseFunctionCallArguments(call, tool);
           console.log("[chat] OpenRouter tool call:", call.name);
           return executeChatTool(call.name, args, send, requestId, unitSystem);
+        }
+      });
+      fullText = result.fullText;
+      send("chat:streamDone", { requestId, fullText });
+      return;
+    }
+
+    if (settings.provider === "claude-api") {
+      const runtimeConfig = getAnthropicRuntimeConfig(settings.anthropic);
+      if (!runtimeConfig.apiKey) {
+        throw new AnthropicProviderError(
+          "Add your Anthropic API key in Settings to use Claude directly.",
+          "no-key"
+        );
+      }
+
+      await ensureAllMcpConnected();
+      const chatTools = getAllChatTools();
+      const { text: instructions, hasData } = await buildTrainingContext(
+        undefined,
+        unitSystem,
+        settings.customInstructions
+      );
+      const effectiveInstructions = withLiveToolInstructions(
+        instructions,
+        chatTools
+      );
+
+      send("chat:streamStart", { requestId });
+      send("chat:streamInfo", {
+        requestId,
+        kind: "context",
+        snapshotIncluded: hasData,
+        mcpEnabled: chatTools.length > 0
+      });
+
+      const result = await streamAnthropicChatCompletion({
+        config: runtimeConfig,
+        instructions: effectiveInstructions,
+        messages,
+        tools: chatTools,
+        maxToolRounds: MAX_TOOL_ROUNDS,
+        signal: controller.signal,
+        onToken: (delta) => {
+          fullText += delta;
+          send("chat:streamToken", { requestId, delta });
+        },
+        onThinking: (delta) => {
+          send("chat:streamInfo", { requestId, kind: "thinking", delta });
+        },
+        onToolCallStart: (toolName) => {
+          send("chat:streamInfo", {
+            requestId,
+            kind: "mcp",
+            tool: toolName,
+            status: "call"
+          });
+        },
+        onToolCallError: (toolName, message) => {
+          send("chat:streamInfo", {
+            requestId,
+            kind: "mcp",
+            tool: toolName,
+            status: "failed",
+            message
+          });
+        },
+        onToolCall: async (toolName, args) => {
+          console.log("[chat] tool call:", toolName);
+          return executeChatTool(toolName, args, send, requestId, unitSystem);
         }
       });
       fullText = result.fullText;

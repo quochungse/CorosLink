@@ -654,9 +654,15 @@ globalThis.fetch = originalFetch;
 const { readChatSettingsFromStore, saveChatSettingsToStore } = await import(
   `${distUrl("chatSettingsStore.js")}?cacheBust=${Date.now()}`
 );
-const { getChatGptModelCandidates } = await import(
+const { getChatGptModelCandidates, getChatModelOptions } = await import(
   `${distUrl("chatModels.js")}?cacheBust=${Date.now()}`
 );
+
+assert.deepEqual(
+  getChatModelOptions("claude-api").map((option) => option.value),
+  ["claude-opus-5", "claude-fable-5", "claude-sonnet-5", "claude-haiku-4-5"]
+);
+assert.equal(getChatModelOptions("claude-code")[0].value, "");
 
 assert.deepEqual(
   getChatGptModelCandidates("gpt-5.6-terra", "gpt-5.5"),
@@ -679,6 +685,7 @@ const fakeStore = {
     for (const key of keys) settingsValues.delete(key);
   }
 };
+let storedAnthropicKey = "";
 const fakeApiKeyStore = {
   hasApiKey: () => Boolean(storedApiKey),
   saveApiKey: (apiKey) => {
@@ -697,12 +704,22 @@ const fakeOpenRouterApiKeyStore = {
     storedOpenRouterApiKey = "";
   }
 };
+const fakeAnthropicKeyStore = {
+  hasApiKey: () => Boolean(storedAnthropicKey),
+  saveApiKey: (apiKey) => {
+    storedAnthropicKey = apiKey;
+  },
+  clearApiKey: () => {
+    storedAnthropicKey = "";
+  }
+};
+const fakeKeyStores = {
+  local: fakeApiKeyStore,
+  anthropic: fakeAnthropicKeyStore,
+  openRouter: fakeOpenRouterApiKeyStore
+};
 
-const saved = saveChatSettingsToStore(
-  fakeStore,
-  fakeApiKeyStore,
-  fakeOpenRouterApiKeyStore,
-  {
+const saved = saveChatSettingsToStore(fakeStore, fakeKeyStores, {
   provider: "claude-code",
   chatgpt: {
     model: "gpt-5.6-terra"
@@ -711,6 +728,12 @@ const saved = saveChatSettingsToStore(
     model: "anthropic/claude-sonnet-4",
     hasApiKey: false,
     apiKey: "sk-or-v1-secret"
+  },
+  anthropic: {
+    model: "claude-sonnet-5",
+    effort: "xhigh",
+    hasApiKey: false,
+    apiKey: "sk-ant-secret"
   },
   claudeCode: {
     model: "sonnet",
@@ -758,48 +781,56 @@ assert.equal(saved.local.hasApiKey, true);
 assert.equal(storedApiKey, "secret");
 assert.equal(storedOpenRouterApiKey, "sk-or-v1-secret");
 assert.equal(saved.customInstructions, "Keep answers short.");
+assert.equal(saved.anthropic.model, "claude-sonnet-5");
+assert.equal(saved.anthropic.effort, "xhigh");
+// The key round-trips into the encrypted store, never back out through get.
+assert.equal(saved.anthropic.apiKey, undefined);
+assert.equal(saved.anthropic.hasApiKey, true);
+assert.equal(storedAnthropicKey, "sk-ant-secret");
 
-const loaded = readChatSettingsFromStore(
-  fakeStore,
-  fakeApiKeyStore,
-  fakeOpenRouterApiKeyStore
-);
+const loaded = readChatSettingsFromStore(fakeStore, fakeKeyStores);
 assert.deepEqual(loaded, saved);
 
-const cleared = saveChatSettingsToStore(
-  fakeStore,
-  fakeApiKeyStore,
-  fakeOpenRouterApiKeyStore,
-  {
-    ...loaded,
-    openRouter: { ...loaded.openRouter, clearApiKey: true },
-    local: { ...loaded.local, clearApiKey: true }
-  }
-);
+const cleared = saveChatSettingsToStore(fakeStore, fakeKeyStores, {
+  ...loaded,
+  openRouter: { ...loaded.openRouter, clearApiKey: true },
+  local: { ...loaded.local, clearApiKey: true }
+});
 assert.equal(cleared.local.hasApiKey, false);
 assert.equal(storedApiKey, "");
 assert.equal(cleared.openRouter.hasApiKey, false);
 assert.equal(storedOpenRouterApiKey, "");
 
-const cappedCustom = saveChatSettingsToStore(
-  fakeStore,
-  fakeApiKeyStore,
-  fakeOpenRouterApiKeyStore,
-  {
-    ...cleared,
-    customInstructions: "y".repeat(MAX_CUSTOM_COACH_INSTRUCTIONS + 50)
-  }
-);
+const clearedAnthropic = saveChatSettingsToStore(fakeStore, fakeKeyStores, {
+  ...cleared,
+  anthropic: { ...cleared.anthropic, clearApiKey: true }
+});
+assert.equal(clearedAnthropic.anthropic.hasApiKey, false);
+assert.equal(storedAnthropicKey, "");
+
+// An unknown effort falls back to the default rather than reaching the API.
+const defaultedEffort = saveChatSettingsToStore(fakeStore, fakeKeyStores, {
+  ...clearedAnthropic,
+  anthropic: { ...clearedAnthropic.anthropic, effort: "turbo" }
+});
+assert.equal(defaultedEffort.anthropic.effort, "high");
+
+// An empty model falls back to the default instead of being sent as "".
+const defaultedModel = saveChatSettingsToStore(fakeStore, fakeKeyStores, {
+  ...defaultedEffort,
+  anthropic: { ...defaultedEffort.anthropic, model: "  " }
+});
+assert.equal(defaultedModel.anthropic.model, "claude-opus-5");
+
+const cappedCustom = saveChatSettingsToStore(fakeStore, fakeKeyStores, {
+  ...defaultedModel,
+  customInstructions: "y".repeat(MAX_CUSTOM_COACH_INSTRUCTIONS + 50)
+});
 assert.equal(cappedCustom.customInstructions.length, MAX_CUSTOM_COACH_INSTRUCTIONS);
-const withoutCustom = saveChatSettingsToStore(
-  fakeStore,
-  fakeApiKeyStore,
-  fakeOpenRouterApiKeyStore,
-  {
-    ...cappedCustom,
-    customInstructions: "   "
-  }
-);
+const withoutCustom = saveChatSettingsToStore(fakeStore, fakeKeyStores, {
+  ...cappedCustom,
+  customInstructions: "   "
+});
 assert.equal(withoutCustom.customInstructions, undefined);
 assert.equal(settingsValues.has("chat.customInstructions"), false);
 

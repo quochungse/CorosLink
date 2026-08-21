@@ -1,4 +1,4 @@
-import { Network, Sparkles, Terminal } from "lucide-react";
+import { KeyRound, Network, Sparkles, Terminal } from "lucide-react";
 import type { ChatProvider } from "../../electron/types";
 import {
   getChatModelOptions,
@@ -16,6 +16,10 @@ function renderClaudeIcon() {
 
 function renderOpenRouterIcon() {
   return <Network size={14} strokeWidth={2.1} aria-hidden="true" />;
+}
+
+function renderClaudeApiIcon() {
+  return <KeyRound size={14} strokeWidth={2.1} aria-hidden="true" />;
 }
 
 export function ModelSwitch({
@@ -39,24 +43,25 @@ export function ModelSwitch({
   )
     ? baseOptions
     : [...baseOptions, { value: model, label: model }];
-  const providerLabel =
-    provider === "claude-code"
-      ? "Claude"
-      : provider === "openrouter"
-        ? "OpenRouter"
-        : "ChatGPT";
-  const tone =
-    provider === "claude-code"
-      ? "claude"
-      : provider === "openrouter"
-        ? "openrouter"
-        : "gpt";
+  const isClaude = provider === "claude-code" || provider === "claude-api";
+  const providerLabel = isClaude
+    ? "Claude"
+    : provider === "openrouter"
+      ? "OpenRouter"
+      : "ChatGPT";
+  const tone = isClaude
+    ? "claude"
+    : provider === "openrouter"
+      ? "openrouter"
+      : "gpt";
   const renderIcon =
-    provider === "claude-code"
-      ? renderClaudeIcon
-      : provider === "openrouter"
-        ? renderOpenRouterIcon
-        : renderChatGptIcon;
+    provider === "claude-api"
+      ? renderClaudeApiIcon
+      : provider === "claude-code"
+        ? renderClaudeIcon
+        : provider === "openrouter"
+          ? renderOpenRouterIcon
+          : renderChatGptIcon;
   const selectedLabel =
     options.find((option) => option.value === model)?.label ?? model;
 

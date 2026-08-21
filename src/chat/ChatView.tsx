@@ -55,6 +55,7 @@ import {
   type UnitSystem
 } from "../units/units";
 import type {
+  AnthropicApiConnectionTest,
   ChatAuthStatus,
   ChatProvider,
   ChatSessionSummary,
@@ -106,6 +107,11 @@ import {
 const DEFAULT_CHAT_SETTINGS: ChatSettings = {
   provider: "chatgpt",
   chatgpt: {},
+  anthropic: {
+    model: "claude-opus-5",
+    effort: "high",
+    hasApiKey: false
+  },
   claudeCode: {
     permissions: {
       recentActivities: true,
@@ -1749,6 +1755,10 @@ export function ChatView({
     useState<LocalChatConnectionTest | null>(null);
   const [localDiscovery, setLocalDiscovery] =
     useState<LocalChatDiscovery | null>(null);
+  const [anthropicApiKey, setAnthropicApiKey] = useState("");
+  const [anthropicConnection, setAnthropicConnection] =
+    useState<AnthropicApiConnectionTest | null>(null);
+  const [testingAnthropic, setTestingAnthropic] = useState(false);
   const [claudeStatus, setClaudeStatus] = useState<ClaudeCodeStatus | null>(null);
   const [checkingClaude, setCheckingClaude] = useState(false);
   const [connectingClaude, setConnectingClaude] = useState(false);
@@ -2328,6 +2338,109 @@ export function ChatView({
     }
   };
 
+  const handleUpdateAnthropic = async (
+    patch: Partial<ChatSettings["anthropic"]>
+  ) => {
+    const nextSettings: ChatSettings = {
+      ...chatSettings,
+      anthropic: { ...chatSettings.anthropic, ...patch }
+    };
+    setChatSettings(nextSettings);
+    setAnthropicConnection(null);
+    if (!api) return;
+    try {
+      const saved = await api.saveChatSettings(nextSettings);
+      setChatSettings(saved);
+    } catch (caught) {
+      onError(
+        caught instanceof Error
+          ? caught.message
+          : "Could not save Claude API settings."
+      );
+    }
+  };
+
+  const handleSaveAnthropicSettings = async () => {
+    if (!api) return;
+    setSavingSettings(true);
+    onError(null);
+    try {
+      const apiKey = anthropicApiKey.trim();
+      const saved = await api.saveChatSettings({
+        ...chatSettings,
+        anthropic: {
+          ...chatSettings.anthropic,
+          apiKey: apiKey || undefined
+        }
+      });
+      setChatSettings(saved);
+      setAnthropicApiKey("");
+      setAnthropicConnection({
+        ok: true,
+        message: saved.anthropic.hasApiKey
+          ? "Claude API settings saved."
+          : "Settings saved. Add an API key to start coaching."
+      });
+    } catch (caught) {
+      onError(
+        caught instanceof Error
+          ? caught.message
+          : "Could not save Claude API settings."
+      );
+    } finally {
+      setSavingSettings(false);
+    }
+  };
+
+  const handleClearAnthropicApiKey = async () => {
+    if (!api) return;
+    setSavingSettings(true);
+    onError(null);
+    try {
+      const saved = await api.saveChatSettings({
+        ...chatSettings,
+        anthropic: { ...chatSettings.anthropic, clearApiKey: true }
+      });
+      setChatSettings(saved);
+      setAnthropicApiKey("");
+      setAnthropicConnection({ ok: true, message: "Anthropic API key cleared." });
+    } catch (caught) {
+      onError(
+        caught instanceof Error ? caught.message : "Could not clear the API key."
+      );
+    } finally {
+      setSavingSettings(false);
+    }
+  };
+
+  const handleTestAnthropicConnection = async () => {
+    if (!api || testingAnthropic) return;
+    setTestingAnthropic(true);
+    setAnthropicConnection(null);
+    onError(null);
+    try {
+      // An unsaved key in the field is tested as typed so the athlete can
+      // verify it before committing it to storage.
+      setAnthropicConnection(
+        await api.testAnthropicConnection({
+          model: chatSettings.anthropic.model,
+          effort: chatSettings.anthropic.effort,
+          apiKey: anthropicApiKey.trim() || undefined
+        })
+      );
+    } catch (caught) {
+      setAnthropicConnection({
+        ok: false,
+        message:
+          caught instanceof Error
+            ? caught.message
+            : "Claude API connection test failed."
+      });
+    } finally {
+      setTestingAnthropic(false);
+    }
+  };
+
   const handleNewChat = async () => {
     if (!api || streaming || exportingLatestActivity) return;
     onError(null);
@@ -2396,29 +2509,37 @@ export function ChatView({
     if (!api || chatSettings.provider === "local") return;
     const normalizedModel = model.trim() || undefined;
     const nextSettings: ChatSettings =
-      chatSettings.provider === "claude-code"
+      chatSettings.provider === "claude-api"
         ? {
             ...chatSettings,
-            claudeCode: {
-              ...chatSettings.claudeCode,
-              model: normalizedModel
+            anthropic: {
+              ...chatSettings.anthropic,
+              model: model.trim() || chatSettings.anthropic.model
             }
           }
-        : chatSettings.provider === "openrouter"
+        : chatSettings.provider === "claude-code"
           ? {
               ...chatSettings,
-              openRouter: {
-                ...chatSettings.openRouter,
-                model: normalizedModel ?? "openrouter/auto"
+              claudeCode: {
+                ...chatSettings.claudeCode,
+                model: normalizedModel
               }
             }
-        : {
-            ...chatSettings,
-            chatgpt: {
-              ...chatSettings.chatgpt,
-              model: normalizedModel
-            }
-          };
+          : chatSettings.provider === "openrouter"
+            ? {
+                ...chatSettings,
+                openRouter: {
+                  ...chatSettings.openRouter,
+                  model: normalizedModel ?? "openrouter/auto"
+                }
+              }
+            : {
+                ...chatSettings,
+                chatgpt: {
+                  ...chatSettings.chatgpt,
+                  model: normalizedModel
+                }
+              };
 
     setChatSettings(nextSettings);
     setSavingSettings(true);
@@ -2788,6 +2909,13 @@ export function ChatView({
       onError("Enter a local model before starting the coach.");
       return false;
     }
+    if (
+      chatSettings.provider === "claude-api" &&
+      !chatSettings.anthropic.hasApiKey
+    ) {
+      onError("Save an Anthropic API key in Settings before starting the coach.");
+      return false;
+    }
     if (chatSettings.provider === "local") {
       try {
         const apiKey = localApiKey.trim();
@@ -3117,6 +3245,7 @@ export function ChatView({
   const isLocalProvider = chatSettings.provider === "local";
   const isClaudeProvider = chatSettings.provider === "claude-code";
   const isOpenRouterProvider = chatSettings.provider === "openrouter";
+  const isClaudeApiProvider = chatSettings.provider === "claude-api";
   const isChatGptProvider = chatSettings.provider === "chatgpt";
   const localModelConfigured = chatSettings.local.model.trim().length > 0;
   const isBusy = streaming || exportingLatestActivity;
@@ -3131,6 +3260,8 @@ export function ChatView({
     isClaudeProvider && claudeStatus?.state !== "connected";
   const showOpenRouterGate =
     isOpenRouterProvider && !chatSettings.openRouter.hasApiKey;
+  const showAnthropicKeyGate =
+    isClaudeApiProvider && !chatSettings.anthropic.hasApiKey;
   const showPlanPanel = useMediaQuery("(min-width: 1400px)");
   const planDrafts = timeline.flatMap((entry) =>
     entry.kind === "planDraft" ? [entry.draft] : []
@@ -3163,11 +3294,13 @@ export function ChatView({
     />
   );
   const selectedModel =
-    chatSettings.provider === "claude-code"
-      ? chatSettings.claudeCode.model ?? ""
-      : chatSettings.provider === "openrouter"
-        ? chatSettings.openRouter.model
-        : chatSettings.chatgpt.model ?? "";
+    chatSettings.provider === "claude-api"
+      ? chatSettings.anthropic.model
+      : chatSettings.provider === "claude-code"
+        ? chatSettings.claudeCode.model ?? ""
+        : chatSettings.provider === "openrouter"
+          ? chatSettings.openRouter.model
+          : chatSettings.chatgpt.model ?? "";
   const providerControls = (
     <div className="chat-provider-controls">
       {providerSwitch}
@@ -3222,6 +3355,16 @@ export function ChatView({
     onConnectClaude: () => void handleConnectClaudeCode(),
     onTestClaude: () => void handleTestClaudeCode(),
     onOpenClaudeSetupGuide: () => void api?.openClaudeCodeSetupGuide(),
+    anthropicApiKey,
+    anthropicConnection,
+    testingAnthropic,
+    onAnthropicApiKeyChange: setAnthropicApiKey,
+    onUpdateAnthropic: (patch: Partial<ChatSettings["anthropic"]>) =>
+      void handleUpdateAnthropic(patch),
+    onTestAnthropicConnection: () => void handleTestAnthropicConnection(),
+    onSaveAnthropicSettings: () => void handleSaveAnthropicSettings(),
+    onClearAnthropicApiKey: () => void handleClearAnthropicApiKey(),
+    onOpenAnthropicKeyGuide: () => void api?.openAnthropicKeyGuide(),
     onUpdateClaudeCode: (patch: Partial<ChatSettings["claudeCode"]>) =>
       void handleUpdateClaudeCode(patch),
     onOpenRouterApiKeyChange: setOpenRouterApiKey,
@@ -3247,6 +3390,70 @@ export function ChatView({
     return (
       <div className="chat-view chat-view-centered">
         <Loader2 className="chat-spinner" size={22} aria-hidden="true" />
+      </div>
+    );
+  }
+
+  if (showAnthropicKeyGate) {
+    return (
+      <div className="chat-view chat-view-login">
+        <div className="chat-header">
+          <div className="chat-header-title">
+            <span>Training Coach</span>
+          </div>
+          <div className="chat-header-end">
+            <button
+              type="button"
+              className="chat-settings-button"
+              onClick={() => setSettingsOpen(true)}
+            >
+              <Settings2 size={16} aria-hidden="true" />
+              Settings
+            </button>
+          </div>
+        </div>
+        <div className="chat-layout">
+          <ChatSidebar {...sidebarProps} />
+          <div className="chat-main chat-main-login">
+            <div className="panel chat-login-panel chat-claude-login-panel">
+              <KeyRound size={32} aria-hidden="true" />
+              <h2>Claude API key</h2>
+              <p>
+                Coach with Claude straight from the Anthropic API using your own
+                key, billed per token to your Anthropic account. The key is
+                stored encrypted on this computer and never leaves it except to
+                call Anthropic.
+              </p>
+              <div className="chat-login-actions">
+                <button
+                  type="button"
+                  className="primary-button"
+                  onClick={() => setSettingsOpen(true)}
+                >
+                  <KeyRound size={16} aria-hidden="true" />
+                  Add API key
+                </button>
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={() => void api?.openAnthropicKeyGuide()}
+                  disabled={!api}
+                >
+                  <ExternalLink size={16} aria-hidden="true" />
+                  Get a key
+                </button>
+              </div>
+              <p className="chat-login-note">
+                Already have a subscription instead? Switch to Claude
+                subscription below to use Claude Code on this computer.
+              </p>
+            </div>
+            <div className="chat-composer-toolbar chat-composer-toolbar-login">
+              {providerControls}
+            </div>
+          </div>
+        </div>
+        <ChatSettingsModal {...settingsModalProps} />
       </div>
     );
   }

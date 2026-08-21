@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Claude API key provider** — a fourth Coach backend that calls the Anthropic Messages API directly with your own key, billed per token, with no Claude Code install required. Pick the model (Opus 5, Fable 5, Sonnet 5, Haiku 4.5) and reasoning effort, test the key without spending tokens, and use the full COROS tool set. The key is stored encrypted on this computer.
+
+### Fixed
+
+- Custom coach instructions now have the wrapper delimiters stripped from athlete-entered text, so a pasted `</athlete_custom_instructions>` can no longer close the block early and promote the rest of the paste to operating rules.
+
 ## [0.1.29] - 2026-08-24
 
 ### Added

@@ -90,6 +90,7 @@ function normalizeProvider(value: unknown): ChatProvider {
   if (
     value === "local" ||
     value === "claude-code" ||
+    value === "claude-api" ||
     value === "openrouter"
   ) {
     return value;
