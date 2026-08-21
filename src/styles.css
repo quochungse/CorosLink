@@ -6796,6 +6796,15 @@ td span {
   white-space: nowrap;
 }
 
+/* Options carrying a qualifier wrap instead of being clipped: the menu is only
+   as wide as the trigger, and the closed pill still shows the short label. */
+.app-select-option-label.has-detail {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  line-height: 1.35;
+}
+
 .app-select-leading-icon {
   display: inline-flex;
   align-items: center;
@@ -18806,6 +18815,16 @@ tr.data-intervals-row-missing {
   min-width: 0;
 }
 
+/* Sits as its own row in .chat-claude-status > div (a 3px-gap grid). Slightly
+   brighter than the status message so the signed-in account reads first. */
+.chat-claude-status .chat-claude-account {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
 .chat-claude-status strong {
   color: currentColor;
   font-size: 12px;
@@ -18820,6 +18839,90 @@ tr.data-intervals-row-missing {
 
 .chat-claude-actions {
   flex-wrap: wrap;
+}
+
+/* The login panel is only 440px wide, so this label must be allowed to wrap
+   rather than inherit the nowrap used inside the settings modal. */
+/* Same segmented-control shape as .route-mode-switch, scoped to chat so the
+   two modules stay independent. */
+.chat-auth-scope-switch {
+  display: flex;
+  gap: 4px;
+  width: 100%;
+  padding: 4px;
+  border-radius: var(--radius-md);
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--glass-border);
+}
+
+.chat-auth-scope-switch button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  flex: 1 1 0;
+  min-width: 0;
+  padding: 8px 10px;
+  border: none;
+  border-radius: calc(var(--radius-md) - 3px);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 11.5px;
+  font-weight: 600;
+  line-height: 1.3;
+  text-align: center;
+  cursor: pointer;
+  transition: background 0.16s ease, color 0.16s ease;
+}
+
+.chat-auth-scope-switch button.is-active {
+  background: var(--accent);
+  color: #ffffff;
+}
+
+.chat-auth-scope-switch button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.chat-claude-model-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.chat-claude-model-row > .chat-local-field {
+  flex: 1 1 150px;
+  min-width: 0;
+}
+
+.chat-claude-login-flow {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  border: 1px solid var(--glass-border);
+  border-radius: 10px;
+  padding: 12px;
+  background: var(--surface-raised, rgba(255, 255, 255, 0.03));
+}
+
+.chat-claude-login-flow-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.chat-claude-login-flow-header > strong {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+}
+
+.chat-claude-login-flow .chat-local-actions {
+  margin-top: 2px;
 }
 
 .chat-claude-permissions {
@@ -18845,6 +18948,12 @@ tr.data-intervals-row-missing {
   justify-content: center;
   gap: 8px;
   flex-wrap: wrap;
+}
+
+/* Wider than the ChatGPT gate: the credential-scope switch holds two long
+   labels side by side, which wrap mid-phrase at the shared 440px. */
+.chat-claude-login-panel {
+  max-width: 560px;
 }
 
 .chat-claude-login-panel > svg {
@@ -19181,6 +19290,15 @@ tr.data-intervals-row-missing {
   background: var(--accent);
   border-color: var(--accent);
   color: #ffffff;
+}
+
+.chat-local-action.is-danger {
+  border-color: var(--error-border);
+  color: var(--error-text);
+}
+
+.chat-local-action.is-danger:hover:not(:disabled) {
+  background: var(--error-bg);
 }
 
 .chat-local-action:disabled {
@@ -19866,6 +19984,12 @@ tr.data-intervals-row-missing {
   width: max-content;
   min-width: 146px;
   max-width: 220px;
+}
+
+/* Narrower than the model pill: the effort labels are one or two short words. */
+.chat-effort-select {
+  min-width: 104px;
+  max-width: 150px;
 }
 
 .chat-provider-select .app-select-trigger,

@@ -2385,8 +2385,20 @@ export interface ClaudeCodePermissions {
 export interface ClaudeCodeConfig {
   /** Optional user-selected path. CorosLink never reads Claude credential files. */
   executablePath?: string;
+  /**
+   * When true (the default) Claude Code runs against a CorosLink-only
+   * CLAUDE_CONFIG_DIR, so the app signs in to its own account instead of
+   * borrowing whichever one the machine's CLI is using.
+   */
+  useAppScopedAuth: boolean;
   /** Model alias (e.g. "opus", "sonnet", "haiku") or full id. Empty = account default. */
   model?: string;
+  /** Reasoning effort. The Agent SDK downgrades levels a model cannot serve. */
+  effort: AnthropicEffort;
+  /** Last observed CLI default model, cached so the picker can name it. */
+  defaultModel?: string;
+  /** Cached account model list, so the picker does not probe on every render. */
+  availableModels?: Array<{ value: string; label: string }>;
   lastConnectionStatus?: ClaudeCodeConnectionState;
   lastCheckedAt?: string;
   permissions: ClaudeCodePermissions;
@@ -2400,6 +2412,14 @@ export interface ClaudeCodeStatus {
   version?: string;
   authMethod?: string;
   subscriptionType?: string;
+  /** Model Claude Code picks when none is requested, as reported by the CLI. */
+  defaultModel?: string;
+  /** Models this account can use, named with the versions the CLI reports. */
+  availableModels?: Array<{ value: string; label: string }>;
+  /** Signed-in Claude account, read live from the CLI and never persisted. */
+  email?: string;
+  /** Organisation the account belongs to, when Claude reports one. */
+  orgName?: string;
   checkedAt: string;
   message: string;
 }
@@ -2410,7 +2430,18 @@ export interface ClaudeCodeConnectionTest {
   message: string;
 }
 
-/** Reasoning effort forwarded as output_config.effort on the Messages API. */
+/** Pending `claude auth login` waiting for the code from the callback page. */
+export interface ClaudeCodeLoginStart {
+  url: string;
+  /** Directory the resulting credentials land in, for display only. */
+  scope: "app" | "machine";
+}
+
+/**
+ * Reasoning effort, shared by both Claude paths: forwarded as
+ * output_config.effort on the Messages API, and as the Agent SDK's `effort`
+ * option for the subscription path.
+ */
 export type AnthropicEffort = "low" | "medium" | "high" | "xhigh" | "max";
 
 /** Direct Claude access with the athlete's own Anthropic API key. */

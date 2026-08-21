@@ -1,6 +1,8 @@
-import { BrowserWindow, safeStorage, shell } from "electron";
+import { BrowserWindow, app, safeStorage, shell } from "electron";
 import crypto from "node:crypto";
+import fs from "node:fs";
 import http from "node:http";
+import path from "node:path";
 import type { AddressInfo } from "node:net";
 import { deleteSettings, getSetting, setSetting } from "./database";
 import {
@@ -68,9 +70,12 @@ import {
 import {
   ClaudeCodeProviderError,
   getClaudeCodeStatus as inspectClaudeCodeStatus,
-  launchClaudeCodeLogin,
+  listClaudeCodeModels,
+  logoutClaudeCode,
+  startClaudeCodeLogin,
   streamClaudeCodeCompletion,
-  testClaudeCodeConnection as runClaudeCodeConnectionTest
+  testClaudeCodeConnection as runClaudeCodeConnectionTest,
+  type ClaudeCodeLoginSession
 } from "./claudeCodeProvider";
 import {
   CHAT_SETTINGS_KEYS,
@@ -95,6 +100,7 @@ import type {
   ChatSettings,
   ChatProvider,
   ClaudeCodeConnectionTest,
+  ClaudeCodeLoginStart,
   ClaudeCodePermissions,
   ClaudeCodeStatus,
   CorosMcpTool,
@@ -179,31 +185,194 @@ export async function testAnthropicApiConnection(
   );
 }
 
+/**
+ * Directory Claude Code keeps CorosLink's own credentials in. Returning
+ * undefined lets Claude Code fall back to the machine-wide ~/.claude login.
+ */
+function getClaudeCodeConfigDir(
+  settings = getChatSettings()
+): string | undefined {
+  if (settings.claudeCode.useAppScopedAuth === false) {
+    return undefined;
+  }
+  const dir = path.join(app.getPath("userData"), "claude-code");
+  // The CLI writes credentials here, so keep it owner-only.
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  return dir;
+}
+
 export async function getClaudeCodeConnectionStatus(): Promise<ClaudeCodeStatus> {
   const settings = getChatSettings();
   const status = await inspectClaudeCodeStatus(
-    settings.claudeCode.executablePath
+    settings.claudeCode.executablePath,
+    getClaudeCodeConfigDir(settings)
   );
-  recordClaudeCodeStatus(status);
-  return status;
+  // Only a real turn reports the model, so carry the cached one through. Without
+  // this the renderer never learns a default discovered during a chat.
+  const merged: ClaudeCodeStatus = {
+    ...status,
+    defaultModel: status.defaultModel || settings.claudeCode.defaultModel,
+    availableModels:
+      status.availableModels || settings.claudeCode.availableModels
+  };
+  if (!merged.availableModels?.length && merged.executablePath) {
+    // Probed once, then cached: the model list is per account and only the CLI
+    // knows which version each alias points at.
+    merged.availableModels = await readClaudeCodeModels(
+      merged.executablePath,
+      getClaudeCodeConfigDir(settings)
+    );
+  }
+  recordClaudeCodeStatus(merged);
+  return merged;
 }
 
-export async function connectClaudeCode(): Promise<ClaudeCodeStatus> {
+async function readClaudeCodeModels(
+  executablePath: string,
+  configDir?: string
+): Promise<ClaudeCodeStatus["availableModels"]> {
+  try {
+    const models = await listClaudeCodeModels({ executablePath, configDir });
+    return models.length > 0 ? models : undefined;
+  } catch {
+    // The static list still covers the picker; retry on the next status read.
+    return undefined;
+  }
+}
+
+// Only one sign-in can be in flight; a second attempt replaces the first.
+let claudeLoginSession: ClaudeCodeLoginSession | null = null;
+
+/**
+ * Re-opens the pending sign-in page, for when Claude Code's own browser launch
+ * did not land. Exposed instead of a general "open this URL" bridge so the
+ * renderer can never ask the main process to launch a URL of its own choosing.
+ */
+export async function openClaudeCodeLoginUrl(): Promise<void> {
+  const url = claudeLoginSession?.url;
+  if (url) {
+    await shell.openExternal(url);
+  }
+}
+
+export async function beginClaudeCodeLogin(): Promise<ClaudeCodeLoginStart> {
   const settings = getChatSettings();
-  const status = await launchClaudeCodeLogin(
-    settings.claudeCode.executablePath
+  const configDir = getClaudeCodeConfigDir(settings);
+  const status = await inspectClaudeCodeStatus(
+    settings.claudeCode.executablePath,
+    configDir
   );
   recordClaudeCodeStatus(status);
-  return status;
+  if (!status.installed || !status.executablePath) {
+    throw new ClaudeCodeProviderError(status.message, "not-installed");
+  }
+
+  cancelClaudeCodeLogin();
+  const session = await startClaudeCodeLogin({
+    executablePath: status.executablePath,
+    configDir
+  });
+  claudeLoginSession = session;
+  // Claude Code opens the sign-in page itself as soon as it prints the URL.
+  // Opening it here as well produced two browser tabs, so the automatic open is
+  // left to the CLI and the app only re-opens it on request.
+  return { url: session.url, scope: configDir ? "app" : "machine" };
+}
+
+/**
+ * Resolves once the pending sign-in finishes, however it finishes.
+ *
+ * The browser flow often completes without the athlete pasting anything, so the
+ * renderer awaits this instead of treating the code box as the only way out.
+ */
+export async function awaitClaudeCodeLogin(): Promise<ClaudeCodeStatus> {
+  const session = claudeLoginSession;
+  if (!session) {
+    throw new ClaudeCodeProviderError(
+      "Start the Claude sign-in again — the pending request expired.",
+      "auth"
+    );
+  }
+  try {
+    await session.completion;
+  } finally {
+    if (claudeLoginSession === session) {
+      claudeLoginSession = null;
+    }
+  }
+  return getClaudeCodeConnectionStatus();
+}
+
+/** Fallback for when Claude shows a code instead of finishing in the browser. */
+export function submitClaudeCodeLoginCode(code: string): void {
+  const session = claudeLoginSession;
+  if (!session) {
+    throw new ClaudeCodeProviderError(
+      "Start the Claude sign-in again — the pending request expired.",
+      "auth"
+    );
+  }
+  session.submitCode(code);
+}
+
+export function cancelClaudeCodeLogin(): void {
+  claudeLoginSession?.cancel();
+  claudeLoginSession = null;
+}
+
+/**
+ * Clears the app's own Claude credentials so a different account can sign in.
+ *
+ * Deliberately refuses when the athlete opted into the machine-wide login: that
+ * store is shared with their terminal and is not ours to sign out.
+ */
+export async function revokeClaudeCodeLogin(): Promise<ClaudeCodeStatus> {
+  const settings = getChatSettings();
+  const configDir = getClaudeCodeConfigDir(settings);
+  if (!configDir) {
+    throw new ClaudeCodeProviderError(
+      "Revoking only applies to the CorosLink-only Claude login. Turn that on first, or sign out from your terminal.",
+      "auth"
+    );
+  }
+
+  // Any half-finished sign-in is against the credentials we are about to drop.
+  cancelClaudeCodeLogin();
+
+  const executablePath = (
+    await inspectClaudeCodeStatus(settings.claudeCode.executablePath, configDir)
+  ).executablePath;
+  if (executablePath) {
+    try {
+      await logoutClaudeCode({ executablePath, configDir });
+    } catch {
+      // Fall through: the credential file is removed below either way.
+    }
+  }
+
+  // The directory belongs to this app, so clearing anything the CLI left behind
+  // cannot affect another Claude login on this computer.
+  fs.rmSync(path.join(configDir, ".credentials.json"), { force: true });
+
+  return getClaudeCodeConnectionStatus();
 }
 
 export async function testClaudeCodeConnection(): Promise<ClaudeCodeConnectionTest> {
   const settings = getChatSettings();
+  const configDir = getClaudeCodeConfigDir(settings);
   const result = await runClaudeCodeConnectionTest(
-    settings.claudeCode.executablePath
+    settings.claudeCode.executablePath,
+    configDir
   );
-  recordClaudeCodeStatus(result.status);
-  return result;
+  const status: ClaudeCodeStatus = {
+    ...result.status,
+    availableModels: result.status.executablePath
+      ? ((await readClaudeCodeModels(result.status.executablePath, configDir)) ??
+        settings.claudeCode.availableModels)
+      : settings.claudeCode.availableModels
+  };
+  recordClaudeCodeStatus(status);
+  return { ...result, status };
 }
 
 function recordClaudeCodeStatus(status: ClaudeCodeStatus): void {
@@ -214,6 +383,11 @@ function recordClaudeCodeStatus(status: ClaudeCodeStatus): void {
       ...current.claudeCode,
       executablePath:
         current.claudeCode.executablePath || status.executablePath,
+      // Sticky: a status read that did not observe a turn reports no model, and
+      // forgetting it would blank the picker's "Default (…)" label.
+      defaultModel: status.defaultModel || current.claudeCode.defaultModel,
+      availableModels:
+        status.availableModels || current.claudeCode.availableModels,
       lastConnectionStatus: status.state,
       lastCheckedAt: status.checkedAt
     }
@@ -686,8 +860,10 @@ export async function streamChat(
   try {
     const settings = getChatSettings();
     if (settings.provider === "claude-code") {
+      const claudeConfigDir = getClaudeCodeConfigDir(settings);
       const status = await inspectClaudeCodeStatus(
-        settings.claudeCode.executablePath
+        settings.claudeCode.executablePath,
+        claudeConfigDir
       );
       recordClaudeCodeStatus(status);
       if (!status.authenticated || !status.executablePath) {
@@ -724,6 +900,17 @@ export async function streamChat(
         tools: chatTools,
         signal: controller.signal,
         model: settings.claudeCode.model,
+        effort: settings.claudeCode.effort,
+        configDir: claudeConfigDir,
+        onModelResolved: (model) => {
+          if (settings.claudeCode.model?.trim()) return;
+          const current = getChatSettings();
+          if (current.claudeCode.defaultModel === model) return;
+          saveChatSettings({
+            ...current,
+            claudeCode: { ...current.claudeCode, defaultModel: model }
+          });
+        },
         onToken: (delta) => {
           fullText += delta;
           send("chat:streamToken", { requestId, delta });

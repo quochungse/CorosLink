@@ -299,7 +299,12 @@ import {
   createChatSessionForProvider,
   deleteChatSessionById,
   detectLocalChatServers,
-  connectClaudeCode,
+  beginClaudeCodeLogin,
+  cancelClaudeCodeLogin,
+  awaitClaudeCodeLogin,
+  submitClaudeCodeLoginCode,
+  openClaudeCodeLoginUrl,
+  revokeClaudeCodeLogin,
   getClaudeCodeConnectionStatus,
   getChatAuthStatus,
   getChatSessionEntries,
@@ -1345,7 +1350,19 @@ function registerIpcHandlers(): void {
     getClaudeCodeConnectionStatus()
   );
 
-  ipcMain.handle("chat:connectClaudeCode", () => connectClaudeCode());
+  ipcMain.handle("chat:startClaudeCodeLogin", () => beginClaudeCodeLogin());
+
+  ipcMain.handle("chat:awaitClaudeCodeLogin", () => awaitClaudeCodeLogin());
+
+  ipcMain.handle("chat:submitClaudeCodeLoginCode", (_event, code: string) =>
+    submitClaudeCodeLoginCode(code)
+  );
+
+  ipcMain.handle("chat:cancelClaudeCodeLogin", () => cancelClaudeCodeLogin());
+
+  ipcMain.handle("chat:openClaudeCodeLoginUrl", () => openClaudeCodeLoginUrl());
+
+  ipcMain.handle("chat:revokeClaudeCodeLogin", () => revokeClaudeCodeLogin());
 
   ipcMain.handle("chat:testClaudeCodeConnection", () =>
     testClaudeCodeConnection()

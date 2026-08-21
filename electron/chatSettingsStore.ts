@@ -19,7 +19,11 @@ export const CHAT_SETTINGS_KEYS = {
   anthropicEffort: "chat.anthropic.effort",
   anthropicApiKey: "chat.anthropic.apiKey",
   claudeExecutablePath: "chat.claudeCode.executablePath",
+  claudeUseAppScopedAuth: "chat.claudeCode.useAppScopedAuth",
   claudeModel: "chat.claudeCode.model",
+  claudeEffort: "chat.claudeCode.effort",
+  claudeDefaultModel: "chat.claudeCode.defaultModel",
+  claudeAvailableModels: "chat.claudeCode.availableModels",
   claudeLastConnectionStatus: "chat.claudeCode.lastConnectionStatus",
   claudeLastCheckedAt: "chat.claudeCode.lastCheckedAt",
   claudeRecentActivities: "chat.claudeCode.permissions.recentActivities",
@@ -85,7 +89,16 @@ export function readChatSettingsFromStore(
     claudeCode: {
       executablePath:
         store.get(CHAT_SETTINGS_KEYS.claudeExecutablePath) || undefined,
+      // Defaults on: the app should not silently use another account's login.
+      useAppScopedAuth:
+        store.get(CHAT_SETTINGS_KEYS.claudeUseAppScopedAuth) !== "false",
       model: store.get(CHAT_SETTINGS_KEYS.claudeModel) || undefined,
+      effort: normalizeAnthropicEffort(store.get(CHAT_SETTINGS_KEYS.claudeEffort)),
+      defaultModel:
+        store.get(CHAT_SETTINGS_KEYS.claudeDefaultModel) || undefined,
+      availableModels: parseModelOptions(
+        store.get(CHAT_SETTINGS_KEYS.claudeAvailableModels)
+      ),
       lastConnectionStatus: normalizeClaudeConnectionStatus(
         store.get(CHAT_SETTINGS_KEYS.claudeLastConnectionStatus)
       ),
@@ -149,6 +162,29 @@ export function saveChatSettingsToStore(
     store.set(CHAT_SETTINGS_KEYS.claudeExecutablePath, executablePath);
   } else {
     store.delete([CHAT_SETTINGS_KEYS.claudeExecutablePath]);
+  }
+  store.set(
+    CHAT_SETTINGS_KEYS.claudeUseAppScopedAuth,
+    settings.claudeCode?.useAppScopedAuth === false ? "false" : "true"
+  );
+  store.set(
+    CHAT_SETTINGS_KEYS.claudeEffort,
+    normalizeAnthropicEffort(settings.claudeCode?.effort)
+  );
+  const availableModels = settings.claudeCode?.availableModels;
+  if (availableModels?.length) {
+    store.set(
+      CHAT_SETTINGS_KEYS.claudeAvailableModels,
+      JSON.stringify(availableModels)
+    );
+  } else {
+    store.delete([CHAT_SETTINGS_KEYS.claudeAvailableModels]);
+  }
+  const claudeDefaultModel = settings.claudeCode?.defaultModel?.trim();
+  if (claudeDefaultModel) {
+    store.set(CHAT_SETTINGS_KEYS.claudeDefaultModel, claudeDefaultModel);
+  } else {
+    store.delete([CHAT_SETTINGS_KEYS.claudeDefaultModel]);
   }
   const claudeModel = settings.claudeCode?.model?.trim();
   if (claudeModel) {
@@ -250,6 +286,27 @@ export function saveChatSettingsToStore(
   }
 
   return readChatSettingsFromStore(store, apiKeyStores);
+}
+
+/** Tolerates a corrupt or older payload by falling back to the static list. */
+function parseModelOptions(
+  raw: string | undefined
+): Array<{ value: string; label: string }> | undefined {
+  if (!raw) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return undefined;
+    const rows = parsed.filter(
+      (row): row is { value: string; label: string } =>
+        typeof row === "object" &&
+        row !== null &&
+        typeof (row as { value?: unknown }).value === "string" &&
+        typeof (row as { label?: unknown }).label === "string"
+    );
+    return rows.length > 0 ? rows : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function normalizeAnthropicEffort(value: unknown): AnthropicEffort {

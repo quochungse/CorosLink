@@ -97,6 +97,7 @@ import type {
   ChatSessionSummary,
   ChatSettings,
   ClaudeCodeConnectionTest,
+  ClaudeCodeLoginStart,
   ClaudeCodeStatus,
   PersistedChatEntry,
   ChatStreamStart,
@@ -932,8 +933,18 @@ const api = {
     ipcRenderer.invoke("chat:openOpenRouterModels"),
   getClaudeCodeStatus: (): Promise<ClaudeCodeStatus> =>
     ipcRenderer.invoke("chat:getClaudeCodeStatus"),
-  connectClaudeCode: (): Promise<ClaudeCodeStatus> =>
-    ipcRenderer.invoke("chat:connectClaudeCode"),
+  startClaudeCodeLogin: (): Promise<ClaudeCodeLoginStart> =>
+    ipcRenderer.invoke("chat:startClaudeCodeLogin"),
+  awaitClaudeCodeLogin: (): Promise<ClaudeCodeStatus> =>
+    ipcRenderer.invoke("chat:awaitClaudeCodeLogin"),
+  submitClaudeCodeLoginCode: (code: string): Promise<void> =>
+    ipcRenderer.invoke("chat:submitClaudeCodeLoginCode", code),
+  cancelClaudeCodeLogin: (): Promise<void> =>
+    ipcRenderer.invoke("chat:cancelClaudeCodeLogin"),
+  openClaudeCodeLoginUrl: (): Promise<void> =>
+    ipcRenderer.invoke("chat:openClaudeCodeLoginUrl"),
+  revokeClaudeCodeLogin: (): Promise<ClaudeCodeStatus> =>
+    ipcRenderer.invoke("chat:revokeClaudeCodeLogin"),
   testClaudeCodeConnection: (): Promise<ClaudeCodeConnectionTest> =>
     ipcRenderer.invoke("chat:testClaudeCodeConnection"),
   openClaudeCodeSetupGuide: (): Promise<void> =>

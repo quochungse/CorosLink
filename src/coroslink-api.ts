@@ -94,6 +94,7 @@ import type {
   ChatSessionSummary,
   ChatSettings,
   ClaudeCodeConnectionTest,
+  ClaudeCodeLoginStart,
   ClaudeCodeStatus,
   PersistedChatEntry,
   ChatStreamStart,
@@ -597,7 +598,12 @@ export interface CorosLinkApi {
   openOpenRouterKeys: () => Promise<void>;
   openOpenRouterModels: () => Promise<void>;
   getClaudeCodeStatus: () => Promise<ClaudeCodeStatus>;
-  connectClaudeCode: () => Promise<ClaudeCodeStatus>;
+  startClaudeCodeLogin: () => Promise<ClaudeCodeLoginStart>;
+  awaitClaudeCodeLogin: () => Promise<ClaudeCodeStatus>;
+  submitClaudeCodeLoginCode: (code: string) => Promise<void>;
+  cancelClaudeCodeLogin: () => Promise<void>;
+  openClaudeCodeLoginUrl: () => Promise<void>;
+  revokeClaudeCodeLogin: () => Promise<ClaudeCodeStatus>;
   testClaudeCodeConnection: () => Promise<ClaudeCodeConnectionTest>;
   openClaudeCodeSetupGuide: () => Promise<void>;
   loginChat: () => Promise<ChatAuthStatus>;

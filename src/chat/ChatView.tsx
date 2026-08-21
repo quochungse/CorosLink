@@ -56,6 +56,7 @@ import {
 } from "../units/units";
 import type {
   AnthropicApiConnectionTest,
+  AnthropicEffort,
   ChatAuthStatus,
   ChatProvider,
   ChatSessionSummary,
@@ -85,8 +86,12 @@ import { sportTheme } from "../training-library/sportTheme";
 import { ActivityVisualCard } from "./ActivityVisualCard";
 import { FitnessTrendCard } from "./FitnessTrendCard";
 import { HrZoneCard } from "./HrZoneCard";
+import { supportsReasoningEffort } from "../../electron/chatModels";
 import { ChatSettingsModal } from "./ChatSettingsModal";
+import { ClaudeAuthScopeToggle } from "./ClaudeAuthScopeToggle";
+import { ClaudeCodeLoginCard } from "./ClaudeCodeLoginCard";
 import { ChatSidebar } from "./ChatSidebar";
+import { EffortSwitch } from "./EffortSwitch";
 import { ModelSwitch } from "./ModelSwitch";
 import { ProviderSwitch } from "./ProviderSwitch";
 import {
@@ -113,6 +118,8 @@ const DEFAULT_CHAT_SETTINGS: ChatSettings = {
     hasApiKey: false
   },
   claudeCode: {
+    useAppScopedAuth: true,
+    effort: "high",
     permissions: {
       recentActivities: true,
       trainingMetrics: true,
@@ -1763,6 +1770,7 @@ export function ChatView({
   const [checkingClaude, setCheckingClaude] = useState(false);
   const [connectingClaude, setConnectingClaude] = useState(false);
   const [testingClaude, setTestingClaude] = useState(false);
+  const [revokingClaude, setRevokingClaude] = useState(false);
   const [sessions, setSessions] = useState<ChatSessionSummary[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -2171,6 +2179,17 @@ export function ChatView({
       api.onChatStreamDone((payload) => {
         if (payload.requestId !== activeRequestIdRef.current) return;
         finishStreaming(payload.fullText, payload.finishReason);
+        // A turn is the only thing that reveals Claude Code's default model, and
+        // the main process saves it behind this window's back.
+        if (
+          chatSettings.provider === "claude-code" &&
+          !chatSettings.claudeCode.defaultModel
+        ) {
+          void api
+            .getChatSettings()
+            .then(setChatSettings)
+            .catch(() => undefined);
+        }
       }),
       api.onChatStreamError((payload) => {
         if (payload.requestId !== activeRequestIdRef.current) return;
@@ -2199,7 +2218,13 @@ export function ChatView({
     return () => {
       for (const unsubscribe of unsubscribers) unsubscribe();
     };
-  }, [api, chatSettings.provider, chatSettings.visualizationsEnabled, onError]);
+  }, [
+    api,
+    chatSettings.provider,
+    chatSettings.claudeCode.defaultModel,
+    chatSettings.visualizationsEnabled,
+    onError
+  ]);
 
   // Keep the transcript scrolled to the newest content.
   useEffect(() => {
@@ -2273,22 +2298,27 @@ export function ChatView({
     }, 1500);
   };
 
-  const handleConnectClaudeCode = async () => {
-    if (!api || connectingClaude) return;
-    setConnectingClaude(true);
+  const handleClaudeSignedIn = (status: ClaudeCodeStatus) => {
+    setClaudeStatus(status);
+    if (status.state === "connecting" || status.state === "sign-in-required") {
+      pollClaudeCodeStatus();
+    }
+  };
+
+  const handleRevokeClaudeCode = async () => {
+    if (!api || revokingClaude) return;
+    setRevokingClaude(true);
     onError(null);
     try {
-      const status = await api.connectClaudeCode();
-      setClaudeStatus(status);
-      if (status.state === "connecting" || status.state === "sign-in-required") {
-        pollClaudeCodeStatus();
-      }
+      setClaudeStatus(await api.revokeClaudeCodeLogin());
     } catch (caught) {
       onError(
-        caught instanceof Error ? caught.message : "Claude sign-in failed."
+        caught instanceof Error
+          ? caught.message
+          : "Could not sign CorosLink out of Claude."
       );
     } finally {
-      setConnectingClaude(false);
+      setRevokingClaude(false);
     }
   };
 
@@ -2329,6 +2359,11 @@ export function ChatView({
     try {
       const saved = await api.saveChatSettings(nextSettings);
       setChatSettings(saved);
+      // Switching credential stores can flip the sign-in state, so re-read it
+      // instead of leaving the caller staring at a cleared status.
+      if (patch.useAppScopedAuth !== undefined) {
+        setClaudeStatus(await api.getClaudeCodeStatus());
+      }
     } catch (caught) {
       onError(
         caught instanceof Error
@@ -2502,6 +2537,29 @@ export function ChatView({
       }
     } catch (caught) {
       onError(caught instanceof Error ? caught.message : "Provider change failed.");
+    }
+  };
+
+  const handleEffortChange = async (effort: AnthropicEffort) => {
+    if (!api || !supportsReasoningEffort(chatSettings.provider)) return;
+    const nextSettings: ChatSettings =
+      chatSettings.provider === "claude-api"
+        ? { ...chatSettings, anthropic: { ...chatSettings.anthropic, effort } }
+        : { ...chatSettings, claudeCode: { ...chatSettings.claudeCode, effort } };
+
+    setChatSettings(nextSettings);
+    setSavingSettings(true);
+    onError(null);
+    try {
+      setChatSettings(await api.saveChatSettings(nextSettings));
+    } catch (caught) {
+      onError(
+        caught instanceof Error
+          ? caught.message
+          : "Could not save the reasoning effort."
+      );
+    } finally {
+      setSavingSettings(false);
     }
   };
 
@@ -3301,14 +3359,36 @@ export function ChatView({
         : chatSettings.provider === "openrouter"
           ? chatSettings.openRouter.model
           : chatSettings.chatgpt.model ?? "";
+  const selectedEffort =
+    chatSettings.provider === "claude-api"
+      ? chatSettings.anthropic.effort
+      : chatSettings.claudeCode.effort;
   const providerControls = (
     <div className="chat-provider-controls">
       {providerSwitch}
       <ModelSwitch
         provider={chatSettings.provider}
         model={selectedModel}
+        defaultModel={
+          chatSettings.provider === "claude-code"
+            ? (claudeStatus?.defaultModel ??
+              chatSettings.claudeCode.defaultModel)
+            : undefined
+        }
+        availableModels={
+          chatSettings.provider === "claude-code"
+            ? (claudeStatus?.availableModels ??
+              chatSettings.claudeCode.availableModels)
+            : undefined
+        }
         disabled={savingSettings || isBusy}
         onChange={(model) => void handleModelChange(model)}
+      />
+      <EffortSwitch
+        provider={chatSettings.provider}
+        effort={selectedEffort}
+        disabled={savingSettings || isBusy}
+        onChange={(effort) => void handleEffortChange(effort)}
       />
     </div>
   );
@@ -3347,12 +3427,14 @@ export function ChatView({
     checkingClaude,
     connectingClaude,
     testingClaude,
+    revokingClaude,
     busy: isBusy,
     onClose: () => setSettingsOpen(false),
     onSignIn: () => void handleSignIn(),
     onSignOut: () => void handleSignOut(),
     onRefreshClaude: () => void refreshClaudeCodeStatus(),
-    onConnectClaude: () => void handleConnectClaudeCode(),
+    onClaudeSignedIn: handleClaudeSignedIn,
+    onRevokeClaude: () => void handleRevokeClaudeCode(),
     onTestClaude: () => void handleTestClaudeCode(),
     onOpenClaudeSetupGuide: () => void api?.openClaudeCodeSetupGuide(),
     anthropicApiKey,
@@ -3487,9 +3569,20 @@ export function ChatView({
                 <span className="chat-beta-badge">Beta</span>
               </div>
               <p>
-                Use the Claude Code CLI installed on this computer with your
-                existing Claude subscription. CorosLink does not read or store
-                your Claude credentials.
+                Coach with your Claude subscription through the Claude Code CLI
+                on this computer.
+              </p>
+              <ClaudeAuthScopeToggle
+                appScoped={chatSettings.claudeCode.useAppScopedAuth !== false}
+                disabled={checkingClaude}
+                onChange={(next) =>
+                  void handleUpdateClaudeCode({ useAppScopedAuth: next })
+                }
+              />
+              <p className="chat-login-note">
+                {chatSettings.claudeCode.useAppScopedAuth !== false
+                  ? "Signing in here creates credentials that belong to CorosLink alone. Any Claude account you use elsewhere on this computer — including in a terminal — is left alone."
+                  : "CorosLink will use the machine-wide Claude login in your home folder, shared with your terminal. Signing in here replaces that login."}
               </p>
               <div className="chat-login-actions">
                 {notInstalled ? (
@@ -3502,23 +3595,11 @@ export function ChatView({
                     Install Claude Code
                   </button>
                 ) : (
-                  <button
-                    type="button"
-                    className="primary-button"
-                    onClick={() => void handleConnectClaudeCode()}
-                    disabled={connectingClaude || !api}
-                  >
-                    {connectingClaude ? (
-                      <Loader2
-                        className="chat-spinner"
-                        size={16}
-                        aria-hidden="true"
-                      />
-                    ) : (
-                      <Terminal size={16} aria-hidden="true" />
-                    )}
-                    Sign in with Claude
-                  </button>
+                  <ClaudeCodeLoginCard
+                    api={api}
+                    onSignedIn={handleClaudeSignedIn}
+                    onError={onError}
+                  />
                 )}
                 <button
                   type="button"

@@ -31,13 +31,15 @@ export function ChatSettingsModal({
   checkingClaude,
   connectingClaude,
   testingClaude,
+  revokingClaude,
   mcpRefreshVersion,
   busy,
   onClose,
   onSignIn,
   onSignOut,
   onRefreshClaude,
-  onConnectClaude,
+  onClaudeSignedIn,
+  onRevokeClaude,
   onTestClaude,
   onOpenClaudeSetupGuide,
   onUpdateClaudeCode,
@@ -84,13 +86,15 @@ export function ChatSettingsModal({
   checkingClaude: boolean;
   connectingClaude: boolean;
   testingClaude: boolean;
+  revokingClaude: boolean;
   mcpRefreshVersion: number;
   busy?: boolean;
   onClose: () => void;
   onSignIn: () => void;
   onSignOut: () => void;
   onRefreshClaude: () => void;
-  onConnectClaude: () => void;
+  onClaudeSignedIn: (status: ClaudeCodeStatus) => void;
+  onRevokeClaude: () => void;
   onTestClaude: () => void;
   onOpenClaudeSetupGuide: () => void;
   onUpdateClaudeCode: (
@@ -187,12 +191,14 @@ export function ChatSettingsModal({
             checkingClaude={checkingClaude}
             connectingClaude={connectingClaude}
             testingClaude={testingClaude}
+            revokingClaude={revokingClaude}
             mcpRefreshVersion={mcpRefreshVersion}
             busy={busy}
             onSignIn={onSignIn}
             onSignOut={onSignOut}
             onRefreshClaude={onRefreshClaude}
-            onConnectClaude={onConnectClaude}
+            onClaudeSignedIn={onClaudeSignedIn}
+            onRevokeClaude={onRevokeClaude}
             onTestClaude={onTestClaude}
             onOpenClaudeSetupGuide={onOpenClaudeSetupGuide}
             onUpdateClaudeCode={onUpdateClaudeCode}

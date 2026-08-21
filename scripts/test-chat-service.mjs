@@ -654,15 +654,116 @@ globalThis.fetch = originalFetch;
 const { readChatSettingsFromStore, saveChatSettingsToStore } = await import(
   `${distUrl("chatSettingsStore.js")}?cacheBust=${Date.now()}`
 );
-const { getChatGptModelCandidates, getChatModelOptions } = await import(
-  `${distUrl("chatModels.js")}?cacheBust=${Date.now()}`
+const {
+  CLAUDE_MODEL_OPTIONS,
+  REASONING_EFFORT_OPTIONS,
+  formatClaudeModelName,
+  formatEffortOption,
+  formatModelOptionLabel,
+  getChatGptModelCandidates,
+  getChatModelOptions,
+  getModelPickerOptions,
+  supportsReasoningEffort,
+  withNamedDefaultModel
+} = await import(`${distUrl("chatModels.js")}?cacheBust=${Date.now()}`);
+
+// Effort reaches only the Claude backends; offering it elsewhere would send a
+// parameter those providers reject.
+assert.equal(supportsReasoningEffort("claude-code"), true);
+assert.equal(supportsReasoningEffort("claude-api"), true);
+assert.equal(supportsReasoningEffort("chatgpt"), false);
+assert.equal(supportsReasoningEffort("local"), false);
+assert.deepEqual(
+  REASONING_EFFORT_OPTIONS.map((option) => option.value),
+  ["low", "medium", "high", "xhigh", "max"]
+);
+// The compact picker shows the short label; Settings appends the detail.
+assert.equal(formatEffortOption({ value: "medium", label: "Medium" }), "Medium");
+assert.equal(
+  formatEffortOption({ value: "high", label: "High", detail: "default" }),
+  "High — default"
+);
+
+// The pill shows the short label; only the open menu appends the qualifier.
+assert.equal(
+  formatModelOptionLabel({ value: "sonnet", label: "Sonnet 4.6" }),
+  "Sonnet 4.6"
+);
+assert.equal(
+  formatModelOptionLabel({
+    value: "sonnet",
+    label: "Sonnet 4.6",
+    detail: "Efficient for routine tasks"
+  }),
+  "Sonnet 4.6 (Efficient for routine tasks)"
+);
+
+// The CLI reports dated ids; the picker shows the family and version instead.
+assert.equal(formatClaudeModelName("claude-sonnet-4-6-20250219"), "Sonnet 4.6");
+assert.equal(formatClaudeModelName("claude-opus-5"), "Opus 5");
+assert.equal(formatClaudeModelName("claude-haiku-4-5"), "Haiku 4.5");
+// Anything that is not a family-and-version id is passed through untouched.
+assert.equal(formatClaudeModelName("sonnet"), "sonnet");
+assert.equal(formatClaudeModelName(""), "");
+
+// The Claude Code CLI's reported default names only its own entry. ChatGPT's
+// empty-value option is "Auto" and must never be relabelled with a Claude
+// model, which is what the conversation header used to show.
+const CLI_DEFAULT = "claude-sonnet-4-6-20250219";
+assert.equal(
+  getModelPickerOptions("claude-code", CLI_DEFAULT)[0].label,
+  "Default (Sonnet 4.6)"
+);
+assert.equal(getModelPickerOptions("chatgpt", CLI_DEFAULT)[0].label, "Auto");
+assert.deepEqual(
+  getModelPickerOptions("chatgpt", CLI_DEFAULT),
+  getChatModelOptions("chatgpt")
+);
+assert.deepEqual(
+  getModelPickerOptions("claude-api", CLI_DEFAULT),
+  getChatModelOptions("claude-api")
+);
+assert.deepEqual(
+  getModelPickerOptions("local", CLI_DEFAULT),
+  getChatModelOptions("local")
+);
+// Without a reported default the Claude entry keeps its generic label.
+assert.equal(
+  getModelPickerOptions("claude-code", undefined)[0].label,
+  "Default model"
 );
 
 assert.deepEqual(
   getChatModelOptions("claude-api").map((option) => option.value),
   ["claude-opus-5", "claude-fable-5", "claude-sonnet-5", "claude-haiku-4-5"]
 );
-assert.equal(getChatModelOptions("claude-code")[0].value, "");
+// Settings and the conversation header must offer the same Claude entries; they
+// used to hardcode two different label sets.
+assert.deepEqual(getChatModelOptions("claude-code"), CLAUDE_MODEL_OPTIONS);
+assert.deepEqual(
+  CLAUDE_MODEL_OPTIONS.map((option) => option.label),
+  [
+    "Default model",
+    "Opus (most capable)",
+    "Sonnet (balanced)",
+    "Haiku (fastest)"
+  ]
+);
+
+// Only the "let Claude decide" entry gets renamed, and only once known.
+const named = withNamedDefaultModel(
+  CLAUDE_MODEL_OPTIONS,
+  "claude-sonnet-4-6-20250219"
+);
+assert.equal(named[0].label, "Default (Sonnet 4.6)");
+assert.deepEqual(named.slice(1), CLAUDE_MODEL_OPTIONS.slice(1));
+assert.deepEqual(withNamedDefaultModel(CLAUDE_MODEL_OPTIONS), CLAUDE_MODEL_OPTIONS);
+assert.deepEqual(
+  withNamedDefaultModel(CLAUDE_MODEL_OPTIONS, "   "),
+  CLAUDE_MODEL_OPTIONS
+);
+// The shared list is never mutated in place.
+assert.equal(CLAUDE_MODEL_OPTIONS[0].label, "Default model");
 
 assert.deepEqual(
   getChatGptModelCandidates("gpt-5.6-terra", "gpt-5.5"),
@@ -737,6 +838,13 @@ const saved = saveChatSettingsToStore(fakeStore, fakeKeyStores, {
   },
   claudeCode: {
     model: "sonnet",
+    useAppScopedAuth: false,
+    effort: "max",
+    defaultModel: "claude-sonnet-4-6",
+    availableModels: [
+      { value: "", label: "Default (Sonnet 4.6)" },
+      { value: "sonnet", label: "Sonnet 4.6" }
+    ],
     executablePath: "/opt/claude/bin/claude",
     lastConnectionStatus: "connected",
     lastCheckedAt: "2026-07-10T12:00:00.000Z",
@@ -766,6 +874,14 @@ assert.equal(saved.openRouter.apiKey, undefined);
 assert.equal(saved.claudeCode.executablePath, "/opt/claude/bin/claude");
 assert.equal(saved.claudeCode.model, "sonnet");
 assert.equal(saved.claudeCode.lastConnectionStatus, "connected");
+assert.equal(saved.claudeCode.useAppScopedAuth, false);
+assert.equal(saved.claudeCode.effort, "max");
+assert.equal(saved.claudeCode.defaultModel, "claude-sonnet-4-6");
+// The account model list round-trips as JSON so the picker can name versions.
+assert.deepEqual(saved.claudeCode.availableModels, [
+  { value: "", label: "Default (Sonnet 4.6)" },
+  { value: "sonnet", label: "Sonnet 4.6" }
+]);
 assert.deepEqual(saved.claudeCode.permissions, {
   recentActivities: true,
   trainingMetrics: false,
@@ -791,8 +907,51 @@ assert.equal(storedAnthropicKey, "sk-ant-secret");
 const loaded = readChatSettingsFromStore(fakeStore, fakeKeyStores);
 assert.deepEqual(loaded, saved);
 
-const cleared = saveChatSettingsToStore(fakeStore, fakeKeyStores, {
+// An app-scoped Claude login is the default, so the app never silently borrows
+// whichever account the machine's CLI happens to be signed into.
+const scopedByDefault = readChatSettingsFromStore(
+  {
+    get: () => undefined,
+    set: () => {},
+    delete: () => {}
+  },
+  fakeKeyStores
+);
+assert.equal(scopedByDefault.claudeCode.useAppScopedAuth, true);
+assert.equal(scopedByDefault.claudeCode.effort, "high");
+assert.equal(scopedByDefault.claudeCode.defaultModel, undefined);
+assert.equal(scopedByDefault.claudeCode.availableModels, undefined);
+// A corrupt or wrongly-shaped payload falls back rather than breaking the picker.
+for (const bad of ['not json', '{"a":1}', "[]", '[{"value":1}]']) {
+  assert.equal(
+    readChatSettingsFromStore(
+      { get: (key) => (key === "chat.claudeCode.availableModels" ? bad : undefined), set: () => {}, delete: () => {} },
+      fakeKeyStores
+    ).claudeCode.availableModels,
+    undefined
+  );
+}
+// Unknown default keeps the plain wording rather than inventing a name.
+assert.equal(
+  withNamedDefaultModel(
+    CLAUDE_MODEL_OPTIONS,
+    scopedByDefault.claudeCode.defaultModel
+  )[0].label,
+  "Default model"
+);
+// The value the CLI actually reports on this machine renders as expected.
+assert.equal(
+  withNamedDefaultModel(CLAUDE_MODEL_OPTIONS, "claude-sonnet-4-6")[0].label,
+  "Default (Sonnet 4.6)"
+);
+const reScoped = saveChatSettingsToStore(fakeStore, fakeKeyStores, {
   ...loaded,
+  claudeCode: { ...loaded.claudeCode, useAppScopedAuth: true }
+});
+assert.equal(reScoped.claudeCode.useAppScopedAuth, true);
+
+const cleared = saveChatSettingsToStore(fakeStore, fakeKeyStores, {
+  ...reScoped,
   openRouter: { ...loaded.openRouter, clearApiKey: true },
   local: { ...loaded.local, clearApiKey: true }
 });

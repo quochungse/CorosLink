@@ -10,6 +10,7 @@ import {
   RefreshCw,
   Save,
   Terminal,
+  UserRound,
   X
 } from "lucide-react";
 import type {
@@ -23,20 +24,18 @@ import type {
   OpenRouterConnectionTest
 } from "../../electron/types";
 import { MAX_CUSTOM_COACH_INSTRUCTIONS } from "../../electron/types";
-import { ANTHROPIC_MODEL_OPTIONS } from "../../electron/chatModels";
+import {
+  ANTHROPIC_MODEL_OPTIONS,
+  CLAUDE_MODEL_OPTIONS,
+  REASONING_EFFORT_OPTIONS,
+  formatEffortOption,
+  formatModelOptionLabel,
+  withNamedDefaultModel
+} from "../../electron/chatModels";
+import { ClaudeAuthScopeToggle } from "./ClaudeAuthScopeToggle";
+import { ClaudeCodeLoginCard } from "./ClaudeCodeLoginCard";
 import { McpServersPanel } from "./McpServersPanel";
 import type { CorosLinkApi } from "../coroslink-api";
-
-const ANTHROPIC_EFFORT_OPTIONS: Array<{
-  value: AnthropicEffort;
-  label: string;
-}> = [
-  { value: "low", label: "Low — fastest and cheapest" },
-  { value: "medium", label: "Medium" },
-  { value: "high", label: "High — default" },
-  { value: "xhigh", label: "Extra high" },
-  { value: "max", label: "Max — most thorough" }
-];
 
 function claudeStatusLabel(status: ClaudeCodeStatus | null): string {
   if (!status) return "Not checked";
@@ -66,12 +65,14 @@ export function ChatSettingsPanel({
   checkingClaude,
   connectingClaude,
   testingClaude,
+  revokingClaude,
   mcpRefreshVersion,
   busy,
   onSignIn,
   onSignOut,
   onRefreshClaude,
-  onConnectClaude,
+  onClaudeSignedIn,
+  onRevokeClaude,
   onTestClaude,
   onOpenClaudeSetupGuide,
   onUpdateClaudeCode,
@@ -117,12 +118,14 @@ export function ChatSettingsPanel({
   checkingClaude: boolean;
   connectingClaude: boolean;
   testingClaude: boolean;
+  revokingClaude: boolean;
   mcpRefreshVersion: number;
   busy?: boolean;
   onSignIn: () => void;
   onSignOut: () => void;
   onRefreshClaude: () => void;
-  onConnectClaude: () => void;
+  onClaudeSignedIn: (status: ClaudeCodeStatus) => void;
+  onRevokeClaude: () => void;
   onTestClaude: () => void;
   onOpenClaudeSetupGuide: () => void;
   onUpdateClaudeCode: (
@@ -179,6 +182,8 @@ export function ChatSettingsPanel({
     onUpdateChatSettings({ customInstructions: next });
   };
 
+  const appScopedAuth = chatSettings.claudeCode.useAppScopedAuth !== false;
+  const [claudeLoginError, setClaudeLoginError] = useState<string | null>(null);
   const [baseInstructionsOpen, setBaseInstructionsOpen] = useState(false);
   const [baseInstructions, setBaseInstructions] = useState<string | null>(null);
   const [baseInstructionsError, setBaseInstructionsError] = useState<string | null>(
@@ -446,8 +451,9 @@ export function ChatSettingsPanel({
           <span className="chat-beta-badge">Beta</span>
         </div>
         <p className="chat-settings-copy">
-          Uses Claude Code installed and signed in on this computer. CorosLink
-          never reads or stores your Claude password or subscription credentials.
+          Runs the Claude Code CLI installed on this computer against your Claude
+          subscription. CorosLink never sees your Claude password — sign-in
+          happens in your browser and Claude Code stores the credentials.
         </p>
 
         <label className="chat-local-field">
@@ -465,20 +471,67 @@ export function ChatSettingsPanel({
           </div>
         </label>
 
-        <label className="chat-local-field">
-          <span>Model</span>
-          <select
-            value={chatSettings.claudeCode.model ?? ""}
-            onChange={(event) =>
-              onUpdateClaudeCode({ model: event.target.value })
-            }
-          >
-            <option value="">Account default</option>
-            <option value="opus">Opus (most capable)</option>
-            <option value="sonnet">Sonnet (balanced)</option>
-            <option value="haiku">Haiku (fastest)</option>
-          </select>
-        </label>
+        <div className="chat-claude-model-row">
+          <label className="chat-local-field">
+            <span>Model</span>
+            <select
+              value={chatSettings.claudeCode.model ?? ""}
+              onChange={(event) =>
+                onUpdateClaudeCode({ model: event.target.value })
+              }
+            >
+              {(
+                claudeStatus?.availableModels?.length
+                  ? claudeStatus.availableModels
+                  : chatSettings.claudeCode.availableModels?.length
+                    ? chatSettings.claudeCode.availableModels
+                    : withNamedDefaultModel(
+                        CLAUDE_MODEL_OPTIONS,
+                        chatSettings.claudeCode.defaultModel
+                      )
+              ).map((option) => (
+                <option key={option.value} value={option.value}>
+                  {formatModelOptionLabel(option)}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <label className="chat-local-field">
+            <span>Reasoning effort</span>
+            <select
+              value={chatSettings.claudeCode.effort}
+              onChange={(event) =>
+                onUpdateClaudeCode({
+                  effort: event.target.value as AnthropicEffort
+                })
+              }
+            >
+              {REASONING_EFFORT_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {formatEffortOption(option)}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+        <p className="chat-settings-copy">
+          Higher effort means deeper reasoning per answer and more of your
+          subscription usage. Claude quietly drops to the highest level your
+          selected model supports.
+        </p>
+
+        <ClaudeAuthScopeToggle
+          appScoped={appScopedAuth}
+          disabled={busy}
+          onChange={(next) => onUpdateClaudeCode({ useAppScopedAuth: next })}
+        />
+        <p className="chat-settings-copy">
+          {appScopedAuth
+            ? "CorosLink keeps its own Claude credentials in its app data folder. Any Claude account you use elsewhere on this computer — including in a terminal — is left alone."
+            : "CorosLink will use the machine-wide Claude login in your home folder, shared with the terminal. Signing in here replaces that login."}
+        </p>
+
 
         <div className="chat-claude-status" data-state={claudeStatus?.state}>
           {checkingClaude || connectingClaude ? (
@@ -494,6 +547,16 @@ export function ChatSettingsPanel({
               {claudeStatus?.message ??
                 "Check this computer for an installed Claude Code runtime."}
             </span>
+            {claudeStatus?.email ? (
+              <span className="chat-claude-account">
+                <UserRound size={12} aria-hidden="true" />
+                {claudeStatus.email}
+                {claudeStatus.orgName ? ` · ${claudeStatus.orgName}` : ""}
+                {claudeStatus.subscriptionType
+                  ? ` · ${claudeStatus.subscriptionType}`
+                  : ""}
+              </span>
+            ) : null}
           </div>
         </div>
 
@@ -522,19 +585,12 @@ export function ChatSettingsPanel({
             </button>
           ) : null}
           {claudeStatus?.installed && claudeStatus.state !== "connected" ? (
-            <button
-              type="button"
-              className="chat-local-action primary"
-              onClick={onConnectClaude}
+            <ClaudeCodeLoginCard
+              api={api}
               disabled={connectingClaude || busy}
-            >
-              {connectingClaude ? (
-                <Loader2 className="chat-spinner" size={14} aria-hidden="true" />
-              ) : (
-                <Terminal size={14} aria-hidden="true" />
-              )}
-              Sign in with Claude
-            </button>
+              onSignedIn={onClaudeSignedIn}
+              onError={(message) => setClaudeLoginError(message)}
+            />
           ) : null}
           {claudeStatus?.state === "connected" ? (
             <button
@@ -551,6 +607,29 @@ export function ChatSettingsPanel({
               Test connection
             </button>
           ) : null}
+          {appScopedAuth && claudeStatus?.authenticated ? (
+            <button
+              type="button"
+              className="chat-local-action is-danger"
+              onClick={() => {
+                if (
+                  window.confirm(
+                    "Sign CorosLink out of Claude? Your Claude login elsewhere on this computer is not affected."
+                  )
+                ) {
+                  onRevokeClaude();
+                }
+              }}
+              disabled={revokingClaude || busy}
+            >
+              {revokingClaude ? (
+                <Loader2 className="chat-spinner" size={14} aria-hidden="true" />
+              ) : (
+                <LogOut size={14} aria-hidden="true" />
+              )}
+              Revoke
+            </button>
+          ) : null}
           <button
             type="button"
             className="chat-local-action"
@@ -560,6 +639,10 @@ export function ChatSettingsPanel({
             Setup guide
           </button>
         </div>
+
+        {claudeLoginError ? (
+          <p className="chat-local-result is-error">{claudeLoginError}</p>
+        ) : null}
 
         <div className="chat-claude-permissions">
           <strong>Claude can access</strong>
@@ -662,9 +745,9 @@ export function ChatSettingsPanel({
                 })
               }
             >
-              {ANTHROPIC_EFFORT_OPTIONS.map((option) => (
+              {REASONING_EFFORT_OPTIONS.map((option) => (
                 <option key={option.value} value={option.value}>
-                  {option.label}
+                  {formatEffortOption(option)}
                 </option>
               ))}
             </select>
