@@ -22,6 +22,11 @@ const TEST_TIMEOUT_MS = 45_000;
 const LOGIN_URL_TIMEOUT_MS = 30_000;
 const LOGIN_COMPLETION_TIMEOUT_MS = 10 * 60_000;
 const LOGIN_POLL_INTERVAL_MS = 2_000;
+
+// `claude --version` costs a process spawn per status read, and the answer only
+// changes when the CLI is upgraded, so it is resolved once per path per run.
+// Failures are not cached: a binary that could not launch may launch later.
+const versionCache = new Map<string, string | undefined>();
 const REQUEST_TIMEOUT_MS = 3 * 60_000;
 
 const SUBSCRIPTION_ENV_KEYS = [
@@ -279,22 +284,25 @@ export async function getClaudeCodeStatus(
     };
   }
 
-  let version: string | undefined;
-  try {
-    const result = await execClaude(executablePath, ["--version"], {
-      timeout: DETECTION_TIMEOUT_MS,
-      configDir
-    });
-    version = result.stdout.trim() || undefined;
-  } catch (caught) {
-    return {
-      state: "connection-failed",
-      installed: true,
-      authenticated: false,
-      executablePath,
-      checkedAt,
-      message: `Claude Code was found but could not launch: ${safeErrorMessage(caught)}`
-    };
+  let version = versionCache.get(executablePath);
+  if (!versionCache.has(executablePath)) {
+    try {
+      const result = await execClaude(executablePath, ["--version"], {
+        timeout: DETECTION_TIMEOUT_MS,
+        configDir
+      });
+      version = result.stdout.trim() || undefined;
+      versionCache.set(executablePath, version);
+    } catch (caught) {
+      return {
+        state: "connection-failed",
+        installed: true,
+        authenticated: false,
+        executablePath,
+        checkedAt,
+        message: `Claude Code was found but could not launch: ${safeErrorMessage(caught)}`
+      };
+    }
   }
 
   try {

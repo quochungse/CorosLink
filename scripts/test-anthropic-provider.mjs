@@ -50,6 +50,14 @@ const sonnet = buildAnthropicRequestTuning({
 assert.deepEqual(sonnet.output_config, { effort: "low" });
 assert.equal(sonnet.fallbacks, undefined);
 
+// Asking for more output than a model allows is a hard 400, so an id this build
+// does not know gets a lower ceiling rather than the optimistic one.
+assert.equal(getAnthropicModelCapabilities("claude-opus-5").maxOutputTokens, 64_000);
+assert.equal(
+  getAnthropicModelCapabilities("claude-opus-9").maxOutputTokens,
+  32_000
+);
+
 // A model id newer than this build keeps the modern request shape.
 const unknown = getAnthropicModelCapabilities("claude-opus-9");
 assert.equal(unknown.adaptiveThinking, true);

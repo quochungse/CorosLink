@@ -2354,14 +2354,22 @@ export function ChatView({
     };
     const nextSettings = { ...chatSettings, claudeCode: nextClaudeCode };
     setChatSettings(nextSettings);
-    setClaudeStatus(null);
+    // Only a different binary or credential store can invalidate the
+    // connection. Clearing the status for a model, effort or permission change
+    // made showClaudeGate true and dropped the athlete out of the conversation.
+    const invalidatesConnection =
+      patch.executablePath !== undefined ||
+      patch.useAppScopedAuth !== undefined;
+    if (invalidatesConnection) {
+      setClaudeStatus(null);
+    }
     if (!api) return;
     try {
       const saved = await api.saveChatSettings(nextSettings);
       setChatSettings(saved);
       // Switching credential stores can flip the sign-in state, so re-read it
       // instead of leaving the caller staring at a cleared status.
-      if (patch.useAppScopedAuth !== undefined) {
+      if (invalidatesConnection) {
         setClaudeStatus(await api.getClaudeCodeStatus());
       }
     } catch (caught) {

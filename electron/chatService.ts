@@ -99,6 +99,7 @@ import type {
   ChatAuthStatus,
   ChatSettings,
   ChatProvider,
+  ClaudeCodeConfig,
   ClaudeCodeConnectionTest,
   ClaudeCodeLoginStart,
   ClaudeCodePermissions,
@@ -215,17 +216,27 @@ export async function getClaudeCodeConnectionStatus(): Promise<ClaudeCodeStatus>
     availableModels:
       status.availableModels || settings.claudeCode.availableModels
   };
-  if (!merged.availableModels?.length && merged.executablePath) {
-    // Probed once, then cached: the model list is per account and only the CLI
-    // knows which version each alias points at.
+  const configDir = getClaudeCodeConfigDir(settings);
+  if (
+    !merged.availableModels?.length &&
+    merged.executablePath &&
+    merged.authenticated &&
+    !probedModelDirs.has(configDir ?? "machine")
+  ) {
+    probedModelDirs.add(configDir ?? "machine");
     merged.availableModels = await readClaudeCodeModels(
       merged.executablePath,
-      getClaudeCodeConfigDir(settings)
+      configDir
     );
   }
   recordClaudeCodeStatus(merged);
   return merged;
 }
+
+// listClaudeCodeModels spawns the CLI and takes over a second, so it must never
+// run on the status polls that fire every 1.5-3s. One attempt per credential
+// store per run; Test connection forces a fresh read.
+const probedModelDirs = new Set<string>();
 
 async function readClaudeCodeModels(
   executablePath: string,
@@ -364,6 +375,8 @@ export async function testClaudeCodeConnection(): Promise<ClaudeCodeConnectionTe
     settings.claudeCode.executablePath,
     configDir
   );
+  // An explicit connection test is the one moment worth re-reading the list.
+  probedModelDirs.delete(configDir ?? "machine");
   const status: ClaudeCodeStatus = {
     ...result.status,
     availableModels: result.status.executablePath
@@ -377,21 +390,36 @@ export async function testClaudeCodeConnection(): Promise<ClaudeCodeConnectionTe
 
 function recordClaudeCodeStatus(status: ClaudeCodeStatus): void {
   const current = getChatSettings();
-  saveChatSettings({
-    ...current,
-    claudeCode: {
-      ...current.claudeCode,
-      executablePath:
-        current.claudeCode.executablePath || status.executablePath,
-      // Sticky: a status read that did not observe a turn reports no model, and
-      // forgetting it would blank the picker's "Default (…)" label.
-      defaultModel: status.defaultModel || current.claudeCode.defaultModel,
-      availableModels:
-        status.availableModels || current.claudeCode.availableModels,
-      lastConnectionStatus: status.state,
-      lastCheckedAt: status.checkedAt
-    }
-  });
+  const next: ClaudeCodeConfig = {
+    ...current.claudeCode,
+    executablePath: current.claudeCode.executablePath || status.executablePath,
+    // Sticky: a status read that did not observe a turn reports no model, and
+    // forgetting it would blank the picker's "Default (…)" label.
+    defaultModel: status.defaultModel || current.claudeCode.defaultModel,
+    availableModels:
+      status.availableModels || current.claudeCode.availableModels,
+    lastConnectionStatus: status.state,
+    lastCheckedAt: status.checkedAt
+  };
+  // Status is re-read every few seconds while a sign-in is pending, and each
+  // save is a dozen SQLite writes. Only the timestamp usually differs, so
+  // compare everything else and skip the write when nothing really moved.
+  if (isSameClaudeCodeRecord(current.claudeCode, next)) {
+    return;
+  }
+  saveChatSettings({ ...current, claudeCode: next });
+}
+
+function isSameClaudeCodeRecord(
+  a: ClaudeCodeConfig,
+  b: ClaudeCodeConfig
+): boolean {
+  return (
+    a.executablePath === b.executablePath &&
+    a.defaultModel === b.defaultModel &&
+    a.lastConnectionStatus === b.lastConnectionStatus &&
+    JSON.stringify(a.availableModels) === JSON.stringify(b.availableModels)
+  );
 }
 
 export function listChatSessionsForProvider(provider: ChatProvider) {

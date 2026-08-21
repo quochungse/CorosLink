@@ -22,6 +22,9 @@ export const DEFAULT_ANTHROPIC_EFFORT: AnthropicEffort = "high";
 const ANTHROPIC_BASE_URL = "https://api.anthropic.com";
 // Requests stream, so a generous cap costs nothing and avoids mid-plan cutoffs.
 const MAX_OUTPUT_TOKENS = 64_000;
+// Used for model ids this build does not know: over-asking is a hard 400, while
+// a lower ceiling only risks truncating an unusually long plan.
+const CONSERVATIVE_OUTPUT_TOKENS = 32_000;
 // Server-side rescue when a safety classifier declines a turn.
 const REFUSAL_FALLBACK_BETA = "server-side-fallback-2026-06-01";
 const REFUSAL_FALLBACK_MODEL = "claude-opus-4-8";
@@ -52,28 +55,34 @@ export interface AnthropicModelCapabilities {
   effort: boolean;
   /** Refusals on this model can be rescued by a server-side fallback. */
   refusalFallback: boolean;
+  /** Ceiling for max_tokens; asking for more than a model allows is a 400. */
+  maxOutputTokens: number;
 }
 
 const MODEL_CAPABILITIES: Record<string, AnthropicModelCapabilities> = {
   "claude-opus-5": {
     adaptiveThinking: true,
     effort: true,
-    refusalFallback: true
+    refusalFallback: true,
+    maxOutputTokens: MAX_OUTPUT_TOKENS
   },
   "claude-fable-5": {
     adaptiveThinking: true,
     effort: true,
-    refusalFallback: true
+    refusalFallback: true,
+    maxOutputTokens: MAX_OUTPUT_TOKENS
   },
   "claude-sonnet-5": {
     adaptiveThinking: true,
     effort: true,
-    refusalFallback: false
+    refusalFallback: false,
+    maxOutputTokens: MAX_OUTPUT_TOKENS
   },
   "claude-haiku-4-5": {
     adaptiveThinking: false,
     effort: false,
-    refusalFallback: false
+    refusalFallback: false,
+    maxOutputTokens: MAX_OUTPUT_TOKENS
   }
 };
 
@@ -83,7 +92,8 @@ const MODEL_CAPABILITIES: Record<string, AnthropicModelCapabilities> = {
 const ASSUMED_CAPABILITIES: AnthropicModelCapabilities = {
   adaptiveThinking: true,
   effort: true,
-  refusalFallback: false
+  refusalFallback: false,
+  maxOutputTokens: CONSERVATIVE_OUTPUT_TOKENS
 };
 
 export function getAnthropicModelCapabilities(
@@ -102,7 +112,7 @@ export interface AnthropicRuntimeConfig {
   effort: AnthropicEffort;
 }
 
-export interface AnthropicRequestTuning {
+interface AnthropicRequestTuning {
   thinking?: Anthropic.Beta.BetaThinkingConfigParam;
   output_config?: Anthropic.Beta.BetaOutputConfig;
   betas?: Anthropic.Beta.AnthropicBeta[];
@@ -182,7 +192,7 @@ export interface StreamAnthropicChatOptions {
   ): Promise<string>;
 }
 
-export function createAnthropicClient(apiKey: string): Anthropic {
+function createAnthropicClient(apiKey: string): Anthropic {
   return new Anthropic({ apiKey, baseURL: ANTHROPIC_BASE_URL });
 }
 
@@ -216,7 +226,7 @@ export async function streamAnthropicChatCompletion(
       const stream = client.beta.messages.stream(
         {
           model,
-          max_tokens: MAX_OUTPUT_TOKENS,
+          max_tokens: getAnthropicModelCapabilities(model).maxOutputTokens,
           system: options.instructions,
           messages: conversation,
           ...(tools.length > 0 ? { tools } : {}),
