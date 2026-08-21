@@ -6,6 +6,7 @@ import {
   insertChatSessionRow,
   listChatSessionRows,
   setChatSessionPinnedRow,
+  setChatSessionTitleRow,
   updateChatSessionRow
 } from "./database";
 import type {
@@ -13,6 +14,7 @@ import type {
   ActivityVisualHrSection,
   ActivityVisualLapPoint,
   ActivityVisualPreview,
+  ChatEntryAutomationMarker,
   ChatProvider,
   ChatSessionSummary,
   CoachInputChoice,
@@ -62,6 +64,7 @@ export interface ChatSessionDatabase {
     updatedAt: string
   ): void;
   setSessionPinned(id: string, pinnedAt: string | null): void;
+  setSessionTitle(id: string, title: string): void;
   deleteSession(id: string): void;
 }
 
@@ -81,6 +84,7 @@ function createSqliteSessionDatabase(): ChatSessionDatabase {
     updateSession: (id, title, messagesJson, updatedAt) =>
       updateChatSessionRow(id, title, messagesJson, updatedAt),
     setSessionPinned: (id, pinnedAt) => setChatSessionPinnedRow(id, pinnedAt),
+    setSessionTitle: (id, title) => setChatSessionTitleRow(id, title),
     deleteSession: (id) => deleteChatSessionRow(id)
   };
 }
@@ -725,6 +729,30 @@ function parseHrZonePreview(value: unknown): HrZonePreview | null {
   };
 }
 
+/**
+ * Attribution is rebuilt field by field like everything else here: a marker
+ * missing any of its five fields is dropped rather than half-restored, so the
+ * UI never renders an automation chip it cannot attribute.
+ */
+function parseAutomationMarker(
+  value: unknown
+): ChatEntryAutomationMarker | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+
+  const fields = ["runId", "automationId", "bindingId", "name", "triggerLabel"] as const;
+  const marker: Record<string, string> = {};
+  for (const field of fields) {
+    const entry = value[field];
+    if (typeof entry !== "string" || !entry.trim()) {
+      return undefined;
+    }
+    marker[field] = entry;
+  }
+  return marker as unknown as ChatEntryAutomationMarker;
+}
+
 function parseMessageEntry(value: unknown): PersistedChatMessageEntry | null {
   if (!isRecord(value)) {
     return null;
@@ -741,12 +769,14 @@ function parseMessageEntry(value: unknown): PersistedChatMessageEntry | null {
     typeof value.reasoningSummary === "string" && value.reasoningSummary.trim()
       ? value.reasoningSummary
       : undefined;
+  const automation = parseAutomationMarker(value.automation);
   return {
     kind: "message",
     role,
     content: value.content,
     ...(source ? { source } : {}),
-    ...(reasoningSummary ? { reasoningSummary } : {})
+    ...(reasoningSummary ? { reasoningSummary } : {}),
+    ...(automation ? { automation } : {})
   };
 }
 
@@ -1033,6 +1063,56 @@ export function setChatSessionPinned(
   database.setSessionPinned(id, pinnedAt);
   const nextRow = database.getSession(id);
   return nextRow ? toSessionSummary(nextRow) : null;
+}
+
+/**
+ * Renames a conversation. Automations need this for both the `dedicated`
+ * conversation they create up front and the `titleTemplate` of a `per-run`
+ * binding: `saveChatSession` only ever derives a title while the stored one is
+ * still the default, which would otherwise name an automation's conversation
+ * after its own playbook text.
+ *
+ * Renaming deliberately leaves `updatedAt` alone so it does not jump the
+ * conversation to the top of the sidebar.
+ */
+export function setChatSessionTitle(
+  id: string,
+  title: string,
+  database: ChatSessionDatabase = defaultDatabase
+): ChatSessionSummary | null {
+  const row = database.getSession(id);
+  if (!row) {
+    return null;
+  }
+
+  const nextTitle = truncateTitle(title);
+  if (nextTitle === row.title) {
+    return toSessionSummary(row);
+  }
+
+  database.setSessionTitle(id, nextTitle);
+  const nextRow = database.getSession(id);
+  return nextRow ? toSessionSummary(nextRow) : null;
+}
+
+/**
+ * Whether the conversation row still exists. `getChatSession` returns `[]` for
+ * both an empty transcript and a deleted one, which an automation binding has
+ * to tell apart (2.4).
+ */
+export function chatSessionExists(
+  id: string,
+  database: ChatSessionDatabase = defaultDatabase
+): boolean {
+  return database.getSession(id) !== undefined;
+}
+
+/** The conversation's current title, or null when it no longer exists. */
+export function getChatSessionTitle(
+  id: string,
+  database: ChatSessionDatabase = defaultDatabase
+): string | null {
+  return database.getSession(id)?.title ?? null;
 }
 
 export function deleteChatSession(

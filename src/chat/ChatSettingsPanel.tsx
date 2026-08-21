@@ -979,6 +979,7 @@ export function ChatSettingsPanel({
           onChange={onMcpServersChange}
         />
       </section>
+
     </div>
   );
 }

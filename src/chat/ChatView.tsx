@@ -37,7 +37,8 @@ import {
   Trash2,
   TriangleAlert,
   Upload,
-  User
+  User,
+  Zap
 } from "lucide-react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -61,6 +62,7 @@ import type {
   ChatProvider,
   ChatSessionSummary,
   ChatSettings,
+  ChatEntryAutomationMarker,
   ClaudeCodeStatus,
   CoachInputChoice,
   CoachInputPrompt,
@@ -80,6 +82,7 @@ import type {
   WorkoutDeletePreview,
   DeleteWorkoutResult
 } from "../../electron/types";
+import { NOTHING_TO_REPORT } from "../../electron/types";
 import { formatWorkoutSport } from "../../electron/workoutCapabilities";
 import { trainingPlanFromCoachDraftPreview } from "../../electron/trainingPlanDomain";
 import { sportTheme } from "../training-library/sportTheme";
@@ -88,6 +91,9 @@ import { FitnessTrendCard } from "./FitnessTrendCard";
 import { HrZoneCard } from "./HrZoneCard";
 import { supportsReasoningEffort } from "../../electron/chatModels";
 import { ChatSettingsModal } from "./ChatSettingsModal";
+import { showToast } from "../toast";
+import { ConversationCoaches } from "./automations/ConversationCoaches";
+import { CoachAutomationsModal } from "./automations/CoachAutomationsModal";
 import { ClaudeAuthScopeToggle } from "./ClaudeAuthScopeToggle";
 import { ClaudeCodeLoginCard } from "./ClaudeCodeLoginCard";
 import { ChatSidebar } from "./ChatSidebar";
@@ -264,6 +270,18 @@ function CoachInputCard({
       ) : null}
     </section>
   );
+}
+
+/**
+ * An automation run streaming into the conversation that is open. Deliberately
+ * separate from the athlete's own streaming state: theirs is persisted as their
+ * turn when it ends, while a run's text is already being written to disk by the
+ * main process, and merging the two would save it twice.
+ */
+interface LiveAutomationRun {
+  runId: string;
+  name: string;
+  text: string;
 }
 
 interface ChatViewProps {
@@ -1773,6 +1791,8 @@ export function ChatView({
   const [revokingClaude, setRevokingClaude] = useState(false);
   const [sessions, setSessions] = useState<ChatSessionSummary[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const [automationsOpen, setAutomationsOpen] = useState(false);
+  const [automationsVersion, setAutomationsVersion] = useState(0);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [timeline, setTimeline] = useState<ChatEntry[]>([]);
   const [streaming, setStreaming] = useState(false);
@@ -1803,6 +1823,18 @@ export function ChatView({
   const [deletedWorkouts, setDeletedWorkouts] = useState<
     Record<string, DeleteWorkoutResult>
   >({});
+  // An automation run writing into the conversation that is open right now.
+  const [liveAutomation, setLiveAutomation] = useState<LiveAutomationRun | null>(
+    null
+  );
+  // House rule 1 asks a run with nothing to say to answer with the marker and
+  // nothing else, so a run heading for silence has no other text in flight.
+  // What has arrived is held back while it could still be that marker: it is a
+  // control token, and the athlete watching the bubble must never read it.
+  const liveAutomationText =
+    liveAutomation && !NOTHING_TO_REPORT.startsWith(liveAutomation.text.trim())
+      ? liveAutomation.text
+      : "";
 
   // Ref so the push-event handlers filter on the current request without
   // being recreated (and re-subscribed) on every keystroke.
@@ -1817,6 +1849,9 @@ export function ChatView({
   // Kept only while a paused Coach turn is resuming, so a failed/cancelled
   // request can restore the question instead of silently losing it.
   const resumedCoachPromptRef = useRef<CoachInputPrompt | null>(null);
+  // Same reason as activeRequestIdRef: the push handlers have to recognise the
+  // automation's stream without re-subscribing.
+  const liveAutomationRef = useRef<LiveAutomationRun | null>(null);
   const autoDetectLocalRef = useRef(false);
   const claudePollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -1907,6 +1942,24 @@ export function ChatView({
     }
   };
 
+  /**
+   * Re-reads the open conversation from disk. An automation run persists in the
+   * main process, behind this window's back, so the transcript on screen is the
+   * only copy that does not know about it — and the next thing the athlete
+   * types would save that stale copy straight over the coach's answer.
+   */
+  const reloadTranscript = async (sessionId: string) => {
+    if (!api) return;
+    try {
+      const entries = await api.getChatSession(sessionId);
+      // The athlete may have switched conversations while this was in flight.
+      if (activeSessionIdRef.current !== sessionId) return;
+      setTimeline(fromPersistedEntries(entries));
+    } catch {
+      // Keep what is on screen rather than blanking a readable transcript.
+    }
+  };
+
   const refreshSessions = async (provider: ChatProvider) => {
     if (!api) return [];
     const listed = await api.listChatSessions(provider);
@@ -1932,6 +1985,66 @@ export function ChatView({
   useEffect(() => {
     activeSessionIdRef.current = activeSessionId;
   }, [activeSessionId]);
+
+  useEffect(() => {
+    liveAutomationRef.current = liveAutomation;
+  }, [liveAutomation]);
+
+  // Switching conversations drops whatever was streaming into the old one; the
+  // run keeps going in the main process and its output is on disk either way.
+  useEffect(() => {
+    setLiveAutomation(null);
+  }, [activeSessionId]);
+
+  /**
+   * A run that targets the conversation on screen has to show up in it as it
+   * happens — an automation the athlete triggered and then cannot see reads as
+   * a button that did nothing.
+   */
+  useEffect(() => {
+    if (!api?.onCoachAutomationRunUpdate) return;
+    return api.onCoachAutomationRunUpdate((run) => {
+      if (!run.sessionId || run.sessionId !== activeSessionIdRef.current) return;
+
+      if (run.status === "running") {
+        setLiveAutomation({ runId: run.id, name: "Automation coach", text: "" });
+        // The run record carries ids, not the coach's name; the chip is worth
+        // one lookup so the athlete knows which of their coaches is speaking.
+        void api
+          .getCoachAutomation(run.automationId)
+          .then((detail) => {
+            if (!detail) return;
+            setLiveAutomation((current) =>
+              current?.runId === run.id
+                ? { ...current, name: detail.automation.name }
+                : current
+            );
+          })
+          .catch(() => undefined);
+        return;
+      }
+
+      const live = liveAutomationRef.current;
+      if (live?.runId === run.id) {
+        setLiveAutomation(null);
+        if (run.status === "silent") {
+          // The athlete just watched this answer stream in. A silent run writes
+          // nothing to the transcript by design, so without a word the bubble
+          // would vanish mid-sentence and read as a bug.
+          showToast(`${live.name} found nothing new to report.`);
+        }
+      }
+
+      // Only a reported run adds anything to the transcript: a silent one is
+      // recorded in the run log by design, and a skip never reached the model.
+      if (run.status !== "success") return;
+      // Reloaded straight away even mid-turn. Waiting for the athlete's turn to
+      // end is worse than useless: their turn persists the whole timeline, so
+      // the copy on screen — which predates the run — would be written over the
+      // coach's answer before the deferred reload ever got to see it.
+      void reloadTranscript(run.sessionId);
+    });
+  }, [api]);
 
   // Load sign-in/provider state on mount.
   useEffect(() => {
@@ -2104,6 +2217,12 @@ export function ChatView({
 
     const unsubscribers = [
       api.onChatStreamStart((payload) => {
+        if (payload.requestId === liveAutomationRef.current?.runId) {
+          setLiveAutomation((current) =>
+            current?.runId === payload.requestId ? { ...current, text: "" } : current
+          );
+          return;
+        }
         if (payload.requestId !== activeRequestIdRef.current) return;
         setStreamingText("");
         setThinkingText("");
@@ -2112,11 +2231,25 @@ export function ChatView({
         pendingCoachPromptsRef.current = [];
       }),
       api.onChatStreamToken((payload) => {
+        // A run's tokens must never touch the athlete's own streaming state:
+        // that state gets persisted as their turn when the stream ends, and the
+        // runner has already written the same text from the main process.
+        if (payload.requestId === liveAutomationRef.current?.runId) {
+          setLiveAutomation((current) =>
+            current?.runId === payload.requestId
+              ? { ...current, text: current.text + payload.delta }
+              : current
+          );
+          return;
+        }
         if (payload.requestId !== activeRequestIdRef.current) return;
         setActiveTool(null);
         setStreamingText((prev) => prev + payload.delta);
       }),
       api.onChatStreamInfo((payload) => {
+        // Cards (plan drafts, charts) belong to whoever asked for them; an
+        // automation's transcript is reloaded from disk when its run ends.
+        if (payload.requestId === liveAutomationRef.current?.runId) return;
         if (payload.requestId !== activeRequestIdRef.current) return;
         if (payload.kind === "context") {
           sourceRef.current = {
@@ -2229,7 +2362,13 @@ export function ChatView({
   // Keep the transcript scrolled to the newest content.
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
-  }, [timeline, streamingText, thinkingText, exportingLatestActivity]);
+  }, [
+    timeline,
+    streamingText,
+    thinkingText,
+    liveAutomation,
+    exportingLatestActivity
+  ]);
 
   const handleSignIn = async () => {
     if (!api) return;
@@ -3789,6 +3928,65 @@ export function ChatView({
     );
   }
 
+/**
+ * `\u26a1 <name> \u00b7 <triggerLabel>` — a conversation can host up to five
+ * automations, so every entry a run produced says which coach spoke.
+ */
+function AutomationAttribution({
+  marker
+}: {
+  marker: ChatEntryAutomationMarker;
+}) {
+  return (
+    <span className="chat-automation-attribution">
+      <Zap size={12} aria-hidden="true" />
+      {marker.name}
+      <span className="chat-automation-attribution-trigger">
+        · {marker.triggerLabel}
+      </span>
+    </span>
+  );
+}
+
+/**
+ * The playbook turn a run sent on the athlete's behalf. Collapsed to a chip by
+ * default — it is machinery, not conversation — but openable, because an
+ * athlete judging an automation's answer needs to see what it was asked.
+ */
+function AutomationPromptChip({
+  marker,
+  prompt,
+  index,
+  highlighted
+}: {
+  marker: ChatEntryAutomationMarker;
+  prompt: string;
+  index: number;
+  highlighted: boolean;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  return (
+    <div
+      className={`chat-row chat-row-automation${
+        highlighted ? " is-chat-jump-target" : ""
+      }`}
+      data-chat-entry-index={index}
+    >
+      <button
+        type="button"
+        className="chat-automation-chip"
+        aria-expanded={expanded}
+        onClick={() => setExpanded((value) => !value)}
+      >
+        <Zap size={12} aria-hidden="true" />
+        {marker.name}
+        <span className="chat-automation-chip-trigger">· {marker.triggerLabel}</span>
+      </button>
+      {expanded ? <pre className="chat-automation-prompt">{prompt}</pre> : null}
+    </div>
+  );
+}
+
   return (
     <div className="chat-view">
       <div className="chat-header">
@@ -3805,6 +4003,12 @@ export function ChatView({
             <Settings2 size={16} aria-hidden="true" />
             Settings
           </button>
+          <ConversationCoaches
+            api={api}
+            sessionId={activeSessionId}
+            refreshVersion={automationsVersion}
+            onManageAutomations={() => setAutomationsOpen(true)}
+          />
           <div className="chat-mcp" ref={mcpRef}>
             {(() => {
               const connectedServers = mcpStatuses.filter((s) => s.connected);
@@ -4075,6 +4279,21 @@ export function ChatView({
               );
             }
 
+            // 5.6: the synthetic user turn an automation sends is stored with
+            // role "user", but it was never typed by the athlete — showing it as
+            // their bubble would misattribute the playbook to them.
+            if (entry.automation && entry.role === "user") {
+              return (
+                <AutomationPromptChip
+                  key={`message-${index}`}
+                  marker={entry.automation}
+                  prompt={entry.content}
+                  index={index}
+                  highlighted={highlightedChatEntryIndex === index}
+                />
+              );
+            }
+
             return (
               <div
                 key={`message-${index}`}
@@ -4093,6 +4312,9 @@ export function ChatView({
                   )}
                 </div>
                 <div className="chat-bubble">
+                  {entry.automation ? (
+                    <AutomationAttribution marker={entry.automation} />
+                  ) : null}
                   {entry.role === "assistant" ? (
                     <>
                       {entry.reasoningSummary ? (
@@ -4141,6 +4363,34 @@ export function ChatView({
                   </div>
                 )}
                 {currentSource ? <SourceBadge source={currentSource} /> : null}
+              </div>
+            </div>
+          ) : null}
+
+          {/* Same avatar and bubble as the persisted answer this becomes, so
+              the reload at the end of the run does not make the row jump. */}
+          {liveAutomation ? (
+            <div className="chat-row chat-row-assistant">
+              <div className="chat-avatar chat-avatar-assistant">
+                <Sparkles size={16} aria-hidden="true" />
+              </div>
+              <div className="chat-bubble chat-bubble-streaming">
+                <span className="chat-automation-attribution">
+                  <Zap size={12} aria-hidden="true" />
+                  {liveAutomation.name}
+                  <span className="chat-automation-attribution-trigger">
+                    · running now
+                  </span>
+                </span>
+                {liveAutomationText ? (
+                  <AssistantMarkdown content={liveAutomationText} streaming />
+                ) : (
+                  <div className="chat-stream-pending">
+                    <span className="chat-stream-status">
+                      Reading your training…
+                    </span>
+                  </div>
+                )}
               </div>
             </div>
           ) : null}
@@ -4348,6 +4598,18 @@ export function ChatView({
         ) : null}
       </div>
       <ChatSettingsModal {...settingsModalProps} />
+      <CoachAutomationsModal
+        api={api}
+        open={automationsOpen}
+        provider={chatSettings.provider}
+        onChanged={() => setAutomationsVersion((value) => value + 1)}
+        onClose={() => {
+          setAutomationsOpen(false);
+          // Catch-all: anything the modal changed is reflected on close, even
+          // a path that forgot to report itself.
+          setAutomationsVersion((value) => value + 1);
+        }}
+      />
     </div>
   );
 }

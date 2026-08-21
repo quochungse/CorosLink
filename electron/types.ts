@@ -2331,6 +2331,20 @@ export interface PersistedChatSource {
   mcpError?: string;
 }
 
+/**
+ * Marks a transcript entry as written by an automation rather than by the
+ * athlete or an interactive turn. A conversation can host up to five
+ * automations, so the marker carries the name: the UI renders
+ * `\u26a1 <name> \u00b7 <triggerLabel>` so the athlete can tell which coach spoke.
+ */
+export interface ChatEntryAutomationMarker {
+  runId: string;
+  automationId: string;
+  bindingId: string;
+  name: string;
+  triggerLabel: string;
+}
+
 export interface PersistedChatMessageEntry {
   kind: "message";
   role: ChatRole;
@@ -2338,6 +2352,12 @@ export interface PersistedChatMessageEntry {
   source?: PersistedChatSource;
   /** Display-safe provider reasoning summary, never raw chain-of-thought. */
   reasoningSummary?: string;
+  /**
+   * Set when an automation produced this entry. The synthetic user turn that
+   * carries the playbook is stored with `role: "user"` and the same marker,
+   * rendered as a chip rather than an athlete bubble.
+   */
+  automation?: ChatEntryAutomationMarker;
 }
 
 export interface CoachInputChoice {
@@ -2509,6 +2529,14 @@ export interface OpenRouterConnectionTest {
 }
 
 /** Hard cap on custom coach instructions so a pasted document cannot crowd out the coach prompt. */
+/**
+ * The answer a run gives when it looked and found nothing worth saying. A
+ * control token, not prose: it decides `silent` vs `success`, and the athlete
+ * must never read it. Lives here rather than beside the runner because the
+ * renderer needs it too — a run streaming live has to hold it back.
+ */
+export const NOTHING_TO_REPORT = "NOTHING_TO_REPORT";
+
 export const MAX_CUSTOM_COACH_INSTRUCTIONS = 4000;
 
 export interface ChatSettings {
@@ -2535,6 +2563,231 @@ export interface ChatSessionSummary {
   messageCount: number;
   /** ISO timestamp the conversation was pinned, or null when unpinned. */
   pinnedAt: string | null;
+}
+
+/**
+ * What a turn is allowed to do. Automation runs are `read-only` (decision 3):
+ * they may read, analyse and draft, but never write to COROS.
+ */
+export type ChatToolPolicy = "interactive" | "read-only";
+
+export type AutomationTriggerKind =
+  | "schedule"
+  | "activity"
+  | "threshold"
+  | "manual";
+
+export type AutomationTrigger =
+  | {
+      kind: "schedule";
+      cadence: "daily" | "weekly";
+      /** 0=Sunday..6=Saturday; weekly only. */
+      dayOfWeek?: number;
+      /** Local wall-clock "HH:mm". */
+      timeOfDay: string;
+    }
+  | {
+      kind: "activity";
+      /** COROS sport type ids; empty means every sport. */
+      sportTypes: number[];
+      minDurationSec?: number;
+      minDistanceM?: number;
+      /**
+       * Analyse every matching activity that appeared since the last analysis,
+       * one run each in chronological order. Off (the default) analyses only
+       * the most recent match.
+       */
+      multiActivity?: boolean;
+    }
+  | {
+      kind: "threshold";
+      metric:
+        | "acuteChronicRamp"
+        | "restingHrDrift"
+        | "planAdherence"
+        | "sleepDebt";
+      value: number;
+    }
+  | { kind: "manual" };
+
+export type AutomationThresholdMetric = Extract<
+  AutomationTrigger,
+  { kind: "threshold" }
+>["metric"];
+
+export interface AutomationConditions {
+  /** Collapse several triggers inside this window into one run. */
+  batchWindowMin: number;
+  /** Minimum gap between two runs of the same binding. */
+  cooldownMin: number;
+  /** Per binding, per local day. */
+  maxRunsPerDay: number;
+  /** Local "HH:mm" range where runs are deferred, not dropped. */
+  quietHours?: { start: string; end: string };
+}
+
+export interface AutomationRuntime {
+  /** Defaults to the interactive chat provider when unset. */
+  provider?: ChatProvider;
+  model?: string;
+  effort?: AnthropicEffort;
+}
+
+/** The definition. Owns no conversation. */
+export interface CoachAutomation {
+  id: string;
+  name: string;
+  /** Persona and remit, injected into the run's system instructions. */
+  role?: string;
+  playbook: string;
+  enabled: boolean;
+  presetId?: string;
+  trigger: AutomationTrigger;
+  conditions: AutomationConditions;
+  runtime: AutomationRuntime;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Create/update payload for a definition; the store fills in the rest. */
+export interface CoachAutomationInput {
+  name: string;
+  role?: string;
+  playbook: string;
+  enabled?: boolean;
+  presetId?: string;
+  trigger: AutomationTrigger;
+  /** Merged over the defaults; omitted keys keep their default. */
+  conditions?: Partial<AutomationConditions>;
+  runtime?: AutomationRuntime;
+}
+
+export type AutomationBindingMode = "per-run" | "dedicated" | "existing";
+
+/** Where the definition is active. */
+export interface CoachAutomationBinding {
+  id: string;
+  automationId: string;
+  mode: AutomationBindingMode;
+  /** null for "per-run". */
+  sessionId: string | null;
+  /** "per-run" only: "{{rule.name}} · {{activity.name}} · {{date}}". */
+  titleTemplate?: string;
+  enabled: boolean;
+  sortOrder: number;
+  lastRunAt?: string;
+  nextRunAt?: string;
+  /**
+   * `start_time` (epoch seconds) of the newest activity this binding has
+   * already analysed. Absent means it never has, and the attach time
+   * (`createdAt`) becomes the floor instead.
+   */
+  lastActivityAt?: number;
+  createdAt: string;
+}
+
+/** Create payload for a binding; the store assigns id, order and timestamps. */
+export interface CoachAutomationBindingInput {
+  automationId: string;
+  mode: AutomationBindingMode;
+  /** Required for "dedicated" and "existing"; must be absent for "per-run". */
+  sessionId?: string | null;
+  /** "per-run" only. */
+  titleTemplate?: string;
+  enabled?: boolean;
+}
+
+/** Why an attach was refused, so the UI can explain rather than just fail. */
+export type CoachAutomationBindingErrorCode =
+  | "AUTOMATION_NOT_FOUND"
+  | "BINDING_LIMIT_REACHED"
+  | "BINDING_DUPLICATE"
+  | "BINDING_PER_RUN_EXISTS"
+  | "BINDING_SESSION_REQUIRED"
+  | "BINDING_SESSION_NOT_ALLOWED";
+
+/**
+ * What a conversation deletion did to the bindings pointing at it (2.4).
+ * `disabled` are "existing" bindings the athlete must re-point; `needsSession`
+ * are "dedicated" bindings that stay enabled and rebuild their conversation on
+ * the next run.
+ */
+export interface CoachAutomationSessionDeletionReport {
+  disabled: CoachAutomationBinding[];
+  needsSession: CoachAutomationBinding[];
+}
+
+export type CoachAutomationRunStatus =
+  | "running"
+  | "success"
+  | "silent"
+  | "skipped"
+  | "failed"
+  | "cancelled";
+
+export interface CoachAutomationRun {
+  id: string;
+  automationId: string;
+  bindingId: string;
+  status: CoachAutomationRunStatus;
+  triggerKind: AutomationTriggerKind;
+  triggerPayload?: Record<string, unknown>;
+  /** Conversation actually written into. */
+  sessionId?: string;
+  /** One-line TLDR for the badge/notification. */
+  summary?: string;
+  model?: string;
+  effort?: string;
+  error?: string;
+  /** cooldown | quiet-hours | no-auth | offline | budget | stale-slot */
+  skipReason?: string;
+  /** Set once the unread badge is cleared. */
+  seenAt?: string;
+  startedAt: string;
+  finishedAt?: string;
+}
+
+/** Run-log query, mirrored by the renderer so it never imports the db layer. */
+export interface CoachAutomationRunQuery {
+  automationId?: string;
+  bindingId?: string;
+  sessionId?: string;
+  /** Inclusive lower bound on `startedAt`, ISO. */
+  since?: string;
+  statuses?: CoachAutomationRunStatus[];
+  limit?: number;
+}
+
+/** One binding plus the conversation it points at, for the "where it runs" UI. */
+export interface CoachAutomationBindingView extends CoachAutomationBinding {
+  sessionTitle?: string;
+  /** True when the conversation this binding targets no longer exists (2.4). */
+  sessionMissing?: boolean;
+}
+
+/** One automation with every place it runs. */
+export interface CoachAutomationDetail {
+  automation: CoachAutomation;
+  bindings: CoachAutomationBindingView[];
+}
+
+/**
+ * Attach refusals are expected — the cap, a duplicate, a second per-run
+ * binding — and the UI has to explain each one. An Error crossing IPC loses its
+ * `code`, so attach answers with a result instead of throwing.
+ */
+export type CoachAutomationAttachResult =
+  | { ok: true; binding: CoachAutomationBinding }
+  | { ok: false; code: CoachAutomationBindingErrorCode; message: string };
+
+/** List-screen projection. */
+export interface CoachAutomationSummary {
+  automation: CoachAutomation;
+  bindingCount: number;
+  enabledBindingCount: number;
+  lastRun?: CoachAutomationRun;
+  /** Earliest across bindings. */
+  nextRunAt?: string;
 }
 
 export interface LocalChatConnectionTest {

@@ -5,6 +5,7 @@ import http from "node:http";
 import path from "node:path";
 import type { AddressInfo } from "node:net";
 import { deleteSettings, getSetting, setSetting } from "./database";
+import { applyCoachAutomationSessionDeleted } from "./coachAutomationStore";
 import {
   formatScheduledExercisesForChat,
   getTrainingHubStatus,
@@ -18,7 +19,7 @@ import {
   getAllMcpTools,
   getMcpServerCachedTools
 } from "./mcpClientManager";
-import { prefixToolName } from "./mcpToolNames";
+import { prefixToolName, splitToolName } from "./mcpToolNames";
 import {
   getChatWorkoutTools,
   handleChatWorkoutTool,
@@ -95,17 +96,24 @@ import {
   setChatSessionPinned
 } from "./chatHistoryStore";
 import type {
+  ActivityVisualPreview,
+  AutomationRuntime,
   AnthropicApiConfig,
   AnthropicApiConnectionTest,
   ChatAuthStatus,
+  ChatEntryAutomationMarker,
   ChatSettings,
   ChatProvider,
+  ChatToolPolicy,
   ClaudeCodeConfig,
   ClaudeCodeConnectionTest,
   ClaudeCodeLoginStart,
   ClaudeCodePermissions,
   ClaudeCodeStatus,
+  CoachInputPrompt,
   CorosMcpTool,
+  FitnessTrendPreview,
+  HrZonePreview,
   LocalChatDiscovery,
   LocalChatConfig,
   LocalChatConnectionTest,
@@ -113,6 +121,7 @@ import type {
   OpenRouterConnectionTest,
   ChatMessage,
   PersistedChatEntry,
+  PersistedChatSource,
   StoredChatToken,
   TrainingHubActivity,
   TrainingHubDashboard,
@@ -120,7 +129,8 @@ import type {
   UploadPlanResult,
   PlanDraftPreview,
   DeleteWorkoutResult,
-  UnitSystem
+  UnitSystem,
+  WorkoutDeletePreview
 } from "./types";
 import {
   formatDistanceValue,
@@ -448,6 +458,11 @@ export function setChatSessionPinnedById(id: string, pinned: boolean) {
 
 export function deleteChatSessionById(id: string): void {
   deleteChatSession(id);
+  // Section 2.4: bindings pointing at this conversation have to react now, not
+  // the next time a trigger happens to fire. A "dedicated" binding rebuilds its
+  // conversation on its next run; an "existing" one is disabled, because only
+  // the athlete knows which thread it should point at instead.
+  applyCoachAutomationSessionDeleted(id);
 }
 
 export async function testLocalChatConnection(
@@ -870,29 +885,347 @@ function getStoredToken(): StoredChatToken | null {
 
 // ----- Streaming chat -----
 
+/**
+ * Where a stream's events go. Interactive chat pushes them at a renderer;
+ * headless automation runs will accumulate them in the main process instead,
+ * so `streamChat` must not know which it is talking to.
+ */
+export interface ChatStreamSink {
+  emit(channel: string, payload: unknown): void;
+  /**
+   * Optional abort wiring, returning a teardown callback. The window sink uses
+   * it to abort when the window closes; a headless sink leaves it undefined so
+   * a run survives having no window.
+   */
+  bindAbort?(controller: AbortController): () => void;
+}
+
+export interface StreamChatOptions {
+  unitSystem?: UnitSystem;
+  /** Automation runs override the saved provider/model/effort (decision 2). */
+  runtime?: AutomationRuntime;
+  /** Automation runs narrow the tool set (decision 3). Defaults to interactive. */
+  toolPolicy?: ChatToolPolicy;
+  /** Automation role, injected as its own hardened instruction block. */
+  roleInstructions?: string;
+}
+
+/**
+ * The interactive sink: sends every event to the renderer and aborts the
+ * stream when the window goes away, which is what an athlete closing the
+ * window means.
+ */
+export function createWindowSink(
+  mainWindow: BrowserWindow | null | undefined
+): ChatStreamSink {
+  return {
+    emit(channel, payload) {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send(channel, payload);
+      }
+    },
+    bindAbort(controller) {
+      const onClosed = () => controller.abort();
+      mainWindow?.once("closed", onClosed);
+      return () => mainWindow?.removeListener("closed", onClosed);
+    }
+  };
+}
+
+/**
+ * The headless sink: turns the same stream events into the
+ * `PersistedChatEntry[]` an interactive turn would have produced in the
+ * renderer, mirroring how ChatView handles `chat:streamInfo` and
+ * `chat:streamDone`. An automation run has no renderer to assemble its
+ * transcript, so this is where that assembly moves to.
+ *
+ * It deliberately omits `bindAbort`: closing the window must not abort an
+ * automation run.
+ */
+export interface ChatStreamCollectorSink extends ChatStreamSink {
+  /** The transcript so far. Complete once `chat:streamDone` has arrived. */
+  entries(): PersistedChatEntry[];
+  /** True once the run finished, whether it succeeded, cancelled or failed. */
+  finished(): boolean;
+  /** Set when the stream ended with `finishReason: "cancelled"`. */
+  cancelled(): boolean;
+  /** The `chat:streamError` message, when the stream failed. */
+  error(): string | undefined;
+  /** True when that failure was an authentication problem, not a model error. */
+  authError(): boolean;
+  /** The assistant's final text, for the run's one-line summary. */
+  text(): string;
+}
+
+function upsertEntry(
+  entries: PersistedChatEntry[],
+  entry: PersistedChatEntry,
+  matches: (candidate: PersistedChatEntry) => boolean
+): void {
+  const index = entries.findIndex(matches);
+  if (index >= 0) {
+    entries[index] = entry;
+    return;
+  }
+  entries.push(entry);
+}
+
+export function createCollectorSink(
+  automation?: ChatEntryAutomationMarker
+): ChatStreamCollectorSink {
+  const entries: PersistedChatEntry[] = [];
+  let pendingCoachPrompts: CoachInputPrompt[] = [];
+  let source: PersistedChatSource | null = null;
+  let thinking = "";
+  let streamedText = "";
+  let finalText = "";
+  let isFinished = false;
+  let wasCancelled = false;
+  let failure: string | undefined;
+  let failureWasAuth = false;
+
+  const reset = () => {
+    pendingCoachPrompts = [];
+    source = null;
+    thinking = "";
+    streamedText = "";
+  };
+
+  const handleInfo = (payload: Record<string, unknown>) => {
+    const kind = payload.kind;
+
+    if (kind === "context") {
+      source = {
+        snapshotIncluded: Boolean(payload.snapshotIncluded),
+        mcpEnabled: Boolean(payload.mcpEnabled),
+        mcpUsed: false,
+        mcpTools: []
+      };
+      return;
+    }
+
+    if (kind === "thinking") {
+      if (typeof payload.delta === "string") {
+        thinking += payload.delta;
+      }
+      return;
+    }
+
+    if (kind === "mcp") {
+      const base: PersistedChatSource = source ?? {
+        snapshotIncluded: false,
+        mcpEnabled: true,
+        mcpUsed: false,
+        mcpTools: []
+      };
+      const tool = typeof payload.tool === "string" ? payload.tool : undefined;
+      const status = typeof payload.status === "string" ? payload.status : "";
+      const message =
+        typeof payload.message === "string" ? payload.message : undefined;
+      const mcpError =
+        /fail|error/i.test(status) || message
+          ? message ?? status
+          : base.mcpError;
+      source = {
+        ...base,
+        mcpUsed: true,
+        mcpTools: tool ? [...base.mcpTools, tool] : base.mcpTools,
+        // Omitted rather than set to undefined so the collected source matches
+        // what `parseSource` rebuilds on reload.
+        ...(mcpError ? { mcpError } : {})
+      };
+      return;
+    }
+
+    if (kind === "coachPrompt") {
+      const prompt = payload.prompt as CoachInputPrompt | undefined;
+      if (!prompt?.promptId) return;
+      pendingCoachPrompts = [
+        ...pendingCoachPrompts.filter(
+          (entry) => entry.promptId !== prompt.promptId
+        ),
+        prompt
+      ];
+      return;
+    }
+
+    if (kind === "planDraft") {
+      const draft = payload.draft as PlanDraftPreview | undefined;
+      if (!draft?.draftId) return;
+      upsertEntry(
+        entries,
+        { kind: "planDraft", draft },
+        (candidate) =>
+          candidate.kind === "planDraft" &&
+          candidate.draft.draftId === draft.draftId
+      );
+      return;
+    }
+
+    if (kind === "workoutDelete") {
+      const preview = payload.preview as WorkoutDeletePreview | undefined;
+      if (!preview?.requestId) return;
+      upsertEntry(
+        entries,
+        { kind: "workoutDelete", preview },
+        (candidate) =>
+          candidate.kind === "workoutDelete" &&
+          candidate.preview.requestId === preview.requestId
+      );
+      return;
+    }
+
+    // The visualization cards are collected whichever way the athlete has the
+    // display toggle set: ChatView filters them out of its *timeline*, but a
+    // headless run has to persist everything the turn produced, and the
+    // renderer decides what to show when it opens the conversation.
+    if (kind === "activityVisual") {
+      const preview = payload.preview as ActivityVisualPreview | undefined;
+      if (!preview?.previewId) return;
+      upsertEntry(
+        entries,
+        { kind: "activityVisual", preview },
+        (candidate) =>
+          candidate.kind === "activityVisual" &&
+          candidate.preview.previewId === preview.previewId
+      );
+      return;
+    }
+
+    if (kind === "fitnessTrend") {
+      const preview = payload.preview as FitnessTrendPreview | undefined;
+      if (!preview?.previewId) return;
+      upsertEntry(
+        entries,
+        { kind: "fitnessTrend", preview },
+        (candidate) =>
+          candidate.kind === "fitnessTrend" &&
+          candidate.preview.previewId === preview.previewId
+      );
+      return;
+    }
+
+    if (kind === "hrZoneSummary") {
+      const preview = payload.preview as HrZonePreview | undefined;
+      if (!preview?.previewId) return;
+      upsertEntry(
+        entries,
+        { kind: "hrZoneSummary", preview },
+        (candidate) =>
+          candidate.kind === "hrZoneSummary" &&
+          candidate.preview.previewId === preview.previewId
+      );
+    }
+  };
+
+  const handleDone = (payload: Record<string, unknown>) => {
+    isFinished = true;
+    // ChatView reads the final text off the done payload; fall back to the
+    // accumulated tokens so a provider that omits it cannot lose the answer.
+    const fullText =
+      typeof payload.fullText === "string" && payload.fullText
+        ? payload.fullText
+        : streamedText;
+    const reasoningSummary = thinking.trim() || undefined;
+
+    if (payload.finishReason === "cancelled") {
+      wasCancelled = true;
+      reset();
+      return;
+    }
+
+    finalText = fullText;
+    const prompts = pendingCoachPrompts;
+    const turnSource = source ?? undefined;
+
+    if (fullText) {
+      entries.push({
+        kind: "message",
+        role: "assistant",
+        content: fullText,
+        ...(turnSource ? { source: turnSource } : {}),
+        ...(reasoningSummary ? { reasoningSummary } : {}),
+        ...(automation ? { automation } : {})
+      });
+    }
+    for (const prompt of prompts) {
+      upsertEntry(
+        entries,
+        { kind: "coachPrompt", prompt },
+        (candidate) =>
+          candidate.kind === "coachPrompt" &&
+          candidate.prompt.promptId === prompt.promptId
+      );
+    }
+    reset();
+  };
+
+  return {
+    emit(channel, payload) {
+      const record = (payload ?? {}) as Record<string, unknown>;
+      if (channel === "chat:streamStart") {
+        reset();
+        return;
+      }
+      if (channel === "chat:streamToken") {
+        if (typeof record.delta === "string") {
+          streamedText += record.delta;
+        }
+        return;
+      }
+      if (channel === "chat:streamInfo") {
+        handleInfo(record);
+        return;
+      }
+      if (channel === "chat:streamDone") {
+        handleDone(record);
+        return;
+      }
+      if (channel === "chat:streamError") {
+        isFinished = true;
+        failure =
+          typeof record.message === "string"
+            ? record.message
+            : "Chat request failed.";
+        failureWasAuth = record.authError === true;
+        reset();
+      }
+    },
+    entries: () => [...entries],
+    finished: () => isFinished,
+    cancelled: () => wasCancelled,
+    error: () => failure,
+    authError: () => failureWasAuth,
+    text: () => finalText
+  };
+}
+
 export async function streamChat(
-  mainWindow: BrowserWindow | null | undefined,
+  sink: ChatStreamSink,
   requestId: string,
   messages: ChatMessage[],
-  unitSystem: UnitSystem = "metric"
+  options: StreamChatOptions = {}
 ): Promise<void> {
-  unitSystem = normalizeUnitSystem(unitSystem);
+  const unitSystem = normalizeUnitSystem(options.unitSystem);
+  const toolPolicy: ChatToolPolicy =
+    options.toolPolicy === "read-only" ? "read-only" : "interactive";
+  const roleInstructions = options.roleInstructions;
+  const runtime = options.runtime ?? {};
   const send = (channel: string, payload: unknown) => {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send(channel, payload);
-    }
+    sink.emit(channel, payload);
   };
 
   const controller = new AbortController();
   activeStreams.set(requestId, controller);
-  // Abort if the window goes away mid-stream.
-  const onClosed = () => controller.abort();
-  mainWindow?.once("closed", onClosed);
+  const releaseAbort = sink.bindAbort?.(controller);
 
   let fullText = "";
   try {
     const settings = getChatSettings();
-    if (settings.provider === "claude-code") {
+    // An automation may run on a different provider than the interactive chat
+    // without touching the saved settings (decision 2).
+    const provider = runtime.provider ?? settings.provider;
+    if (provider === "claude-code") {
       const claudeConfigDir = getClaudeCodeConfigDir(settings);
       const status = await inspectClaudeCodeStatus(
         settings.claudeCode.executablePath,
@@ -907,11 +1240,15 @@ export async function streamChat(
       }
 
       await ensureAllMcpConnected();
-      const chatTools = getClaudeCodeTools(settings.claudeCode.permissions);
+      const chatTools = getClaudeCodeTools(
+        settings.claudeCode.permissions,
+        toolPolicy
+      );
       const { text: instructions, hasData } = await buildTrainingContext(
         settings.claudeCode.permissions,
         unitSystem,
-        settings.customInstructions
+        settings.customInstructions,
+        roleInstructions
       );
       const effectiveInstructions = withLiveToolInstructions(
         instructions,
@@ -932,11 +1269,13 @@ export async function streamChat(
         messages,
         tools: chatTools,
         signal: controller.signal,
-        model: settings.claudeCode.model,
-        effort: settings.claudeCode.effort,
+        model: runtime.model ?? settings.claudeCode.model,
+        effort: runtime.effort ?? settings.claudeCode.effort,
         configDir: claudeConfigDir,
         onModelResolved: (model) => {
-          if (settings.claudeCode.model?.trim()) return;
+          // An automation's override says nothing about the interactive
+          // default, so never let one overwrite the saved defaultModel.
+          if (runtime.model?.trim() || settings.claudeCode.model?.trim()) return;
           const current = getChatSettings();
           if (current.claudeCode.defaultModel === model) return;
           saveChatSettings({
@@ -978,7 +1317,8 @@ export async function streamChat(
             send,
             requestId,
             unitSystem,
-            settings.claudeCode.permissions
+            settings.claudeCode.permissions,
+            toolPolicy
           );
         }
       });
@@ -993,7 +1333,7 @@ export async function streamChat(
       return;
     }
 
-    if (settings.provider === "openrouter") {
+    if (provider === "openrouter") {
       const apiKey = readStoredOpenRouterApiKey();
       if (!apiKey) {
         throw new Error("Add an OpenRouter API key in Coach settings first.");
@@ -1001,11 +1341,12 @@ export async function streamChat(
       const { text: instructions, hasData } = await buildTrainingContext(
         undefined,
         unitSystem,
-        settings.customInstructions
+        settings.customInstructions,
+        roleInstructions
       );
 
       await ensureAllMcpConnected();
-      const chatTools = getAllChatTools();
+      const chatTools = applyChatToolPolicy(getAllChatTools(), toolPolicy);
       const effectiveInstructions = withLiveToolInstructions(
         instructions,
         chatTools
@@ -1021,7 +1362,7 @@ export async function streamChat(
 
       const result = await streamOpenRouterChatCompletion({
         config: {
-          model: settings.openRouter.model,
+          model: runtime.model ?? settings.openRouter.model,
           apiKey
         },
         instructions: effectiveInstructions,
@@ -1055,7 +1396,15 @@ export async function streamChat(
           const tool = findChatTool(call.name);
           const args = parseFunctionCallArguments(call, tool);
           console.log("[chat] OpenRouter tool call:", call.name);
-          return executeChatTool(call.name, args, send, requestId, unitSystem);
+          return executeChatTool(
+            call.name,
+            args,
+            send,
+            requestId,
+            unitSystem,
+            undefined,
+            toolPolicy
+          );
         }
       });
       fullText = result.fullText;
@@ -1063,8 +1412,12 @@ export async function streamChat(
       return;
     }
 
-    if (settings.provider === "claude-api") {
-      const runtimeConfig = getAnthropicRuntimeConfig(settings.anthropic);
+    if (provider === "claude-api") {
+      const runtimeConfig = {
+        ...getAnthropicRuntimeConfig(settings.anthropic),
+        ...(runtime.model ? { model: runtime.model } : {}),
+        ...(runtime.effort ? { effort: runtime.effort } : {})
+      };
       if (!runtimeConfig.apiKey) {
         throw new AnthropicProviderError(
           "Add your Anthropic API key in Settings to use Claude directly.",
@@ -1073,11 +1426,12 @@ export async function streamChat(
       }
 
       await ensureAllMcpConnected();
-      const chatTools = getAllChatTools();
+      const chatTools = applyChatToolPolicy(getAllChatTools(), toolPolicy);
       const { text: instructions, hasData } = await buildTrainingContext(
         undefined,
         unitSystem,
-        settings.customInstructions
+        settings.customInstructions,
+        roleInstructions
       );
       const effectiveInstructions = withLiveToolInstructions(
         instructions,
@@ -1125,7 +1479,15 @@ export async function streamChat(
         },
         onToolCall: async (toolName, args) => {
           console.log("[chat] tool call:", toolName);
-          return executeChatTool(toolName, args, send, requestId, unitSystem);
+          return executeChatTool(
+            toolName,
+            args,
+            send,
+            requestId,
+            unitSystem,
+            undefined,
+            toolPolicy
+          );
         }
       });
       fullText = result.fullText;
@@ -1133,20 +1495,27 @@ export async function streamChat(
       return;
     }
 
-    if (settings.provider === "local") {
+    if (provider === "local") {
       const { text: instructions, hasData } = await buildTrainingContext(
         undefined,
         unitSystem,
-        settings.customInstructions
+        settings.customInstructions,
+        roleInstructions
       );
-      const runtimeConfig = getLocalRuntimeConfig(settings.local);
+      const runtimeConfig = {
+        ...getLocalRuntimeConfig(settings.local),
+        ...(runtime.model ? { model: runtime.model } : {})
+      };
 
       if (runtimeConfig.toolsEnabled) {
         await ensureAllMcpConnected();
       }
-      const chatTools = runtimeConfig.toolsEnabled
-        ? getAllChatTools()
-        : [...getChatWorkoutTools(), ...getChatInteractionTools()];
+      const chatTools = applyChatToolPolicy(
+        runtimeConfig.toolsEnabled
+          ? getAllChatTools()
+          : [...getChatWorkoutTools(), ...getChatInteractionTools()],
+        toolPolicy
+      );
       const effectiveInstructions = withLiveToolInstructions(
         instructions,
         chatTools
@@ -1201,7 +1570,15 @@ export async function streamChat(
           const tool = findChatTool(call.name);
           const args = parseFunctionCallArguments(call, tool);
           console.log("[chat] tool call:", call.name);
-          return executeChatTool(call.name, args, send, requestId, unitSystem);
+          return executeChatTool(
+            call.name,
+            args,
+            send,
+            requestId,
+            unitSystem,
+            undefined,
+            toolPolicy
+          );
         }
       });
       fullText = result.fullText;
@@ -1213,7 +1590,8 @@ export async function streamChat(
     const { text: instructions, hasData } = await buildTrainingContext(
       undefined,
       unitSystem,
-      settings.customInstructions
+      settings.customInstructions,
+      roleInstructions
     );
 
     // Reconnect a previously-authorized COROS MCP session, then expose its tools
@@ -1225,7 +1603,7 @@ export async function streamChat(
     // leaning on the brief snapshot in `instructions`.
     const effectiveInstructions = withLiveToolInstructions(
       instructions,
-      getAllChatTools()
+      applyChatToolPolicy(getAllChatTools(), toolPolicy)
     );
 
     send("chat:streamStart", { requestId });
@@ -1343,7 +1721,9 @@ export async function streamChat(
             args,
             send,
             requestId,
-            unitSystem
+            unitSystem,
+            undefined,
+            toolPolicy
           );
         } catch (toolError) {
           output =
@@ -1401,7 +1781,7 @@ export async function streamChat(
       });
     }
   } finally {
-    mainWindow?.removeListener("closed", onClosed);
+    releaseAbort?.();
     activeStreams.delete(requestId);
   }
 }
@@ -1461,8 +1841,49 @@ const CLAUDE_REMOTE_READ_TOOLS: Record<
   fullActivityFiles: []
 };
 
+/**
+ * Section 6, decision 3: an auto run may draft and propose, never write.
+ * `upload_training_plan` and `delete_workout` are the write surface today; any
+ * future write tool must be added here as well.
+ */
+const READ_ONLY_BLOCKED_TOOLS = new Set(["upload_training_plan", "delete_workout"]);
+
+/**
+ * Narrows a tool set to what an automation run may call. Beyond the named
+ * write tools this drops every non-COROS MCP server the athlete configured:
+ * their write surface is unknown, so they are excluded by default rather than
+ * inspected.
+ *
+ * Drafting stays allowed because it is already non-destructive — the draft
+ * tools return a preview and the real write only happens from the athlete's
+ * confirmation card.
+ */
+export function isToolAllowedUnderPolicy(
+  name: string,
+  policy: ChatToolPolicy = "interactive"
+): boolean {
+  if (policy !== "read-only") {
+    return true;
+  }
+  if (READ_ONLY_BLOCKED_TOOLS.has(name)) {
+    return false;
+  }
+  const remote = splitToolName(name);
+  return !remote || remote.serverId === "coros";
+}
+
+export function applyChatToolPolicy(
+  tools: CorosMcpTool[],
+  policy: ChatToolPolicy = "interactive"
+): CorosMcpTool[] {
+  return policy === "read-only"
+    ? tools.filter((tool) => isToolAllowedUnderPolicy(tool.name, policy))
+    : tools;
+}
+
 export function getClaudeCodeTools(
-  permissions: ClaudeCodePermissions
+  permissions: ClaudeCodePermissions,
+  toolPolicy: ChatToolPolicy = "interactive"
 ): CorosMcpTool[] {
   const remoteAllowedNames = new Set<string>();
   for (const [permission, names] of Object.entries(CLAUDE_REMOTE_READ_TOOLS)) {
@@ -1500,13 +1921,16 @@ export function getClaudeCodeTools(
     );
   });
 
-  return [
-    ...remoteTools,
-    ...activityTools,
-    ...analyticsTools,
-    ...workoutTools,
-    ...getChatInteractionTools()
-  ];
+  return applyChatToolPolicy(
+    [
+      ...remoteTools,
+      ...activityTools,
+      ...analyticsTools,
+      ...workoutTools,
+      ...getChatInteractionTools()
+    ],
+    toolPolicy
+  );
 }
 
 async function executeChatTool(
@@ -1515,8 +1939,18 @@ async function executeChatTool(
   send: (channel: string, payload: unknown) => void,
   requestId: string,
   unitSystem: UnitSystem,
-  claudePermissions?: ClaudeCodePermissions
+  claudePermissions?: ClaudeCodePermissions,
+  toolPolicy: ChatToolPolicy = "interactive"
 ): Promise<string> {
+  // Every provider branch converges here, so this is the one place the
+  // read-only boundary cannot be routed around by a model that names a tool it
+  // was never offered.
+  if (!isToolAllowedUnderPolicy(name, toolPolicy)) {
+    throw new Error(
+      `${name} is not available to an automation run; it may only read, analyse and draft.`
+    );
+  }
+
   if (isChatInteractionTool(name)) {
     return handleChatInteractionTool(
       name as ChatInteractionToolName,
@@ -1527,7 +1961,8 @@ async function executeChatTool(
           kind: "coachPrompt",
           prompt
         });
-      }
+      },
+      toolPolicy
     );
   }
   if (isChatWorkoutTool(name)) {
@@ -1889,10 +2324,14 @@ function extractSseData(frame: string): string | null {
 async function buildTrainingContext(
   permissions?: ClaudeCodePermissions,
   unitSystem: UnitSystem = "metric",
-  customInstructions?: string
+  customInstructions?: string,
+  roleInstructions?: string
 ): Promise<{ text: string; hasData: boolean }> {
   // Rebuilt per request so edits to the athlete's custom instructions apply live.
-  const coachInstructions = buildCoachInstructions(customInstructions);
+  const coachInstructions = buildCoachInstructions(
+    customInstructions,
+    roleInstructions
+  );
   const unitInstruction =
     `The athlete selected ${unitSystem === "imperial" ? "Imperial" : "Metric"} units. ` +
     `Use ${unitSystem === "imperial" ? "miles, feet, min/mi, mph, pounds, and yards for swims" : "kilometres, metres, min/km, km/h, and kilograms"} in every user-facing answer and tool summary. ` +

@@ -92,6 +92,16 @@ import type {
   ChatMessage,
   ChatProvider,
   ChatSessionSummary,
+  CoachAutomation,
+  CoachAutomationAttachResult,
+  CoachAutomationBinding,
+  CoachAutomationBindingInput,
+  CoachAutomationBindingView,
+  CoachAutomationDetail,
+  CoachAutomationInput,
+  CoachAutomationRun,
+  CoachAutomationRunQuery,
+  CoachAutomationSummary,
   ChatSettings,
   ClaudeCodeConnectionTest,
   ClaudeCodeLoginStart,
@@ -626,6 +636,53 @@ export interface CorosLinkApi {
     pinned: boolean
   ) => Promise<ChatSessionSummary | null>;
   deleteChatSession: (sessionId: string) => Promise<void>;
+  renameChatSession: (
+    sessionId: string,
+    title: string
+  ) => Promise<ChatSessionSummary | null>;
+  listCoachAutomations: () => Promise<CoachAutomationSummary[]>;
+  getCoachAutomation: (
+    automationId: string
+  ) => Promise<CoachAutomationDetail | null>;
+  saveCoachAutomation: (
+    input: CoachAutomationInput,
+    automationId?: string
+  ) => Promise<CoachAutomation | null>;
+  setCoachAutomationEnabled: (
+    automationId: string,
+    enabled: boolean
+  ) => Promise<CoachAutomation | null>;
+  deleteCoachAutomation: (automationId: string) => Promise<void>;
+  listCoachAutomationBindings: (
+    automationId: string
+  ) => Promise<CoachAutomationBindingView[]>;
+  attachCoachAutomation: (
+    input: CoachAutomationBindingInput
+  ) => Promise<CoachAutomationAttachResult>;
+  detachCoachAutomation: (bindingId: string) => Promise<void>;
+  setCoachAutomationBindingEnabled: (
+    bindingId: string,
+    enabled: boolean
+  ) => Promise<CoachAutomationBinding | null>;
+  reorderCoachAutomationBindings: (
+    sessionId: string,
+    bindingIds: string[]
+  ) => Promise<CoachAutomationBinding[]>;
+  listCoachAutomationsForSession: (
+    sessionId: string
+  ) => Promise<CoachAutomationBindingView[]>;
+  runCoachAutomationNow: (
+    automationId: string,
+    bindingIds?: string[]
+  ) => Promise<CoachAutomationRun[]>;
+  listCoachAutomationRuns: (
+    filter?: CoachAutomationRunQuery
+  ) => Promise<CoachAutomationRun[]>;
+  cancelCoachAutomationRun: (runId: string) => Promise<void>;
+  markCoachAutomationRunsSeen: (runIds: string[]) => Promise<number>;
+  onCoachAutomationRunUpdate: (
+    callback: (run: CoachAutomationRun) => void
+  ) => () => void;
   onChatStreamStart: (callback: (payload: ChatStreamStart) => void) => () => void;
   onChatStreamToken: (callback: (payload: ChatStreamToken) => void) => () => void;
   onChatStreamDone: (callback: (payload: ChatStreamDone) => void) => () => void;

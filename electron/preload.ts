@@ -95,6 +95,16 @@ import type {
   ChatMessage,
   ChatProvider,
   ChatSessionSummary,
+  CoachAutomation,
+  CoachAutomationAttachResult,
+  CoachAutomationBinding,
+  CoachAutomationBindingInput,
+  CoachAutomationBindingView,
+  CoachAutomationDetail,
+  CoachAutomationInput,
+  CoachAutomationRun,
+  CoachAutomationRunQuery,
+  CoachAutomationSummary,
   ChatSettings,
   ClaudeCodeConnectionTest,
   ClaudeCodeLoginStart,
@@ -977,6 +987,74 @@ const api = {
     ipcRenderer.invoke("chat:setSessionPinned", sessionId, pinned),
   deleteChatSession: (sessionId: string): Promise<void> =>
     ipcRenderer.invoke("chat:deleteSession", sessionId),
+  renameChatSession: (
+    sessionId: string,
+    title: string
+  ): Promise<ChatSessionSummary | null> =>
+    ipcRenderer.invoke("chat:renameSession", sessionId, title),
+  listCoachAutomations: (): Promise<CoachAutomationSummary[]> =>
+    ipcRenderer.invoke("coachAutomation:list"),
+  getCoachAutomation: (automationId: string): Promise<CoachAutomationDetail | null> =>
+    ipcRenderer.invoke("coachAutomation:get", automationId),
+  saveCoachAutomation: (
+    input: CoachAutomationInput,
+    automationId?: string
+  ): Promise<CoachAutomation | null> =>
+    ipcRenderer.invoke("coachAutomation:save", input, automationId),
+  setCoachAutomationEnabled: (
+    automationId: string,
+    enabled: boolean
+  ): Promise<CoachAutomation | null> =>
+    ipcRenderer.invoke("coachAutomation:setEnabled", automationId, enabled),
+  deleteCoachAutomation: (automationId: string): Promise<void> =>
+    ipcRenderer.invoke("coachAutomation:delete", automationId),
+  listCoachAutomationBindings: (
+    automationId: string
+  ): Promise<CoachAutomationBindingView[]> =>
+    ipcRenderer.invoke("coachAutomation:listBindings", automationId),
+  attachCoachAutomation: (
+    input: CoachAutomationBindingInput
+  ): Promise<CoachAutomationAttachResult> =>
+    ipcRenderer.invoke("coachAutomation:attach", input),
+  detachCoachAutomation: (bindingId: string): Promise<void> =>
+    ipcRenderer.invoke("coachAutomation:detach", bindingId),
+  setCoachAutomationBindingEnabled: (
+    bindingId: string,
+    enabled: boolean
+  ): Promise<CoachAutomationBinding | null> =>
+    ipcRenderer.invoke("coachAutomation:setBindingEnabled", bindingId, enabled),
+  reorderCoachAutomationBindings: (
+    sessionId: string,
+    bindingIds: string[]
+  ): Promise<CoachAutomationBinding[]> =>
+    ipcRenderer.invoke("coachAutomation:reorderBindings", sessionId, bindingIds),
+  listCoachAutomationsForSession: (
+    sessionId: string
+  ): Promise<CoachAutomationBindingView[]> =>
+    ipcRenderer.invoke("coachAutomation:listForSession", sessionId),
+  runCoachAutomationNow: (
+    automationId: string,
+    bindingIds?: string[]
+  ): Promise<CoachAutomationRun[]> =>
+    ipcRenderer.invoke("coachAutomation:runNow", automationId, bindingIds),
+  listCoachAutomationRuns: (
+    filter?: CoachAutomationRunQuery
+  ): Promise<CoachAutomationRun[]> =>
+    ipcRenderer.invoke("coachAutomation:listRuns", filter),
+  cancelCoachAutomationRun: (runId: string): Promise<void> =>
+    ipcRenderer.invoke("coachAutomation:cancelRun", runId),
+  markCoachAutomationRunsSeen: (runIds: string[]): Promise<number> =>
+    ipcRenderer.invoke("coachAutomation:markSeen", runIds),
+  onCoachAutomationRunUpdate: (
+    callback: (run: CoachAutomationRun) => void
+  ): (() => void) => {
+    const listener = (
+      _event: Electron.IpcRendererEvent,
+      run: CoachAutomationRun
+    ) => callback(run);
+    ipcRenderer.on("coachAutomation:runUpdate", listener);
+    return () => ipcRenderer.removeListener("coachAutomation:runUpdate", listener);
+  },
   onChatStreamStart: (
     callback: (payload: ChatStreamStart) => void
   ): (() => void) => {

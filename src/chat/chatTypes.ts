@@ -1,5 +1,6 @@
 import type {
   ActivityVisualPreview,
+  ChatEntryAutomationMarker,
   ChatMessage,
   CoachInputPrompt,
   FitnessTrendPreview,
@@ -24,6 +25,14 @@ export interface ChatMessageEntry {
   content: string;
   source?: SourceInfo;
   reasoningSummary?: string;
+  /**
+   * Set when a coach automation wrote this entry. Both converters below have to
+   * carry it: they rebuild entries field by field, so an unlisted field is
+   * dropped — and `toPersistedEntries` runs whenever the athlete replies in the
+   * conversation, which would silently strip attribution off the run's own
+   * messages.
+   */
+  automation?: ChatEntryAutomationMarker;
 }
 
 export interface ChatPlanDraftEntry {
@@ -240,7 +249,8 @@ function persistVisualEntry(entry: ChatEntry): PersistedChatEntry | null {
       ...(entry.source ? { source: entry.source } : {}),
       ...(entry.reasoningSummary
         ? { reasoningSummary: entry.reasoningSummary }
-        : {})
+        : {}),
+      ...(entry.automation ? { automation: entry.automation } : {})
     };
   }
   return null;
@@ -308,7 +318,8 @@ export function fromPersistedEntries(entries: PersistedChatEntry[]): ChatEntry[]
       ...(entry.source ? { source: entry.source } : {}),
       ...(entry.reasoningSummary
         ? { reasoningSummary: entry.reasoningSummary }
-        : {})
+        : {}),
+      ...(entry.automation ? { automation: entry.automation } : {})
     });
   }
 

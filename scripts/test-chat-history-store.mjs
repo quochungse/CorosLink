@@ -16,7 +16,8 @@ const {
   parseChatTranscriptJson,
   restoreChatPlanDraftSources,
   saveChatSession,
-  setChatSessionPinned
+  setChatSessionPinned,
+  setChatSessionTitle
 } = await import(`${distUrl("chatHistoryStore.js")}?cacheBust=${Date.now()}`);
 
 function createMemoryDatabase() {
@@ -61,6 +62,11 @@ function createMemoryDatabase() {
       const row = rows.get(id);
       if (!row) return;
       rows.set(id, { ...row, pinned_at: pinnedAt });
+    },
+    setSessionTitle(id, title) {
+      const row = rows.get(id);
+      if (!row) return;
+      rows.set(id, { ...row, title });
     },
     deleteSession(id) {
       rows.delete(id);
@@ -385,5 +391,127 @@ saveChatSession(
 );
 assert.equal(listChatSessions("openrouter", db).length, 1);
 assert.equal(listChatSessions("chatgpt", db).length, 2);
+
+// --- setChatSessionTitle (coach automations name their own conversations) ---
+const named = createChatSession("local", db);
+const renamed = setChatSessionTitle(named.id, "  Morning briefing  ", db);
+assert.equal(renamed.title, "Morning briefing");
+assert.equal(
+  renamed.updatedAt,
+  named.updatedAt,
+  "renaming must not jump the conversation to the top of the sidebar"
+);
+
+// An over-long title is truncated the same way a derived one is.
+const longTitle = setChatSessionTitle(named.id, "x".repeat(120), db);
+assert.equal(longTitle.title.length, 49);
+assert.ok(longTitle.title.endsWith("\u2026"));
+
+// A blank rename falls back to the default rather than storing "".
+assert.equal(setChatSessionTitle(named.id, "   ", db).title, "New chat");
+
+// Renaming to the stored title is a no-op that still returns the summary.
+assert.equal(setChatSessionTitle(named.id, "New chat", db).title, "New chat");
+assert.equal(setChatSessionTitle("missing", "Nope", db), null);
+
+// A renamed conversation keeps its name: saveChatSession only derives a title
+// while the stored one is still the default, which is exactly what stops an
+// automation's conversation being named after its own playbook text.
+setChatSessionTitle(named.id, "Daily briefing", db);
+const afterPlaybook = saveChatSession(
+  named.id,
+  [{ kind: "message", role: "user", content: "Summarise yesterday and set today's focus." }],
+  db
+);
+assert.equal(afterPlaybook.title, "Daily briefing");
+deleteChatSession(named.id, db);
+
+// --- automation attribution survives a round-trip (section 5.6) ------------
+// parseMessageEntry rebuilds entries field by field, so an unlisted field is
+// silently dropped on reload. These assertions are the guard on that.
+const marker = {
+  runId: "run-1",
+  automationId: "auto-1",
+  bindingId: "bind-1",
+  name: "Morning briefing",
+  triggerLabel: "Daily at 07:30"
+};
+
+const attributed = createChatSession("local", db);
+saveChatSession(
+  attributed.id,
+  [
+    // The synthetic user turn carrying the playbook, stored as role "user".
+    {
+      kind: "message",
+      role: "user",
+      content: "Summarise yesterday and set today's focus.",
+      automation: marker
+    },
+    {
+      kind: "message",
+      role: "assistant",
+      content: "Easy 40min today.",
+      reasoningSummary: "checked yesterday's load",
+      automation: marker
+    },
+    // An interactive turn in the same conversation carries no marker.
+    { kind: "message", role: "user", content: "Why easy?" }
+  ],
+  db
+);
+
+const reloaded = getChatSession(attributed.id, db);
+assert.equal(reloaded.length, 3);
+assert.deepEqual(reloaded[0].automation, marker, "the user turn keeps its marker");
+assert.deepEqual(reloaded[1].automation, marker, "the assistant turn keeps its marker");
+assert.equal(reloaded[1].reasoningSummary, "checked yesterday's load");
+assert.equal(
+  "automation" in reloaded[2],
+  false,
+  "an interactive turn gains no marker"
+);
+// It survives the JSON the row actually stores, not just the in-memory object.
+assert.deepEqual(
+  parseChatTranscriptJson(db.getSession(attributed.id).messages_json)[1].automation,
+  marker
+);
+deleteChatSession(attributed.id, db);
+
+// A marker missing any field is dropped rather than half-restored, and the
+// message itself still survives.
+const partialCases = [
+  { ...marker, triggerLabel: undefined },
+  { ...marker, name: "   " },
+  { ...marker, runId: 42 },
+  { runId: "r", automationId: "a" },
+  "not-an-object",
+  null,
+  []
+];
+for (const automation of partialCases) {
+  const parsed = parseChatTranscriptJson(
+    JSON.stringify([{ kind: "message", role: "assistant", content: "hi", automation }])
+  );
+  assert.equal(parsed.length, 1, `message dropped for ${JSON.stringify(automation)}`);
+  assert.equal(
+    parsed[0].automation,
+    undefined,
+    `partial marker kept for ${JSON.stringify(automation)}`
+  );
+}
+
+// An extra field on the marker is not carried through.
+const extraFields = parseChatTranscriptJson(
+  JSON.stringify([
+    {
+      kind: "message",
+      role: "assistant",
+      content: "hi",
+      automation: { ...marker, sessionId: "leaked" }
+    }
+  ])
+);
+assert.deepEqual(extraFields[0].automation, marker);
 
 console.log("chat history store tests passed");
