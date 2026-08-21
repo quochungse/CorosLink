@@ -970,6 +970,11 @@ const api = {
     entries: PersistedChatEntry[]
   ): Promise<ChatSessionSummary | null> =>
     ipcRenderer.invoke("chat:saveSession", sessionId, entries),
+  setChatSessionPinned: (
+    sessionId: string,
+    pinned: boolean
+  ): Promise<ChatSessionSummary | null> =>
+    ipcRenderer.invoke("chat:setSessionPinned", sessionId, pinned),
   deleteChatSession: (sessionId: string): Promise<void> =>
     ipcRenderer.invoke("chat:deleteSession", sessionId),
   onChatStreamStart: (

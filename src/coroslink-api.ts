@@ -621,6 +621,10 @@ export interface CorosLinkApi {
     sessionId: string,
     entries: PersistedChatEntry[]
   ) => Promise<ChatSessionSummary | null>;
+  setChatSessionPinned: (
+    sessionId: string,
+    pinned: boolean
+  ) => Promise<ChatSessionSummary | null>;
   deleteChatSession: (sessionId: string) => Promise<void>;
   onChatStreamStart: (callback: (payload: ChatStreamStart) => void) => () => void;
   onChatStreamToken: (callback: (payload: ChatStreamToken) => void) => () => void;

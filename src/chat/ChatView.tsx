@@ -2506,6 +2506,28 @@ export function ChatView({
     await loadSession(sessionId);
   };
 
+  const handleTogglePinSession = async (sessionId: string, pinned: boolean) => {
+    if (!api) return;
+    onError(null);
+    try {
+      const summary = await api.setChatSessionPinned(sessionId, pinned);
+      if (!summary) return;
+      setSessions((current) =>
+        current.map((session) =>
+          session.id === summary.id ? summary : session
+        )
+      );
+    } catch (caught) {
+      onError(
+        caught instanceof Error
+          ? caught.message
+          : pinned
+            ? "Could not pin chat."
+            : "Could not unpin chat."
+      );
+    }
+  };
+
   const handleDeleteSession = async (sessionId: string) => {
     if (!api || streaming || exportingLatestActivity) return;
     onError(null);
@@ -3412,6 +3434,8 @@ export function ChatView({
     onOpen: () => void handleUpdateChatSettings({ sidebarOpen: true }),
     onNewChat: () => void handleNewChat(),
     onSelectSession: (sessionId: string) => void handleSelectSession(sessionId),
+    onTogglePinSession: (sessionId: string, pinned: boolean) =>
+      void handleTogglePinSession(sessionId, pinned),
     onDeleteSession: (sessionId: string) => void handleDeleteSession(sessionId)
   };
 

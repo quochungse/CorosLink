@@ -91,7 +91,8 @@ import {
   deleteChatSession,
   getChatSession,
   listChatSessions,
-  saveChatSession
+  saveChatSession,
+  setChatSessionPinned
 } from "./chatHistoryStore";
 import type {
   AnthropicApiConfig,
@@ -439,6 +440,10 @@ export function saveChatSessionEntries(
   entries: PersistedChatEntry[]
 ) {
   return saveChatSession(id, entries);
+}
+
+export function setChatSessionPinnedById(id: string, pinned: boolean) {
+  return setChatSessionPinned(id, pinned);
 }
 
 export function deleteChatSessionById(id: string): void {

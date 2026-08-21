@@ -15,11 +15,12 @@ const {
   migrateLegacyTranscriptRow,
   parseChatTranscriptJson,
   restoreChatPlanDraftSources,
-  saveChatSession
+  saveChatSession,
+  setChatSessionPinned
 } = await import(`${distUrl("chatHistoryStore.js")}?cacheBust=${Date.now()}`);
 
 function createMemoryDatabase() {
-  /** @type {Map<string, { id: string, provider: string, title: string, messages_json: string, created_at: string, updated_at: string }>} */
+  /** @type {Map<string, { id: string, provider: string, title: string, messages_json: string, created_at: string, updated_at: string, pinned_at: string | null }>} */
   const rows = new Map();
 
   return {
@@ -42,7 +43,8 @@ function createMemoryDatabase() {
         title,
         messages_json: messagesJson,
         created_at: createdAt,
-        updated_at: updatedAt
+        updated_at: updatedAt,
+        pinned_at: null
       });
     },
     updateSession(id, title, messagesJson, updatedAt) {
@@ -54,6 +56,11 @@ function createMemoryDatabase() {
         messages_json: messagesJson,
         updated_at: updatedAt
       });
+    },
+    setSessionPinned(id, pinnedAt) {
+      const row = rows.get(id);
+      if (!row) return;
+      rows.set(id, { ...row, pinned_at: pinnedAt });
     },
     deleteSession(id) {
       rows.delete(id);
@@ -288,6 +295,38 @@ saveChatSession(
 );
 assert.equal(listChatSessions("local", db).length, 1);
 assert.equal(listChatSessions("chatgpt", db).length, 2);
+
+const pinTarget = createChatSession("chatgpt", db);
+assert.equal(pinTarget.pinnedAt, null);
+
+const pinned = setChatSessionPinned(pinTarget.id, true, db);
+assert.ok(pinned);
+assert.ok(pinned.pinnedAt);
+assert.equal(
+  listChatSessions("chatgpt", db).find((session) => session.id === pinTarget.id)
+    .pinnedAt,
+  pinned.pinnedAt
+);
+
+// Re-pinning keeps the original timestamp so the pinned order stays stable.
+assert.equal(setChatSessionPinned(pinTarget.id, true, db).pinnedAt, pinned.pinnedAt);
+
+// Saving a transcript must not clear the pin.
+saveChatSession(
+  pinTarget.id,
+  [{ kind: "message", role: "user", content: "Keep me pinned" }],
+  db
+);
+assert.equal(
+  listChatSessions("chatgpt", db).find((session) => session.id === pinTarget.id)
+    .pinnedAt,
+  pinned.pinnedAt
+);
+
+assert.equal(setChatSessionPinned(pinTarget.id, false, db).pinnedAt, null);
+assert.equal(setChatSessionPinned("missing-session", true, db), null);
+
+deleteChatSession(pinTarget.id, db);
 
 const claude = createChatSession("claude-code", db);
 saveChatSession(

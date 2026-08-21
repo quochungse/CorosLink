@@ -314,6 +314,7 @@ import {
   logoutChat,
   saveChatSessionEntries,
   saveChatSettings,
+  setChatSessionPinnedById,
   streamChat,
   testClaudeCodeConnection,
   testAnthropicApiConnection,
@@ -1403,6 +1404,12 @@ function registerIpcHandlers(): void {
     "chat:saveSession",
     (_event, sessionId: string, entries: PersistedChatEntry[]) =>
       saveChatSessionEntries(sessionId, entries)
+  );
+
+  ipcMain.handle(
+    "chat:setSessionPinned",
+    (_event, sessionId: string, pinned: boolean) =>
+      setChatSessionPinnedById(sessionId, pinned)
   );
 
   ipcMain.handle("chat:deleteSession", (_event, sessionId: string) => {

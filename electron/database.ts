@@ -263,7 +263,8 @@ export function initializeDatabase(userDataPath: string): Database.Database {
       title TEXT NOT NULL,
       messages_json TEXT NOT NULL,
       created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
+      updated_at TEXT NOT NULL,
+      pinned_at TEXT
     );
 
     CREATE INDEX IF NOT EXISTS idx_chat_sessions_provider_updated
@@ -374,6 +375,8 @@ export function initializeDatabase(userDataPath: string): Database.Database {
   // 1..5; 0 = unrated). NULL = never fetched from the detail endpoint yet.
   ensureColumn(db, "training_activities", "feel_type", "INTEGER");
   migrateChatSessionProviderConstraint(db);
+  // pinned_at holds the ISO timestamp a conversation was pinned; NULL = unpinned.
+  ensureColumn(db, "chat_sessions", "pinned_at", "TEXT");
   migrateChatTranscriptsToSessions(db);
 
   // Seed the built-in COROS MCP server so existing users get a registry entry
@@ -856,12 +859,13 @@ export interface ChatSessionRow {
   messages_json: string;
   created_at: string;
   updated_at: string;
+  pinned_at: string | null;
 }
 
 export function listChatSessionRows(provider: string): ChatSessionRow[] {
   return requireDatabase()
     .prepare(
-      `SELECT id, provider, title, messages_json, created_at, updated_at
+      `SELECT id, provider, title, messages_json, created_at, updated_at, pinned_at
        FROM chat_sessions
        WHERE provider = ?
        ORDER BY updated_at DESC`
@@ -872,7 +876,7 @@ export function listChatSessionRows(provider: string): ChatSessionRow[] {
 export function getChatSessionRow(id: string): ChatSessionRow | undefined {
   return requireDatabase()
     .prepare(
-      `SELECT id, provider, title, messages_json, created_at, updated_at
+      `SELECT id, provider, title, messages_json, created_at, updated_at, pinned_at
        FROM chat_sessions
        WHERE id = ?`
     )
@@ -908,6 +912,15 @@ export function updateChatSessionRow(
        WHERE id = ?`
     )
     .run(title, messagesJson, updatedAt, id);
+}
+
+export function setChatSessionPinnedRow(
+  id: string,
+  pinnedAt: string | null
+): void {
+  requireDatabase()
+    .prepare("UPDATE chat_sessions SET pinned_at = ? WHERE id = ?")
+    .run(pinnedAt, id);
 }
 
 export function deleteChatSessionRow(id: string): void {

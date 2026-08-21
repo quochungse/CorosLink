@@ -2533,6 +2533,8 @@ export interface ChatSessionSummary {
   updatedAt: string;
   createdAt: string;
   messageCount: number;
+  /** ISO timestamp the conversation was pinned, or null when unpinned. */
+  pinnedAt: string | null;
 }
 
 export interface LocalChatConnectionTest {

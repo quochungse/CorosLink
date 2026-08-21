@@ -13,6 +13,7 @@ export function ChatSidebar({
   onOpen,
   onNewChat,
   onSelectSession,
+  onTogglePinSession,
   onDeleteSession
 }: {
   open: boolean;
@@ -24,6 +25,7 @@ export function ChatSidebar({
   onOpen: () => void;
   onNewChat: () => void;
   onSelectSession: (sessionId: string) => void;
+  onTogglePinSession: (sessionId: string, pinned: boolean) => void;
   onDeleteSession: (sessionId: string) => void;
 }) {
   useEffect(() => {
@@ -87,6 +89,7 @@ export function ChatSidebar({
               onCollapse={onClose}
               onNewChat={onNewChat}
               onSelectSession={onSelectSession}
+              onTogglePinSession={onTogglePinSession}
               onDeleteSession={onDeleteSession}
             />
           </div>

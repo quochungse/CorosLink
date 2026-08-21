@@ -5,6 +5,7 @@ import {
   getChatSessionRow,
   insertChatSessionRow,
   listChatSessionRows,
+  setChatSessionPinnedRow,
   updateChatSessionRow
 } from "./database";
 import type {
@@ -40,6 +41,7 @@ export interface ChatSessionRow {
   messages_json: string;
   created_at: string;
   updated_at: string;
+  pinned_at?: string | null;
 }
 
 export interface ChatSessionDatabase {
@@ -59,6 +61,7 @@ export interface ChatSessionDatabase {
     messagesJson: string,
     updatedAt: string
   ): void;
+  setSessionPinned(id: string, pinnedAt: string | null): void;
   deleteSession(id: string): void;
 }
 
@@ -77,6 +80,7 @@ function createSqliteSessionDatabase(): ChatSessionDatabase {
       ),
     updateSession: (id, title, messagesJson, updatedAt) =>
       updateChatSessionRow(id, title, messagesJson, updatedAt),
+    setSessionPinned: (id, pinnedAt) => setChatSessionPinnedRow(id, pinnedAt),
     deleteSession: (id) => deleteChatSessionRow(id)
   };
 }
@@ -931,7 +935,8 @@ function toSessionSummary(row: ChatSessionRow): ChatSessionSummary {
     preview: derivePreviewFromEntries(entries),
     updatedAt: row.updated_at,
     createdAt: row.created_at,
-    messageCount: countMessages(entries)
+    messageCount: countMessages(entries),
+    pinnedAt: row.pinned_at ?? null
   };
 }
 
@@ -1004,6 +1009,23 @@ export function saveChatSession(
     JSON.stringify(normalizedEntries),
     updatedAt
   );
+  const nextRow = database.getSession(id);
+  return nextRow ? toSessionSummary(nextRow) : null;
+}
+
+export function setChatSessionPinned(
+  id: string,
+  pinned: boolean,
+  database: ChatSessionDatabase = defaultDatabase
+): ChatSessionSummary | null {
+  const row = database.getSession(id);
+  if (!row) {
+    return null;
+  }
+
+  // Keep an existing pin timestamp so re-pinning does not reshuffle the list.
+  const pinnedAt = pinned ? row.pinned_at ?? new Date().toISOString() : null;
+  database.setSessionPinned(id, pinnedAt);
   const nextRow = database.getSession(id);
   return nextRow ? toSessionSummary(nextRow) : null;
 }

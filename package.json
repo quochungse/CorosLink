@@ -39,6 +39,7 @@
     "test:claude-code": "npm run build:electron && node scripts/test-claude-code-provider.mjs",
     "test:anthropic-provider": "npm run build:electron && node scripts/test-anthropic-provider.mjs",
     "test:chat-history-store": "npm run build:electron && node scripts/test-chat-history-store.mjs",
+    "test:chat-session-groups": "node --experimental-strip-types scripts/test-chat-session-groups.mjs",
     "test:chat-activity-tools": "npm run build:electron && node scripts/test-chat-activity-tools.mjs",
     "test:chat-analytics-tools": "npm run build:electron && node scripts/test-chat-analytics-tools.mjs",
     "test:sleep-data-parser": "npm run build:electron && node scripts/test-sleep-data-parser.mjs",

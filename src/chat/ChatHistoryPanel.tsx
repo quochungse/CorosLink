@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { Loader2, PanelLeftClose, Plus, Search } from "lucide-react";
+import { Loader2, PanelLeftClose, Pin, Plus, Search } from "lucide-react";
 import type { ChatSessionSummary } from "../../electron/types";
 import { ChatSessionRow } from "./ChatSessionRow";
 import { groupChatSessions } from "./chatSessionGroups";
@@ -11,6 +11,7 @@ export function ChatHistoryPanel({
   onCollapse,
   onNewChat,
   onSelectSession,
+  onTogglePinSession,
   onDeleteSession
 }: {
   sessions: ChatSessionSummary[];
@@ -19,6 +20,7 @@ export function ChatHistoryPanel({
   onCollapse: () => void;
   onNewChat: () => void;
   onSelectSession: (sessionId: string) => void;
+  onTogglePinSession: (sessionId: string, pinned: boolean) => void;
   onDeleteSession: (sessionId: string) => void;
 }) {
   const [query, setQuery] = useState("");
@@ -85,8 +87,21 @@ export function ChatHistoryPanel({
           </p>
         ) : (
           groups.map((group) => (
-            <section key={group.label} className="chat-session-group">
-              <h3 className="chat-session-group-label">{group.label}</h3>
+            <section
+              key={group.label}
+              className={[
+                "chat-session-group",
+                group.label === "Pinned" ? "is-pinned-group" : ""
+              ]
+                .filter(Boolean)
+                .join(" ")}
+            >
+              <h3 className="chat-session-group-label">
+                {group.label === "Pinned" ? (
+                  <Pin size={11} aria-hidden="true" />
+                ) : null}
+                {group.label === "Pinned" ? "Pinned conversations" : group.label}
+              </h3>
               <div className="chat-session-group-list">
                 {group.sessions.map((session) => (
                   <ChatSessionRow
@@ -95,6 +110,9 @@ export function ChatHistoryPanel({
                     active={session.id === activeSessionId}
                     disabled={busy}
                     onSelect={() => onSelectSession(session.id)}
+                    onTogglePin={() =>
+                      onTogglePinSession(session.id, !session.pinnedAt)
+                    }
                     onDelete={() => onDeleteSession(session.id)}
                   />
                 ))}
