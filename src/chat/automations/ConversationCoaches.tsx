@@ -21,12 +21,21 @@ export function ConversationCoaches({
   api,
   sessionId,
   refreshVersion = 0,
+  onChanged,
   onManageAutomations
 }: {
   api: CorosLinkApi | undefined;
   sessionId: string | null;
   /** Bumped by the Automations screen so the chips follow what it changed. */
   refreshVersion?: number;
+  /**
+   * Attaching, detaching or switching a coach off changes which conversations
+   * a coach speaks into, and that is what the sidebar's ⚡ mark is (9.3). This
+   * popover is the entry point most athletes use, and it was the only one with
+   * no way to say it had changed anything, so the mark did not move until the
+   * app was restarted.
+   */
+  onChanged?: () => void;
   onManageAutomations: () => void;
 }) {
   const [bindings, setBindings] = useState<CoachAutomationBindingView[]>([]);
@@ -34,6 +43,18 @@ export function ConversationCoaches({
   const [open, setOpen] = useState(false);
   const [attachOpen, setAttachOpen] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
+  /** Covers the gap between the click and the run having a record of its own. */
+  const [startingId, setStartingId] = useState<string | null>(null);
+  /**
+   * Binding id → the run in flight for it, re-derived on every refresh rather
+   * than accumulated from the pushes. Accumulating looked cheaper and was
+   * wrong twice over: the terminal update for a `per-run` binding names the
+   * conversation the run *created*, not this one, so the entry was never
+   * cleared; and switching conversations and back left the map holding runs
+   * that had finished while the athlete was elsewhere. Runs are serialised
+   * process-wide (5.4), so the query it replaces reads at most one row.
+   */
+  const [inFlightRuns, setInFlightRuns] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
@@ -44,12 +65,16 @@ export function ConversationCoaches({
     }
     try {
       // The chips need the automation's name, which a binding does not carry.
-      const [attached, all] = await Promise.all([
+      const [attached, all, running] = await Promise.all([
         api.listCoachAutomationsForSession(sessionId),
-        api.listCoachAutomations()
+        api.listCoachAutomations(),
+        api.listCoachAutomationRuns({ statuses: ["running"] })
       ]);
       setBindings(attached);
       setAutomations(all);
+      setInFlightRuns(
+        Object.fromEntries(running.map((run) => [run.bindingId, run.id]))
+      );
       setError(null);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
@@ -67,10 +92,14 @@ export function ConversationCoaches({
   useEffect(() => {
     if (!api?.onCoachAutomationRunUpdate) return;
     return api.onCoachAutomationRunUpdate((run) => {
-      if (run.sessionId && run.sessionId !== sessionId) return;
+      // Deliberately unfiltered. A `per-run` binding attached *here* runs into
+      // a conversation of its own, so filtering on this one's session id threw
+      // away every update about the rows on screen. Runs are rare enough that
+      // one extra read costs nothing next to being wrong.
+      setStartingId((current) => (current === run.bindingId ? null : current));
       void refresh();
     });
-  }, [api, sessionId, refresh]);
+  }, [api, refresh]);
 
   useEffect(() => {
     if (!open) return;
@@ -96,10 +125,43 @@ export function ConversationCoaches({
     try {
       await work();
       await refresh();
+      onChanged?.();
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
       setBusyId(null);
+    }
+  };
+
+  /**
+   * Not `withBusy`: a run resolves only once it has finished, and this popover
+   * is closed long before that. Anchoring the button to the promise left the
+   * spinner up the next time the athlete opened it, on a run that had ended.
+   */
+  const startRun = async (binding: CoachAutomationBindingView) => {
+    if (!api) return;
+    setStartingId(binding.id);
+    setError(null);
+    try {
+      announceRunNow(
+        await api.runCoachAutomationNow(binding.automationId, [binding.id])
+      );
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setStartingId((current) => (current === binding.id ? null : current));
+      await refresh();
+    }
+  };
+
+  /** The way out of a run that is taking longer than the athlete wants to wait. */
+  const stopRun = async (runId: string) => {
+    if (!api) return;
+    setError(null);
+    try {
+      await api.cancelCoachAutomationRun(runId);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
     }
   };
 
@@ -178,6 +240,8 @@ export function ConversationCoaches({
                     (entry) => entry.automation.id === binding.automationId
                   );
                   const busy = busyId === binding.id;
+                  const inFlight = inFlightRuns[binding.id] ?? null;
+                  const starting = startingId === binding.id;
                   const name = summary?.automation.name ?? "Automation";
                   const masterOff = summary?.automation.enabled === false;
                   const live = isLive(binding);
@@ -255,33 +319,41 @@ export function ConversationCoaches({
                             </button>
                           </>
                         ) : null}
-                        <button
-                          type="button"
-                          className="icon-button"
-                          aria-label="Run now here"
-                          title="Run now here"
-                          disabled={busy || !api}
-                          onClick={() =>
-                            void withBusy(binding.id, async () =>
-                              announceRunNow(
-                                await (api as CorosLinkApi).runCoachAutomationNow(
-                                  binding.automationId,
-                                  [binding.id]
-                                )
-                              )
-                            )
-                          }
-                        >
-                          {busy ? (
+                        {inFlight ? (
+                          <button
+                            type="button"
+                            className="icon-button"
+                            aria-label="Stop this run"
+                            title="Stop this run"
+                            disabled={!api}
+                            onClick={() => void stopRun(inFlight)}
+                          >
                             <Loader2
                               className="chat-spinner"
                               size={14}
                               aria-hidden="true"
                             />
-                          ) : (
-                            <Play size={14} aria-hidden="true" />
-                          )}
-                        </button>
+                          </button>
+                        ) : (
+                          <button
+                            type="button"
+                            className="icon-button"
+                            aria-label="Run now here"
+                            title="Run now here"
+                            disabled={busy || starting || !api}
+                            onClick={() => void startRun(binding)}
+                          >
+                            {starting ? (
+                              <Loader2
+                                className="chat-spinner"
+                                size={14}
+                                aria-hidden="true"
+                              />
+                            ) : (
+                              <Play size={14} aria-hidden="true" />
+                            )}
+                          </button>
+                        )}
                         <button
                           type="button"
                           className="icon-button"
@@ -332,7 +404,10 @@ export function ConversationCoaches({
           sessionId={sessionId}
           attached={bindings}
           onClose={() => setAttachOpen(false)}
-          onAttached={refresh}
+          onAttached={async () => {
+            await refresh();
+            onChanged?.();
+          }}
         />
       ) : null}
     </div>

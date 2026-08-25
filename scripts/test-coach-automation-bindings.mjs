@@ -24,7 +24,11 @@ const {
   setCoachAutomationBindingEnabled,
   setCoachAutomationBindingSchedule,
   setCoachAutomationBindingSession,
-  setCoachAutomationEnabled
+  listCoachAutomationSessionAttention,
+  markCoachAutomationSessionSeen,
+  recordCoachAutomationRun,
+  setCoachAutomationEnabled,
+  updateCoachAutomation
 } = await import(`${distUrl("coachAutomationStore.js")}?cacheBust=${Date.now()}`);
 
 // better-sqlite3 is built for the Electron ABI and will not dlopen under plain
@@ -36,6 +40,9 @@ function createMemoryDatabase() {
   const automations = new Map();
   /** @type {Map<string, Record<string, any>>} */
   const bindings = new Map();
+
+  /** @type {Array<Record<string, any>>} */
+  const runs = [];
 
   const byOrder = (left, right) =>
     left.sort_order - right.sort_order ||
@@ -111,6 +118,26 @@ function createMemoryDatabase() {
     },
     deleteBinding(id) {
       bindings.delete(id);
+    },
+    // Runs, for the conversation-list attention projection (9.3). The filters
+    // mirror the WHERE clauses in listCoachAutomationRunRows.
+    listRuns(filter = {}) {
+      return runs
+        .filter((run) => !filter.sessionId || run.session_id === filter.sessionId)
+        .filter((run) => !filter.statuses || filter.statuses.includes(run.status))
+        .filter((run) => !filter.unseenOnly || run.seen_at === null)
+        .map((row) => ({ ...row }));
+    },
+    getRun(id) {
+      const row = runs.find((run) => run.id === id);
+      return row ? { ...row } : undefined;
+    },
+    insertRun(row) {
+      runs.push({ ...row });
+    },
+    updateRun(row) {
+      const index = runs.findIndex((run) => run.id === row.id);
+      if (index >= 0) runs[index] = { ...row };
     }
   };
 }
@@ -325,6 +352,58 @@ assert.equal(
 );
 assert.equal(setCoachAutomationBindingSchedule("missing", {}, db), null);
 
+// A changed trigger invalidates the slots the scheduler already booked (3.1).
+// Moving a briefing from 07:00 to 21:00 must not deliver one more 07:00 first.
+{
+  const rebooked = makeAutomation("Rebooked");
+  const first = attachCoachAutomation(
+    { automationId: rebooked.id, mode: "dedicated", sessionId: "s-reboot-a" },
+    db
+  );
+  const second = attachCoachAutomation(
+    { automationId: rebooked.id, mode: "dedicated", sessionId: "s-reboot-b" },
+    db
+  );
+  const book = (binding) =>
+    setCoachAutomationBindingSchedule(
+      binding.id,
+      { nextRunAt: "2026-08-22T07:00:00.000Z" },
+      db
+    );
+  book(first);
+  book(second);
+
+  updateCoachAutomation(
+    rebooked.id,
+    { trigger: { kind: "schedule", cadence: "daily", timeOfDay: "07:00" } },
+    db
+  );
+  assert.equal(
+    getCoachAutomationBinding(first.id, db).nextRunAt,
+    undefined,
+    "every binding of the edited automation loses its booked slot"
+  );
+  assert.equal(getCoachAutomationBinding(second.id, db).nextRunAt, undefined);
+
+  book(first);
+  updateCoachAutomation(rebooked.id, { name: "Renamed" }, db);
+  assert.equal(
+    getCoachAutomationBinding(first.id, db).nextRunAt,
+    "2026-08-22T07:00:00.000Z",
+    "an edit that leaves the trigger alone leaves the slot alone"
+  );
+  updateCoachAutomation(
+    rebooked.id,
+    { trigger: { kind: "schedule", cadence: "daily", timeOfDay: "07:00" } },
+    db
+  );
+  assert.equal(
+    getCoachAutomationBinding(first.id, db).nextRunAt,
+    "2026-08-22T07:00:00.000Z",
+    "and re-sending the same trigger is not an edit"
+  );
+}
+
 // The activity watermark lives on the same row: a binding attached last month
 // and one attached today owe answers on different activities, so it cannot be
 // tracked per automation.
@@ -499,5 +578,354 @@ assert.match(
   /export function deleteChatSessionById\([\s\S]*?applyCoachAutomationSessionDeleted\(id\)/,
   "deleting a conversation no longer notifies the bindings pointing at it"
 );
+
+// --- conversation-list attention (9.3) -------------------------------------
+// An auto run changes the transcript, so it bumps the conversation to the top
+// of the list. The chip says a coach speaks here; the dot says it has said
+// something new. Without the dot the row reorders for no visible reason.
+{
+  const attentionDb = createMemoryDatabase();
+  const coach = createCoachAutomation(
+    { name: "Debrief", playbook: "Debrief.", trigger: { kind: "manual" } },
+    attentionDb
+  );
+  const attach = (sessionId, patch = {}) =>
+    attachCoachAutomation(
+      { automationId: coach.id, mode: "existing", sessionId, ...patch },
+      attentionDb
+    );
+  const run = (sessionId, patch = {}) =>
+    recordCoachAutomationRun(
+      {
+        automationId: coach.id,
+        bindingId: "any",
+        status: "success",
+        triggerKind: "manual",
+        sessionId,
+        finishedAt: "2026-08-25T07:00:00.000Z",
+        ...patch
+      },
+      attentionDb
+    );
+  const byId = () =>
+    new Map(
+      listCoachAutomationSessionAttention(attentionDb).map((row) => [
+        row.sessionId,
+        row
+      ])
+    );
+
+  const live = attach("s-live");
+  const off = attach("s-off");
+  setCoachAutomationBindingEnabled(off.id, false, attentionDb);
+  // A "per-run" binding has no conversation of its own to mark.
+  attachCoachAutomation(
+    { automationId: coach.id, mode: "per-run" },
+    attentionDb
+  );
+
+  // Only conversations with something to say are listed at all: a row the
+  // sidebar hears nothing about is a row with no marks on it.
+  let marks = byId();
+  assert.equal(marks.get("s-live").attached, true);
+  assert.equal(marks.get("s-live").unread, 0, "attached is not the same as unread");
+  assert.equal(
+    marks.has("s-off"),
+    false,
+    "a binding switched off is not going to speak"
+  );
+  assert.equal(marks.size, 1, "and a per-run binding has no conversation of its own");
+
+  // Only the two statuses that write to the transcript make a conversation
+  // unread — those are the two that bumped it up the list.
+  run("s-live");
+  run("s-live", { status: "silent" });
+  run("s-live", { status: "skipped", skipReason: "cooldown" });
+  run("s-live", { status: "failed", error: "boom" });
+  run("s-live", { status: "running", finishedAt: undefined });
+  marks = byId();
+  assert.equal(
+    marks.get("s-live").unread,
+    2,
+    "a skip, a failure and a run still going wrote nothing to read"
+  );
+
+  // A run into a conversation nothing is attached to any more is still unread:
+  // the answer is sitting in it either way.
+  run("s-history");
+  marks = byId();
+  assert.equal(marks.get("s-history").attached, false);
+  assert.equal(marks.get("s-history").unread, 1);
+
+  // A run whose conversation was deleted has nowhere to be unread.
+  run(undefined);
+  assert.equal(byId().size, 2, "a run with no conversation marks nothing");
+
+  // Opening a conversation is what reading it means, and it is scoped.
+  assert.equal(markCoachAutomationSessionSeen("s-live", attentionDb), 2);
+  marks = byId();
+  assert.equal(marks.get("s-live").unread, 0);
+  assert.equal(
+    marks.get("s-history").unread,
+    1,
+    "reading one conversation does not clear another"
+  );
+  assert.equal(
+    markCoachAutomationSessionSeen("s-live", attentionDb),
+    0,
+    "reading it twice is a no-op"
+  );
+  assert.equal(
+    marks.get("s-live").attached,
+    true,
+    "and the chip stays: the coach still writes here"
+  );
+  assert.equal(
+    byId().has("s-history"),
+    true,
+    "an unread conversation stays listed even with nothing attached"
+  );
+
+  // The skip is still unstamped, so it never silently became "read".
+  const skipped = attentionDb
+    .listRuns({ sessionId: "s-live", statuses: ["skipped"] })
+    .at(0);
+  assert.equal(skipped.seen_at, null, "a skip the athlete never saw stays unseen");
+
+  // Switching the definition off silences every conversation it wrote into.
+  setCoachAutomationEnabled(coach.id, false, attentionDb);
+  assert.equal(
+    byId().has("s-live"),
+    false,
+    "a disabled automation speaks nowhere, and its read conversation drops out"
+  );
+}
+
+// --- the marks reach the conversation list ---------------------------------
+// The projection above is only worth having if the sidebar asks for it, clears
+// it, and keeps asking. All of this lives in JSX and effects, so it is asserted
+// at the source level — the same trick test-ipc-surface.mjs uses for invariants
+// TypeScript cannot see. A dropped argument is still a valid call.
+{
+  const read = (...parts) => readFileSync(path.join(repoRoot, ...parts), "utf8");
+
+  const row = read("src", "chat", "ChatSessionRow.tsx");
+  assert.match(
+    row,
+    /className="chat-session-row-automation-mark"/,
+    "the row must carry the automation chip"
+  );
+  assert.match(
+    row,
+    /className="chat-session-row-unread"/,
+    "the row must carry the unread dot"
+  );
+
+  const view = read("src", "chat", "ChatView.tsx");
+  assert.match(
+    view,
+    /void markSessionRead\(sessionId\);/,
+    "opening a conversation must clear its unread mark"
+  );
+  assert.match(
+    view,
+    /attention: sessionAttention/,
+    "the marks must reach the sidebar"
+  );
+  // Three run-update listeners, each doing what the other two deliberately do
+  // not. The live-view subscription returns early for conversations that are
+  // not open, which is exactly the case the dot exists for, so a second one
+  // watches all of them; and neither touches the conversation list, which a
+  // `per-run` binding adds to on every run. Three is the point, not an accident.
+  assert.equal(
+    (view.match(/api\.onCoachAutomationRunUpdate\(/g) ?? []).length,
+    3,
+    "a run into a conversation that is not open must still update the marks"
+  );
+  // 2.2: a `per-run` binding creates a conversation this window has never heard
+  // of, and every run bumps the one it wrote into to the top (9.3). The sidebar
+  // renders from a list read on mount, so without this neither showed up until
+  // the app was restarted.
+  assert.match(
+    view,
+    /if \(!run\.sessionId\) return;\n\s*void refreshSessions\(provider\)/,
+    "a run that reaches into the conversation list must make the sidebar re-read it"
+  );
+
+  // The ⚡ mark is derived from the bindings, so attaching or detaching moves
+  // it. The header popover is the entry point most athletes use and the only
+  // one with no way to report a change, so the mark stayed put until restart.
+  assert.match(
+    view,
+    /onChanged=\{\(\) => setAutomationsVersion\(\(value\) => value \+ 1\)\}\n\s*onManageAutomations=/,
+    "the header popover must be able to say it changed which coaches are attached"
+  );
+  const popover = read("src", "chat", "automations", "ConversationCoaches.tsx");
+  // Both of its ways of changing a binding: the shared mutation wrapper — the
+  // switch, the reorder, the detach — and the attach dialog it opens.
+  assert.match(
+    popover,
+    /await work\(\);\n\s*await refresh\(\);\n\s*onChanged\?\.\(\);/,
+    "switching, reordering or detaching a coach must say so"
+  );
+  assert.match(
+    popover,
+    /onAttached=\{async \(\) => \{\n\s*await refresh\(\);\n\s*onChanged\?\.\(\);/,
+    "and so must attaching one"
+  );
+
+  // --- 3.4: which places a manual run reaches ------------------------------
+  // From a conversation it is always that one place, whichever surface asked.
+  assert.match(
+    popover,
+    /runCoachAutomationNow\(binding\.automationId, \[binding\.id\]\)/,
+    "running from a conversation must run only in that conversation"
+  );
+  assert.match(
+    read("src", "chat", "automations", "CoachAutomationDetail.tsx"),
+    /runCoachAutomationNow\(automationId, \[bindingId\]\)/,
+    "and so must running from one row of the coach's own list"
+  );
+
+  // From the automation screen the coach may run in several places at once, so
+  // it asks first — but only where there is something to ask about.
+  const runPanel = read("src", "chat", "automations", "CoachAutomationsPanel.tsx");
+  assert.match(
+    runPanel,
+    /if \(summary\.bindingCount > 1\) \{\n\s*setPickingId\(automation\.id\);\n\s*return;\n\s*\}\n\s*void startRun\(automation\.id\);/,
+    "one place runs straight away; several ask which"
+  );
+  assert.match(
+    runPanel,
+    /api\.runCoachAutomationNow\(automationId, bindingIds\)/,
+    "and the answer has to reach the runner"
+  );
+  const runDialog = read("src", "chat", "automations", "RunNowDialog.tsx");
+  assert.match(
+    runDialog,
+    /detail\.bindings\n\s*\.filter\(\(binding\) => binding\.enabled\)/,
+    "the default is every live place, not every place"
+  );
+
+  // --- the run log is a way back into the conversation ----------------------
+  const detailScreen = read("src", "chat", "automations", "CoachAutomationDetail.tsx");
+  assert.match(
+    detailScreen,
+    /onClick=\{\(\) => onOpenConversation\?\.\(opensInto\)\}/,
+    "a run log row must open the conversation the run wrote into"
+  );
+  // A `per-run` conversation can be newer than anything this window has heard
+  // of, and one from an old run may have been deleted since. Selecting a
+  // session id no row exists for leaves the sidebar with nothing selected and
+  // the composer writing into a conversation that is not there.
+  assert.match(
+    view,
+    /const listed = await refreshSessions\(chatSettings\.provider\);\n\s*if \(!listed\.some\(\(session\) => session\.id === sessionId\)\)/,
+    "and the conversation has to still exist before it is opened"
+  );
+
+  // --- what "a run is in flight here" is read from -------------------------
+  // Derived, not accumulated. A `per-run` binding attached to this conversation
+  // runs into one of its own, so a subscription filtered on this session's id
+  // threw away every update about the rows on screen — and switching away and
+  // back left the map holding runs that had finished meanwhile.
+  assert.match(
+    popover,
+    /listCoachAutomationRuns\(\{ statuses: \["running"\] \}\)[\s\S]{0,300}?setInFlightRuns\(\s*Object\.fromEntries\(running\.map/,
+    "the popover must re-read which runs are in flight, and use the answer"
+  );
+  assert.doesNotMatch(
+    popover,
+    /run\.sessionId !== sessionId/,
+    "and must not throw away the updates that tell it to"
+  );
+  // A trigger fans out to one run per place and they are serialised, so between
+  // two of them no run is `running`. The card's optimistic flag has to outlast
+  // that gap or it offers "Run now" in the middle of its own fan-out — which is
+  // why it is set once and cleared once, when the whole fan-out has answered.
+  assert.equal(
+    (runPanel.match(/setStartingId\(/g) ?? []).length,
+    2,
+    "the card's run flag is set on the click and cleared on the outcome, nowhere else"
+  );
+
+  // 5.6: a run streams into the conversation as it happens, but the
+  // subscription that shows it only ever hears about a run whose conversation
+  // is *already* open. Opening one mid-run — which a `per-run` binding invites,
+  // its conversation appearing in the sidebar the moment the run starts — left
+  // an empty transcript with nothing to say why.
+  assert.match(
+    view,
+    /statuses: \["running"\][\s\S]{0,200}?showLiveAutomation\(runs\[0\]\)/,
+    "opening a conversation must pick up a run already streaming into it"
+  );
+
+  assert.match(
+    read("electron", "preload.ts"),
+    /invoke\("coachAutomation:markSessionSeen", sessionId\)/,
+    "preload must forward the session id across the bridge"
+  );
+  assert.match(
+    read("electron", "main.ts"),
+    /markCoachAutomationSessionSeen\(sessionId\)/,
+    "the ipcMain handler must forward the session id"
+  );
+
+  // 2.1: the store refuses a `dedicated` binding with no conversation, and it
+  // is right to — it has no business creating chat sessions. Somebody still has
+  // to, and that is the attach screen. Until the presets started recommending
+  // this mode the button had never worked: it attached with no session id and
+  // failed with BINDING_SESSION_REQUIRED every time.
+  const attachScreen = read("src", "chat", "automations", "AttachAutomationScreen.tsx");
+  assert.match(
+    attachScreen,
+    /api\.createChatSession\(provider\)/,
+    "attaching a dedicated binding must create its conversation"
+  );
+  assert.match(
+    attachScreen,
+    /api\.renameChatSession\(created\.id, automationName\)/,
+    "and name it, or its first run titles it after its own playbook (2.5)"
+  );
+  assert.match(
+    attachScreen,
+    /mode: "dedicated",\s*sessionId: created\.id/,
+    "and hand that conversation to the store"
+  );
+  assert.doesNotMatch(
+    attachScreen,
+    /attachMode\("dedicated"\)/,
+    "the session-less dedicated attach is the bug, not a fallback"
+  );
+
+  // A preset was written around one binding mode, and the attach screen says
+  // which — advisory only, since all three modes stay on offer.
+  const detail = read("src", "chat", "automations", "CoachAutomationDetail.tsx");
+  assert.match(
+    detail,
+    /suggestedMode=\{suggestedBinding\?\.mode\}/,
+    "the preset's recommended binding mode must reach the attach screen"
+  );
+  assert.match(
+    attachScreen,
+    /data-suggested=\{suggestedMode === "dedicated" \? "true" : undefined\}/,
+    "and be marked on the mode it recommends"
+  );
+
+  // Section 10: an expired provider sign-in shows up as a no-auth skip and
+  // nothing else. For the providers guard rail 3 cannot pre-flight, this banner
+  // is the athlete's only indication.
+  const panel = read("src", "chat", "automations", "CoachAutomationsPanel.tsx");
+  assert.match(
+    panel,
+    /skipReason === "no-auth"/,
+    "the panel must recognise a signed-out provider"
+  );
+  assert.match(
+    panel,
+    /className="coach-automation-banner"/,
+    "and say so in a banner"
+  );
+}
 
 console.log("coach automation binding tests passed");

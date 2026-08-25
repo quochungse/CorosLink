@@ -1,6 +1,9 @@
 import { useMemo, useState } from "react";
 import { Loader2, PanelLeftClose, Pin, Plus, Search } from "lucide-react";
-import type { ChatSessionSummary } from "../../electron/types";
+import type {
+  ChatSessionSummary,
+  CoachAutomationSessionAttention
+} from "../../electron/types";
 import { ChatSessionRow } from "./ChatSessionRow";
 import { groupChatSessions } from "./chatSessionGroups";
 
@@ -8,6 +11,7 @@ export function ChatHistoryPanel({
   sessions,
   activeSessionId,
   busy,
+  attention,
   onCollapse,
   onNewChat,
   onSelectSession,
@@ -17,6 +21,8 @@ export function ChatHistoryPanel({
   sessions: ChatSessionSummary[];
   activeSessionId: string | null;
   busy?: boolean;
+  /** Coach attention per conversation, keyed by session id (9.3). */
+  attention?: Map<string, CoachAutomationSessionAttention>;
   onCollapse: () => void;
   onNewChat: () => void;
   onSelectSession: (sessionId: string) => void;
@@ -109,6 +115,7 @@ export function ChatHistoryPanel({
                     session={session}
                     active={session.id === activeSessionId}
                     disabled={busy}
+                    attention={attention?.get(session.id)}
                     onSelect={() => onSelectSession(session.id)}
                     onTogglePin={() =>
                       onTogglePinSession(session.id, !session.pinnedAt)

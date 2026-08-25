@@ -1252,6 +1252,9 @@ export function listCoachAutomationRunRows(
     clauses.push(`status IN (${filter.statuses.map(() => "?").join(", ")})`);
     params.push(...filter.statuses);
   }
+  if (filter.unseenOnly) {
+    clauses.push("seen_at IS NULL");
+  }
   const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
   const limit = filter.limit ? "LIMIT ?" : "";
   if (filter.limit) {

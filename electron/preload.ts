@@ -3,6 +3,7 @@ import type {
   ActivityBackupProgress,
   BinaryStatus,
   CachedCorosMapPackage,
+  CoachAutomationSessionAttention,
   CombinedDownloadProgressEvent,
   CombinedDownloadResult,
   CorosMapDownloadJob,
@@ -26,6 +27,7 @@ import type {
   RouteWaypointRequest,
   ActivityPaceBaselines,
   RouteShareSession,
+  SaveChatSessionOptions,
   SpotifyConfig,
   SpotifyPlaylist,
   SpotifyPlaylistTrack,
@@ -977,9 +979,10 @@ const api = {
     ipcRenderer.invoke("chat:createSession", provider),
   saveChatSession: (
     sessionId: string,
-    entries: PersistedChatEntry[]
+    entries: PersistedChatEntry[],
+    options?: SaveChatSessionOptions
   ): Promise<ChatSessionSummary | null> =>
-    ipcRenderer.invoke("chat:saveSession", sessionId, entries),
+    ipcRenderer.invoke("chat:saveSession", sessionId, entries, options),
   setChatSessionPinned: (
     sessionId: string,
     pinned: boolean
@@ -1045,6 +1048,11 @@ const api = {
     ipcRenderer.invoke("coachAutomation:cancelRun", runId),
   markCoachAutomationRunsSeen: (runIds: string[]): Promise<number> =>
     ipcRenderer.invoke("coachAutomation:markSeen", runIds),
+  listCoachAutomationSessionAttention: (): Promise<
+    CoachAutomationSessionAttention[]
+  > => ipcRenderer.invoke("coachAutomation:sessionAttention"),
+  markCoachAutomationSessionSeen: (sessionId: string): Promise<number> =>
+    ipcRenderer.invoke("coachAutomation:markSessionSeen", sessionId),
   onCoachAutomationRunUpdate: (
     callback: (run: CoachAutomationRun) => void
   ): (() => void) => {

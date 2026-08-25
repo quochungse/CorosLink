@@ -2360,6 +2360,38 @@ export interface PersistedChatMessageEntry {
   automation?: ChatEntryAutomationMarker;
 }
 
+/**
+ * An automation looked and had nothing to say (5.5). A silent run writes no
+ * answer, so without this entry the athlete watching sees the live bubble
+ * vanish mid-sentence and the conversation keeps no record that the coach ever
+ * ran — which reads as a bug rather than as a verdict.
+ */
+export interface PersistedChatAutomationSilentEntry {
+  kind: "automationSilent";
+  automation: ChatEntryAutomationMarker;
+  /** Epoch milliseconds. The chip shows when the coach looked. */
+  at: number;
+}
+
+/**
+ * How a `chat:saveSession` call describes what it is based on (5.6b). Lives
+ * here rather than beside the store because the renderer declares the same
+ * call and must not import a main-process module to do it.
+ */
+export interface SaveChatSessionOptions {
+  /**
+   * How many of the stored entries the caller's array accounts for. Anything
+   * the row holds beyond that arrived from somewhere else — in practice a coach
+   * automation writing from the main process while the window held a copy from
+   * before the run — and is kept instead of being overwritten.
+   *
+   * Omitting it replaces the row outright, which is what the runner wants: it
+   * re-read the transcript itself a moment earlier, with nothing awaited in
+   * between.
+   */
+  knownEntryCount?: number;
+}
+
 export interface CoachInputChoice {
   id: string;
   label: string;
@@ -2626,6 +2658,35 @@ export interface AutomationConditions {
   quietHours?: { start: string; end: string };
 }
 
+/**
+ * Section 7, decided. An automation with no effort of its own runs at `low`,
+ * whatever its trigger and whatever the interactive chat is set to.
+ *
+ * Three reasons this is a flat default rather than the trigger-kind carve-out
+ * the first draft proposed (`activity` and daily `schedule` only):
+ *
+ * 1. **The editor already promises it.** `EffortSwitch` renders
+ *    `runtime.effort ?? "low"`, so a definition saved without touching that
+ *    control showed `low` and then ran at the chat's effort. The divergence was
+ *    the real problem behind the deferred paragraph.
+ * 2. **A default keyed on the trigger is invisible.** The same automation moved
+ *    from daily to weekly would silently get more expensive, with nothing on
+ *    screen to explain it. One rule the athlete can hold in their head beats a
+ *    table they cannot see.
+ * 3. **Effort is cost, not capability.** Provider and model still inherit from
+ *    chat settings — those are the coach the athlete chose. How hard it thinks
+ *    on a run nobody is watching is a different question, and a preset that
+ *    wants more says so out loud.
+ *
+ * The cost: "inherit the chat's effort" is no longer expressible. It never was
+ * visible anywhere, so nothing that was legible is lost.
+ *
+ * Lives here rather than beside the runner because the Automations panel shows
+ * the resolved value on every card, and the renderer must not import a
+ * main-process module to learn it.
+ */
+export const AUTOMATION_DEFAULT_EFFORT: AnthropicEffort = "low";
+
 export interface AutomationRuntime {
   /** Defaults to the interactive chat provider when unset. */
   provider?: ChatProvider;
@@ -2657,8 +2718,14 @@ export interface CoachAutomationInput {
   enabled?: boolean;
   presetId?: string;
   trigger: AutomationTrigger;
-  /** Merged over the defaults; omitted keys keep their default. */
-  conditions?: Partial<AutomationConditions>;
+  /**
+   * Merged over the defaults; omitted keys keep their default. An explicit
+   * `quietHours: null` is the one way to clear a stored window — leaving the
+   * key out means "unchanged", so it could not also mean "remove".
+   */
+  conditions?: Partial<Omit<AutomationConditions, "quietHours">> & {
+    quietHours?: AutomationConditions["quietHours"] | null;
+  };
   runtime?: AutomationRuntime;
 }
 
@@ -2755,7 +2822,22 @@ export interface CoachAutomationRunQuery {
   /** Inclusive lower bound on `startedAt`, ISO. */
   since?: string;
   statuses?: CoachAutomationRunStatus[];
+  /** Only runs the athlete has not looked at yet (`seen_at IS NULL`). */
+  unseenOnly?: boolean;
   limit?: number;
+}
+
+/**
+ * What the conversation list has to say about one conversation (9.3). An auto
+ * run changes the transcript and so bumps the row to the top; without this the
+ * row reorders for no visible reason.
+ */
+export interface CoachAutomationSessionAttention {
+  sessionId: string;
+  /** A live binding writes here, whether or not it ever has. */
+  attached: boolean;
+  /** Runs that landed in it and have not been looked at yet. */
+  unread: number;
 }
 
 /** One binding plus the conversation it points at, for the "where it runs" UI. */
@@ -3876,6 +3958,7 @@ export interface WorkoutDeletePreview {
 /** Persisted coach timeline entry (messages plus inline action cards). */
 export type PersistedChatEntry =
   | PersistedChatMessageEntry
+  | PersistedChatAutomationSilentEntry
   | { kind: "coachPrompt"; prompt: CoachInputPrompt }
   | { kind: "planDraft"; draft: PlanDraftPreview }
   | { kind: "workoutDelete"; preview: WorkoutDeletePreview }

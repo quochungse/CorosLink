@@ -122,6 +122,7 @@ import type {
   ChatMessage,
   PersistedChatEntry,
   PersistedChatSource,
+  SaveChatSessionOptions,
   StoredChatToken,
   TrainingHubActivity,
   TrainingHubDashboard,
@@ -447,9 +448,10 @@ export function createChatSessionForProvider(provider: ChatProvider) {
 
 export function saveChatSessionEntries(
   id: string,
-  entries: PersistedChatEntry[]
+  entries: PersistedChatEntry[],
+  options?: SaveChatSessionOptions
 ) {
-  return saveChatSession(id, entries);
+  return saveChatSession(id, entries, undefined, options);
 }
 
 export function setChatSessionPinnedById(id: string, pinned: boolean) {

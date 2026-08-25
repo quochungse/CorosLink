@@ -2,6 +2,7 @@ import type {
   ActivityBackupProgress,
   BinaryStatus,
   CachedCorosMapPackage,
+  CoachAutomationSessionAttention,
   CombinedDownloadProgressEvent,
   CombinedDownloadResult,
   CorosMapDownloadJob,
@@ -25,6 +26,7 @@ import type {
   RouteWaypointRequest,
   ActivityPaceBaselines,
   RouteShareSession,
+  SaveChatSessionOptions,
   SpotifyConfig,
   SpotifyPlaylist,
   SpotifyPlaylistTrack,
@@ -629,7 +631,8 @@ export interface CorosLinkApi {
   createChatSession: (provider: ChatProvider) => Promise<ChatSessionSummary>;
   saveChatSession: (
     sessionId: string,
-    entries: PersistedChatEntry[]
+    entries: PersistedChatEntry[],
+    options?: SaveChatSessionOptions
   ) => Promise<ChatSessionSummary | null>;
   setChatSessionPinned: (
     sessionId: string,
@@ -680,6 +683,10 @@ export interface CorosLinkApi {
   ) => Promise<CoachAutomationRun[]>;
   cancelCoachAutomationRun: (runId: string) => Promise<void>;
   markCoachAutomationRunsSeen: (runIds: string[]) => Promise<number>;
+  listCoachAutomationSessionAttention: () => Promise<
+    CoachAutomationSessionAttention[]
+  >;
+  markCoachAutomationSessionSeen: (sessionId: string) => Promise<number>;
   onCoachAutomationRunUpdate: (
     callback: (run: CoachAutomationRun) => void
   ) => () => void;

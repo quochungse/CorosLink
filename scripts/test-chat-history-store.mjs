@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -513,5 +514,270 @@ const extraFields = parseChatTranscriptJson(
   ])
 );
 assert.deepEqual(extraFields[0].automation, marker);
+
+// --- the silent-run trace survives a round-trip (section 5.5) --------------
+// A run that found nothing writes no answer, so this one-line entry is the
+// only record the conversation keeps of it. Same hazard as the marker above:
+// parseEntry rebuilds field by field.
+const lookedAt = Date.parse("2026-08-24T06:12:00.000Z");
+const traced = createChatSession("local", db);
+saveChatSession(
+  traced.id,
+  [
+    { kind: "message", role: "user", content: "Morning." },
+    { kind: "automationSilent", automation: marker, at: lookedAt }
+  ],
+  db
+);
+
+const withTrace = getChatSession(traced.id, db);
+assert.equal(withTrace.length, 2);
+assert.deepEqual(
+  withTrace[1],
+  { kind: "automationSilent", automation: marker, at: lookedAt },
+  "the trace comes back whole"
+);
+assert.deepEqual(
+  parseChatTranscriptJson(db.getSession(traced.id).messages_json)[1],
+  { kind: "automationSilent", automation: marker, at: lookedAt },
+  "and it survives the JSON the row actually stores"
+);
+deleteChatSession(traced.id, db);
+
+// Both halves are required: the marker says who looked, `at` says when, and a
+// chip that can answer neither is not worth restoring. The entry is dropped
+// rather than half-rendered, and the turns around it are untouched.
+const brokenTraces = [
+  { kind: "automationSilent", at: lookedAt },
+  { kind: "automationSilent", automation: { ...marker, name: "" }, at: lookedAt },
+  { kind: "automationSilent", automation: marker },
+  { kind: "automationSilent", automation: marker, at: "06:12" },
+  { kind: "automationSilent", automation: marker, at: Number.NaN }
+];
+for (const broken of brokenTraces) {
+  const parsed = parseChatTranscriptJson(
+    JSON.stringify([{ kind: "message", role: "user", content: "hi" }, broken])
+  );
+  assert.equal(parsed.length, 1, `half-formed trace kept: ${JSON.stringify(broken)}`);
+  assert.equal(parsed[0].kind, "message", "the surrounding turn survives it");
+}
+
+// An extra field on the trace is not carried through either.
+assert.deepEqual(
+  parseChatTranscriptJson(
+    JSON.stringify([
+      { kind: "automationSilent", automation: marker, at: lookedAt, note: "leaked" }
+    ])
+  ),
+  [{ kind: "automationSilent", automation: marker, at: lookedAt }]
+);
+
+// --- append-on-save: the renderer and the runner racing (section 5.6b) -----
+// The window holds its own copy of the transcript and saves the whole array.
+// A run writes from the main process behind its back, so between the run
+// landing and the window's reload arriving there is a window in which the
+// window's next save would delete the coach's answer.
+{
+  const marker = {
+    runId: "run-race",
+    automationId: "auto-race",
+    bindingId: "bind-race",
+    name: "Post-run debrief",
+    triggerLabel: "Manual"
+  };
+  const athleteOpening = { kind: "message", role: "user", content: "Morning." };
+  const runEntries = [
+    { kind: "message", role: "user", content: "Debrief the session.", automation: marker },
+    { kind: "message", role: "assistant", content: "Easy week, hold it there.", automation: marker }
+  ];
+  const athleteReply = { kind: "message", role: "user", content: "Thanks." };
+
+  const race = () => {
+    const session = createChatSession("local", db);
+    // What the window read when it opened the conversation.
+    saveChatSession(session.id, [athleteOpening], db);
+    return session;
+  };
+
+  // 1. Interleaved: the run lands, then the window saves its pre-run copy.
+  {
+    const session = race();
+    const windowBase = getChatSession(session.id, db).length;
+
+    // The runner re-read a moment ago and has nothing awaited since, so it
+    // replaces outright — no option.
+    saveChatSession(session.id, [athleteOpening, ...runEntries], db);
+
+    // The window never saw that. Its array is its own copy plus what the
+    // athlete just typed.
+    saveChatSession(session.id, [athleteOpening, athleteReply], db, {
+      knownEntryCount: windowBase
+    });
+
+    assert.deepEqual(
+      getChatSession(session.id, db).map((entry) => entry.content),
+      ["Morning.", "Thanks.", "Debrief the session.", "Easy week, hold it there."],
+      "the run survives the window's save, and the athlete's turn survives the run"
+    );
+    deleteChatSession(session.id, db);
+  }
+
+  // 2. The same sequence without the option is exactly the bug this closes.
+  {
+    const session = race();
+    saveChatSession(session.id, [athleteOpening, ...runEntries], db);
+    saveChatSession(session.id, [athleteOpening, athleteReply], db);
+    assert.deepEqual(
+      getChatSession(session.id, db).map((entry) => entry.content),
+      ["Morning.", "Thanks."],
+      "without it the coach's answer is overwritten — which is why the option exists"
+    );
+    deleteChatSession(session.id, db);
+  }
+
+  // 3. Saving again before the reload arrives keeps the tail once, not twice.
+  // The base advances to what was sent, never to what the row ended up with,
+  // so the same foreign tail is re-preserved until the window catches up.
+  {
+    const session = race();
+    const windowBase = getChatSession(session.id, db).length;
+    saveChatSession(session.id, [athleteOpening, ...runEntries], db);
+
+    saveChatSession(session.id, [athleteOpening, athleteReply], db, {
+      knownEntryCount: windowBase
+    });
+    saveChatSession(
+      session.id,
+      [athleteOpening, athleteReply, { kind: "message", role: "assistant", content: "Noted." }],
+      db,
+      { knownEntryCount: 2 }
+    );
+
+    assert.deepEqual(
+      getChatSession(session.id, db).map((entry) => entry.content),
+      [
+        "Morning.",
+        "Thanks.",
+        "Noted.",
+        "Debrief the session.",
+        "Easy week, hold it there."
+      ],
+      "the tail is preserved once more, not duplicated"
+    );
+    deleteChatSession(session.id, db);
+  }
+
+  // 4. Nothing foreign to keep: a window that is up to date replaces its own
+  // entries freely, which is what editing a card in place needs.
+  {
+    const session = race();
+    saveChatSession(
+      session.id,
+      [{ kind: "message", role: "user", content: "Morning, rewritten." }],
+      db,
+      { knownEntryCount: 1 }
+    );
+    assert.deepEqual(
+      getChatSession(session.id, db).map((entry) => entry.content),
+      ["Morning, rewritten."],
+      "a caller that accounts for the whole row still owns the whole row"
+    );
+    deleteChatSession(session.id, db);
+  }
+
+  // 5. A caller that knows nothing keeps everything. This is the state a window
+  // is in before it has read the conversation, and the safe direction to fail.
+  {
+    const session = race();
+    saveChatSession(session.id, [athleteOpening, ...runEntries], db);
+    saveChatSession(session.id, [], db, { knownEntryCount: 0 });
+    assert.equal(
+      getChatSession(session.id, db).length,
+      3,
+      "an empty save from a window that has read nothing destroys nothing"
+    );
+    deleteChatSession(session.id, db);
+  }
+
+  // 6. Junk counts do not corrupt the row: a count past the end has no tail,
+  // and a nonsensical one is treated as no claim at all.
+  {
+    const session = race();
+    saveChatSession(session.id, [athleteOpening, ...runEntries], db);
+    saveChatSession(session.id, [athleteReply], db, { knownEntryCount: 99 });
+    assert.deepEqual(
+      getChatSession(session.id, db).map((entry) => entry.content),
+      ["Thanks."],
+      "a count past the end leaves no tail to keep"
+    );
+
+    // Four stored entries against a count of -3, so a count used unclamped
+    // would slice from the end and quietly drop the first one.
+    saveChatSession(
+      session.id,
+      [athleteOpening, ...runEntries, { kind: "message", role: "assistant", content: "And rest." }],
+      db
+    );
+    saveChatSession(session.id, [athleteReply], db, { knownEntryCount: -3 });
+    assert.deepEqual(
+      getChatSession(session.id, db).map((entry) => entry.content),
+      [
+        "Thanks.",
+        "Morning.",
+        "Debrief the session.",
+        "Easy week, hold it there.",
+        "And rest."
+      ],
+      "a negative count claims nothing, so the whole row is kept"
+    );
+    deleteChatSession(session.id, db);
+  }
+
+  // 7. The silent-run trace is preserved the same way — it is a tail like any
+  // other, and it is the only record that run left.
+  {
+    const session = race();
+    const windowBase = getChatSession(session.id, db).length;
+    saveChatSession(
+      session.id,
+      [athleteOpening, { kind: "automationSilent", automation: marker, at: 1787626149503 }],
+      db
+    );
+    saveChatSession(session.id, [athleteOpening, athleteReply], db, {
+      knownEntryCount: windowBase
+    });
+    assert.deepEqual(
+      getChatSession(session.id, db).map((entry) => entry.kind),
+      ["message", "message", "automationSilent"]
+    );
+    deleteChatSession(session.id, db);
+  }
+}
+
+// --- the option survives the whole IPC chain -------------------------------
+// A store that can merge but is never asked to is no better than one that
+// cannot. The renderer's end is asserted in test-coach-automation-runner.mjs;
+// these are the three links between it and this function, none of which
+// TypeScript would notice going missing — a dropped argument is still a valid
+// call to every signature involved.
+{
+  const read = (...parts) => fs.readFileSync(path.join(repoRoot, ...parts), "utf8");
+
+  assert.match(
+    read("electron", "preload.ts"),
+    /invoke\("chat:saveSession", sessionId, entries, options\)/,
+    "preload must forward the options across the bridge"
+  );
+  assert.match(
+    read("electron", "main.ts"),
+    /saveChatSessionEntries\(sessionId, entries, options\)/,
+    "the ipcMain handler must forward the options"
+  );
+  assert.match(
+    read("electron", "chatService.ts"),
+    /saveChatSession\(id, entries, undefined, options\)/,
+    "the chatService wrapper must forward the options to the store"
+  );
+}
 
 console.log("chat history store tests passed");

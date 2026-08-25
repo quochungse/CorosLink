@@ -45,6 +45,8 @@
     "test:coach-automation-guards": "npm run build:electron && node scripts/test-coach-automation-guards.mjs",
     "test:coach-automation-runner": "npm run build:electron && node scripts/test-coach-automation-runner.mjs",
     "test:coach-activity-watcher": "npm run build:electron && node scripts/test-coach-activity-watcher.mjs",
+    "test:coach-automation-schedule": "npm run build:electron && node scripts/test-coach-automation-schedule.mjs",
+    "test:coach-automation-sql": "npm run build:electron && cross-env ELECTRON_RUN_AS_NODE=1 electron scripts/test-coach-automation-sql.mjs",
     "test:coach-automation-plan-draft": "npm run build:electron && node scripts/test-coach-automation-plan-draft.mjs",
     "test:ipc-surface": "node scripts/test-ipc-surface.mjs",
     "test:chat-session-groups": "node --experimental-strip-types scripts/test-chat-session-groups.mjs",

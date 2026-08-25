@@ -25,6 +25,8 @@ export function AutomationDefinitionForm({
   onChange: (patch: Partial<CoachAutomationInput>) => void;
 }) {
   const activityTrigger = draft.trigger.kind === "activity" ? draft.trigger : null;
+  const scheduleTrigger = draft.trigger.kind === "schedule" ? draft.trigger : null;
+  const quietHours = draft.conditions?.quietHours ?? null;
   const runtimeProvider = draft.runtime?.provider ?? provider;
   // Mirrors what the two switches themselves decide to render.
   const showModel = runtimeProvider !== "local";
@@ -35,6 +37,19 @@ export function AutomationDefinitionForm({
   ) => {
     if (!activityTrigger) return;
     onChange({ trigger: { ...activityTrigger, ...patch } });
+  };
+
+  const patchSchedule = (
+    patch: Partial<Extract<AutomationTrigger, { kind: "schedule" }>>
+  ) => {
+    if (!scheduleTrigger) return;
+    onChange({ trigger: { ...scheduleTrigger, ...patch } });
+  };
+
+  const patchConditions = (
+    patch: NonNullable<CoachAutomationInput["conditions"]>
+  ) => {
+    onChange({ conditions: { ...draft.conditions, ...patch } });
   };
 
   return (
@@ -79,6 +94,96 @@ export function AutomationDefinitionForm({
         Variables: {"{{rule.name}}"}, {"{{date}}"}, {"{{activity.name}}"},{" "}
         {"{{activity.sport}}"}, {"{{week.range}}"}
       </p>
+
+      <label className="chat-local-field">
+        <span>Trigger</span>
+        <select
+          value={draft.trigger.kind}
+          disabled={disabled}
+          onChange={(event) =>
+            onChange({ trigger: blankTrigger(event.target.value) })
+          }
+        >
+          <option value="activity">After a new activity</option>
+          <option value="schedule">On a schedule</option>
+          <option value="manual">Manual only</option>
+          {/* Phase 3. Shown only when a definition already carries one, so the
+              select never renders with nothing selected. */}
+          {draft.trigger.kind === "threshold" ? (
+            <option value="threshold" disabled>
+              When a metric crosses a threshold
+            </option>
+          ) : null}
+        </select>
+      </label>
+
+      {scheduleTrigger ? (
+        <fieldset className="coach-automation-fieldset" disabled={disabled}>
+          <legend>Fires on a schedule</legend>
+          <div className="coach-automation-row">
+            <label className="chat-local-field">
+              <span>Repeats</span>
+              <select
+                value={scheduleTrigger.cadence}
+                onChange={(event) =>
+                  // Rebuilt rather than merged: a daily trigger carries no
+                  // `dayOfWeek`, and leaving a stale one behind would make the
+                  // form read as edited after a save that dropped it.
+                  onChange({
+                    trigger:
+                      event.target.value === "weekly"
+                        ? {
+                            kind: "schedule",
+                            cadence: "weekly",
+                            dayOfWeek: scheduleTrigger.dayOfWeek ?? 1,
+                            timeOfDay: scheduleTrigger.timeOfDay
+                          }
+                        : {
+                            kind: "schedule",
+                            cadence: "daily",
+                            timeOfDay: scheduleTrigger.timeOfDay
+                          }
+                  })
+                }
+              >
+                <option value="daily">Every day</option>
+                <option value="weekly">Every week</option>
+              </select>
+            </label>
+            {scheduleTrigger.cadence === "weekly" ? (
+              <label className="chat-local-field">
+                <span>Day</span>
+                <select
+                  value={scheduleTrigger.dayOfWeek ?? 1}
+                  onChange={(event) =>
+                    patchSchedule({ dayOfWeek: Number(event.target.value) })
+                  }
+                >
+                  {WEEKDAY_OPTIONS.map((day, index) => (
+                    <option key={day} value={index}>
+                      {day}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            ) : null}
+            <label className="chat-local-field">
+              <span>At</span>
+              <input
+                type="time"
+                value={scheduleTrigger.timeOfDay}
+                onChange={(event) =>
+                  patchSchedule({ timeOfDay: event.target.value || "07:00" })
+                }
+              />
+            </label>
+          </div>
+          <p className="coach-automation-hint">
+            Your local time, and only while CorosLink is running. A slot missed by
+            more than a day is written off rather than delivered late.
+          </p>
+        </fieldset>
+      ) : null}
 
       {activityTrigger ? (
         <fieldset className="coach-automation-fieldset" disabled={disabled}>
@@ -196,22 +301,22 @@ export function AutomationDefinitionForm({
       <fieldset className="coach-automation-fieldset" disabled={disabled}>
         <legend>Guard rails</legend>
         <div className="coach-automation-row">
-          <label className="chat-local-field">
-            <span>Batch window (min)</span>
-            <input
-              type="number"
-              min={0}
-              value={draft.conditions?.batchWindowMin ?? 20}
-              onChange={(event) =>
-                onChange({
-                  conditions: {
-                    ...draft.conditions,
-                    batchWindowMin: Number(event.target.value)
-                  }
-                })
-              }
-            />
-          </label>
+          {/* The batch window only means anything to the activity watcher —
+              it is how long several activities landing together are held so
+              they become one run. A schedule fires on its own clock. */}
+          {activityTrigger ? (
+            <label className="chat-local-field">
+              <span>Batch window (min)</span>
+              <input
+                type="number"
+                min={0}
+                value={draft.conditions?.batchWindowMin ?? 20}
+                onChange={(event) =>
+                  patchConditions({ batchWindowMin: Number(event.target.value) })
+                }
+              />
+            </label>
+          ) : null}
           <label className="chat-local-field">
             <span>Cooldown (min)</span>
             <input
@@ -219,12 +324,7 @@ export function AutomationDefinitionForm({
               min={0}
               value={draft.conditions?.cooldownMin ?? 120}
               onChange={(event) =>
-                onChange({
-                  conditions: {
-                    ...draft.conditions,
-                    cooldownMin: Number(event.target.value)
-                  }
-                })
+                patchConditions({ cooldownMin: Number(event.target.value) })
               }
             />
           </label>
@@ -236,17 +336,87 @@ export function AutomationDefinitionForm({
               max={24}
               value={draft.conditions?.maxRunsPerDay ?? 3}
               onChange={(event) =>
-                onChange({
-                  conditions: {
-                    ...draft.conditions,
-                    maxRunsPerDay: Number(event.target.value)
-                  }
-                })
+                patchConditions({ maxRunsPerDay: Number(event.target.value) })
               }
             />
           </label>
         </div>
+        <label className="coach-automation-switch">
+          <input
+            type="checkbox"
+            checked={quietHours !== null}
+            onChange={(event) =>
+              patchConditions({
+                quietHours: event.target.checked
+                  ? { start: "22:00", end: "06:00" }
+                  : null
+              })
+            }
+          />
+          <span>Quiet hours</span>
+        </label>
+        {quietHours ? (
+          <div className="coach-automation-row">
+            <label className="chat-local-field">
+              <span>From</span>
+              <input
+                type="time"
+                value={quietHours.start}
+                onChange={(event) =>
+                  patchConditions({
+                    quietHours: {
+                      ...quietHours,
+                      start: event.target.value || "22:00"
+                    }
+                  })
+                }
+              />
+            </label>
+            <label className="chat-local-field">
+              <span>Until</span>
+              <input
+                type="time"
+                value={quietHours.end}
+                onChange={(event) =>
+                  patchConditions({
+                    quietHours: { ...quietHours, end: event.target.value || "06:00" }
+                  })
+                }
+              />
+            </label>
+          </div>
+        ) : null}
+        <p className="coach-automation-hint">
+          {quietHours
+            ? "A scheduled run inside this window waits until it closes. An activity run is skipped instead — the activity is not going anywhere, and the next poll picks it up."
+            : "Runs are allowed at any hour."}
+        </p>
       </fieldset>
     </>
   );
+}
+
+const WEEKDAY_OPTIONS = [
+  "Sunday",
+  "Monday",
+  "Tuesday",
+  "Wednesday",
+  "Thursday",
+  "Friday",
+  "Saturday"
+];
+
+/**
+ * The starting point for a trigger kind the athlete just switched to. Switching
+ * away and back deliberately resets rather than remembering: the two kinds share
+ * no fields, so there is nothing to preserve.
+ */
+function blankTrigger(kind: string): AutomationTrigger {
+  if (kind === "schedule") {
+    return { kind: "schedule", cadence: "daily", timeOfDay: "07:00" };
+  }
+  if (kind === "activity") {
+    return { kind: "activity", sportTypes: [] };
+  }
+  return { kind: "manual" };
 }

@@ -28,6 +28,7 @@ import type {
   PlanDraftPreview,
   PlanDraftPreviewEntry,
   PlanWorkoutEntryInput,
+  SaveChatSessionOptions,
   TrainingHubActivitySeriesPoint,
   TrainingHubThresholdZone,
   TrainingHubTrackPoint,
@@ -822,6 +823,21 @@ function parseEntry(value: unknown): PersistedChatEntry | null {
     return preview ? { kind: "hrZoneSummary", preview } : null;
   }
 
+  if (value.kind === "automationSilent") {
+    // Both halves are required. The marker is who looked and the timestamp is
+    // when; a chip that can answer neither is not worth restoring, and this
+    // entry is only ever written by the runner, so half of one means the row
+    // came from somewhere unexpected.
+    const automation = parseAutomationMarker(value.automation);
+    const at =
+      typeof value.at === "number" && Number.isFinite(value.at)
+        ? value.at
+        : null;
+    return automation && at !== null
+      ? { kind: "automationSilent", automation, at }
+      : null;
+  }
+
   return parseMessageEntry(value);
 }
 
@@ -1017,17 +1033,47 @@ export function createChatSession(
   return toSessionSummary(row);
 }
 
+/**
+ * The entries a save would silently destroy: everything the row holds past the
+ * point the caller knows about. Position is the whole test — the automation
+ * runner only ever appends, so a foreign write is always a tail.
+ *
+ * A caller that knows nothing (0) therefore keeps everything, which is the
+ * safe direction for the accident this guards against.
+ */
+function foreignTail(
+  storedJson: string,
+  knownEntryCount: number | undefined
+): PersistedChatEntry[] {
+  if (knownEntryCount === undefined || !Number.isFinite(knownEntryCount)) {
+    return [];
+  }
+  const known = Math.max(0, Math.floor(knownEntryCount));
+  const stored = parseChatTranscriptJson(storedJson);
+  return stored.length > known ? stored.slice(known) : [];
+}
+
+/**
+ * `options` sits after the injectable database rather than before it, against
+ * this file's usual "seam goes last" shape. Deliberate: every caller that
+ * passes a database is a test, and moving the seam would put an `undefined`
+ * placeholder in a dozen of them to spare one production call site.
+ */
 export function saveChatSession(
   id: string,
   entries: PersistedChatEntry[],
-  database: ChatSessionDatabase = defaultDatabase
+  database: ChatSessionDatabase = defaultDatabase,
+  options: SaveChatSessionOptions = {}
 ): ChatSessionSummary | null {
   const row = database.getSession(id);
   if (!row) {
     return null;
   }
 
-  const normalizedEntries = normalizeEntries(entries);
+  const normalizedEntries = normalizeEntries([
+    ...entries,
+    ...foreignTail(row.messages_json, options.knownEntryCount)
+  ]);
   const title =
     row.title === DEFAULT_SESSION_TITLE
       ? deriveSessionTitleFromEntries(normalizedEntries)

@@ -64,6 +64,8 @@ import type {
   ChatSettings,
   ChatEntryAutomationMarker,
   ClaudeCodeStatus,
+  CoachAutomationRun,
+  CoachAutomationSessionAttention,
   CoachInputChoice,
   CoachInputPrompt,
   LocalChatConnectionTest,
@@ -91,7 +93,6 @@ import { FitnessTrendCard } from "./FitnessTrendCard";
 import { HrZoneCard } from "./HrZoneCard";
 import { supportsReasoningEffort } from "../../electron/chatModels";
 import { ChatSettingsModal } from "./ChatSettingsModal";
-import { showToast } from "../toast";
 import { ConversationCoaches } from "./automations/ConversationCoaches";
 import { CoachAutomationsModal } from "./automations/CoachAutomationsModal";
 import { ClaudeAuthScopeToggle } from "./ClaudeAuthScopeToggle";
@@ -1795,6 +1796,22 @@ export function ChatView({
   const [automationsVersion, setAutomationsVersion] = useState(0);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [timeline, setTimeline] = useState<ChatEntry[]>([]);
+  /**
+   * How many stored entries this window's timeline accounts for (5.6b). A run
+   * writing from the main process appends past that point, and the store keeps
+   * whatever lies beyond it rather than letting this window's copy — taken
+   * before the run — delete the coach's answer.
+   *
+   * Zero means "nothing is known about the row", which keeps everything.
+   */
+  const persistedBaseRef = useRef(0);
+  /**
+   * 9.3: which conversations a coach speaks into, and which of them have said
+   * something the athlete has not read. Keyed by session id.
+   */
+  const [sessionAttention, setSessionAttention] = useState<
+    Map<string, CoachAutomationSessionAttention>
+  >(new Map());
   const [streaming, setStreaming] = useState(false);
   const [streamingText, setStreamingText] = useState("");
   const [thinkingText, setThinkingText] = useState("");
@@ -1897,8 +1914,14 @@ export function ChatView({
   ) => {
     if (!api || !sessionId) return;
     const run = () => {
+      const persisted = toPersistedEntries(entries);
+      const knownEntryCount = persistedBaseRef.current;
+      // Advanced at send time, not on the reply. Handlers run in send order, so
+      // the row ends up holding this array; waiting for the reply would let an
+      // earlier save's answer roll the base backwards.
+      persistedBaseRef.current = persisted.length;
       void api
-        .saveChatSession(sessionId, toPersistedEntries(entries))
+        .saveChatSession(sessionId, persisted, { knownEntryCount })
         .then((summary) => {
           if (!summary) return;
           setSessions((current) => {
@@ -1929,14 +1952,48 @@ export function ChatView({
     persistTimeoutRef.current = setTimeout(run, 300);
   };
 
+  const refreshSessionAttention = useCallback(async () => {
+    if (!api) return;
+    try {
+      const rows = await api.listCoachAutomationSessionAttention();
+      setSessionAttention(new Map(rows.map((row) => [row.sessionId, row])));
+    } catch {
+      // A conversation list without its marks is still a conversation list.
+    }
+  }, [api]);
+
+  /**
+   * Opening a conversation is what reading it means (9.3). Only re-reads the
+   * marks when something actually cleared, so switching between conversations
+   * with nothing unread costs one call rather than two.
+   */
+  const markSessionRead = useCallback(
+    async (sessionId: string) => {
+      if (!api) return;
+      try {
+        if ((await api.markCoachAutomationSessionSeen(sessionId)) > 0) {
+          await refreshSessionAttention();
+        }
+      } catch {
+        // The dot is a hint, not state the athlete can lose work over.
+      }
+    },
+    [api, refreshSessionAttention]
+  );
+
   const loadSession = async (sessionId: string) => {
     if (!api) return;
     try {
       const entries = await api.getChatSession(sessionId);
+      persistedBaseRef.current = entries.length;
       setTimeline(fromPersistedEntries(entries));
       resetEphemeralChatState();
       setActiveSessionId(sessionId);
+      void markSessionRead(sessionId);
     } catch {
+      // Nothing was read, so nothing is known about the row: a save from here
+      // must not be taken as authority to shorten it.
+      persistedBaseRef.current = 0;
       setTimeline([]);
       resetEphemeralChatState();
     }
@@ -1954,18 +2011,54 @@ export function ChatView({
       const entries = await api.getChatSession(sessionId);
       // The athlete may have switched conversations while this was in flight.
       if (activeSessionIdRef.current !== sessionId) return;
+      // A save waiting on the debounce holds the copy this reload is replacing,
+      // and the base is about to move past it. Letting it fire would write the
+      // pre-run transcript back over the answer with a base that no longer
+      // covers it — the exact loss 5.6b's merge exists to prevent.
+      if (persistTimeoutRef.current) {
+        clearTimeout(persistTimeoutRef.current);
+        persistTimeoutRef.current = null;
+      }
+      persistedBaseRef.current = entries.length;
       setTimeline(fromPersistedEntries(entries));
     } catch {
       // Keep what is on screen rather than blanking a readable transcript.
     }
   };
 
-  const refreshSessions = async (provider: ChatProvider) => {
-    if (!api) return [];
-    const listed = await api.listChatSessions(provider);
-    setSessions(listed);
-    return listed;
+  /**
+   * A run log row names the conversation the coach wrote into, and reading what
+   * it said is the obvious next thing to do — so the row opens it, from behind
+   * the modal that is covering it.
+   *
+   * The list is re-read first rather than searched as it stands: a `per-run`
+   * conversation may be newer than anything this window has heard of, and one
+   * from an old run may have been deleted since. Loading a session id no row
+   * exists for would leave the sidebar with nothing selected and the composer
+   * writing into a conversation that is not there.
+   */
+  const openRunConversation = async (sessionId: string) => {
+    if (!api) return;
+    const listed = await refreshSessions(chatSettings.provider);
+    if (!listed.some((session) => session.id === sessionId)) {
+      onError("That conversation is no longer here — it may have been deleted.");
+      return;
+    }
+    onError(null);
+    setAutomationsOpen(false);
+    setAutomationsVersion((value) => value + 1);
+    await loadSession(sessionId);
   };
+
+  const refreshSessions = useCallback(
+    async (provider: ChatProvider) => {
+      if (!api) return [];
+      const listed = await api.listChatSessions(provider);
+      setSessions(listed);
+      return listed;
+    },
+    [api]
+  );
 
   const ensureActiveSession = async (provider: ChatProvider) => {
     if (!api) return null;
@@ -1977,6 +2070,7 @@ export function ChatView({
     const created = await api.createChatSession(provider);
     setSessions([created]);
     setActiveSessionId(created.id);
+    persistedBaseRef.current = 0;
     setTimeline([]);
     resetEphemeralChatState();
     return created.id;
@@ -1986,15 +2080,116 @@ export function ChatView({
     activeSessionIdRef.current = activeSessionId;
   }, [activeSessionId]);
 
+  // Attaching or detaching a coach changes which conversations carry the mark,
+  // so the list re-reads on the same version counter the header chips use.
+  useEffect(() => {
+    void refreshSessionAttention();
+  }, [refreshSessionAttention, automationsVersion]);
+
+  /**
+   * A run reaches into the conversation list from outside this window. A
+   * `per-run` binding brings a conversation into existence every time it fires
+   * (2.2), a `dedicated` one rebuilds its own when it has been deleted, and
+   * every run bumps whatever it wrote into to the top (9.3).
+   *
+   * The sidebar renders from a list this window read once, on mount and on a
+   * provider change, so none of that was visible until the app was restarted:
+   * a conversation the window had never heard of was simply not in the array,
+   * and the reorder had nothing to reorder. The `running` update carries the
+   * session id too — the conversation exists before the model is asked
+   * anything — so a new one appears while the run is still going, which is the
+   * only way the athlete can open it and watch the answer arrive.
+   */
+  useEffect(() => {
+    if (!api?.onCoachAutomationRunUpdate) return;
+    // The provider on screen, not the run's: an automation may run on one of
+    // its own (decision 2), and that conversation belongs to that provider's
+    // list rather than this one.
+    const provider = chatSettings.provider;
+    return api.onCoachAutomationRunUpdate((run) => {
+      if (!run.sessionId) return;
+      void refreshSessions(provider).catch(() => undefined);
+    });
+  }, [api, chatSettings.provider, refreshSessions]);
+
+  /**
+   * 9.3: a run into a conversation the athlete is *not* looking at is exactly
+   * what the unread dot is for. The live-view subscription below ignores those,
+   * so this one watches every run.
+   */
+  useEffect(() => {
+    if (!api?.onCoachAutomationRunUpdate) return;
+    return api.onCoachAutomationRunUpdate((run) => {
+      // Still working: nothing has landed in any conversation yet.
+      if (run.status === "running") return;
+      if (run.sessionId && run.sessionId === activeSessionIdRef.current) {
+        // The conversation is open and the reload has already put the answer on
+        // screen, so it is read the moment it arrives.
+        void markSessionRead(run.sessionId);
+        return;
+      }
+      void refreshSessionAttention();
+    });
+  }, [api, markSessionRead, refreshSessionAttention]);
+
   useEffect(() => {
     liveAutomationRef.current = liveAutomation;
   }, [liveAutomation]);
 
-  // Switching conversations drops whatever was streaming into the old one; the
-  // run keeps going in the main process and its output is on disk either way.
+  /**
+   * The run record carries ids, not the coach's name, so the chip is worth one
+   * lookup: an athlete watching a bubble needs to know which of their coaches
+   * is speaking.
+   */
+  const showLiveAutomation = useCallback(
+    (run: CoachAutomationRun) => {
+      setLiveAutomation({ runId: run.id, name: "Automation coach", text: "" });
+      void api
+        ?.getCoachAutomation(run.automationId)
+        .then((detail) => {
+          if (!detail) return;
+          setLiveAutomation((current) =>
+            current?.runId === run.id
+              ? { ...current, name: detail.automation.name }
+              : current
+          );
+        })
+        .catch(() => undefined);
+    },
+    [api]
+  );
+
+  /**
+   * Switching conversations drops whatever was streaming into the old one; the
+   * run keeps going in the main process and its output is on disk either way.
+   *
+   * And it picks up whatever is streaming into the new one. The subscription
+   * below only ever hears about a run while its conversation is already open,
+   * so opening one mid-run — which is exactly what a `per-run` binding invites
+   * the athlete to do, its conversation appearing in the sidebar the moment the
+   * run starts — showed an empty transcript with nothing to say why. The text
+   * already streamed is gone, but the bubble says who is working and the tokens
+   * from here on land in it.
+   */
   useEffect(() => {
     setLiveAutomation(null);
-  }, [activeSessionId]);
+    if (!api || !activeSessionId) return;
+    let cancelled = false;
+    void api
+      .listCoachAutomationRuns({
+        sessionId: activeSessionId,
+        statuses: ["running"],
+        limit: 1
+      })
+      .then((runs) => {
+        if (cancelled || !runs.length) return;
+        showLiveAutomation(runs[0]);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [api, activeSessionId, showLiveAutomation]);
 
   /**
    * A run that targets the conversation on screen has to show up in it as it
@@ -2007,44 +2202,26 @@ export function ChatView({
       if (!run.sessionId || run.sessionId !== activeSessionIdRef.current) return;
 
       if (run.status === "running") {
-        setLiveAutomation({ runId: run.id, name: "Automation coach", text: "" });
-        // The run record carries ids, not the coach's name; the chip is worth
-        // one lookup so the athlete knows which of their coaches is speaking.
-        void api
-          .getCoachAutomation(run.automationId)
-          .then((detail) => {
-            if (!detail) return;
-            setLiveAutomation((current) =>
-              current?.runId === run.id
-                ? { ...current, name: detail.automation.name }
-                : current
-            );
-          })
-          .catch(() => undefined);
+        showLiveAutomation(run);
         return;
       }
 
-      const live = liveAutomationRef.current;
-      if (live?.runId === run.id) {
+      if (liveAutomationRef.current?.runId === run.id) {
         setLiveAutomation(null);
-        if (run.status === "silent") {
-          // The athlete just watched this answer stream in. A silent run writes
-          // nothing to the transcript by design, so without a word the bubble
-          // would vanish mid-sentence and read as a bug.
-          showToast(`${live.name} found nothing new to report.`);
-        }
       }
 
-      // Only a reported run adds anything to the transcript: a silent one is
-      // recorded in the run log by design, and a skip never reached the model.
-      if (run.status !== "success") return;
+      // A skip never reached the model and adds nothing. A silent run does add
+      // something now — the one-line trace saying the coach looked (5.5) — so
+      // it reloads on the same path as an answer, and the trace is what
+      // explains the live bubble disappearing.
+      if (run.status !== "success" && run.status !== "silent") return;
       // Reloaded straight away even mid-turn. Waiting for the athlete's turn to
       // end is worse than useless: their turn persists the whole timeline, so
       // the copy on screen — which predates the run — would be written over the
       // coach's answer before the deferred reload ever got to see it.
       void reloadTranscript(run.sessionId);
     });
-  }, [api]);
+  }, [api, showLiveAutomation]);
 
   // Load sign-in/provider state on mount.
   useEffect(() => {
@@ -2630,6 +2807,7 @@ export function ChatView({
       const created = await api.createChatSession(chatSettings.provider);
       setSessions((current) => [created, ...current]);
       setActiveSessionId(created.id);
+      persistedBaseRef.current = 0;
       setTimeline([]);
       resetEphemeralChatState();
     } catch (caught) {
@@ -2680,6 +2858,7 @@ export function ChatView({
           const created = await api.createChatSession(chatSettings.provider);
           setSessions([created]);
           setActiveSessionId(created.id);
+          persistedBaseRef.current = 0;
           setTimeline([]);
           resetEphemeralChatState();
         }
@@ -3569,6 +3748,7 @@ export function ChatView({
     sessions,
     activeSessionId,
     busy: isBusy,
+    attention: sessionAttention,
     onClose: () => void handleUpdateChatSettings({ sidebarOpen: false }),
     onOpen: () => void handleUpdateChatSettings({ sidebarOpen: true }),
     onNewChat: () => void handleNewChat(),
@@ -3987,6 +4167,64 @@ function AutomationPromptChip({
   );
 }
 
+/**
+ * When the coach looked. Absolute, not relative: a transcript entry is read
+ * long after it was written, and "2h ago" becomes a lie the moment the
+ * conversation is reopened.
+ */
+function formatLookedAt(at: number): string {
+  const when = new Date(at);
+  if (Number.isNaN(when.getTime())) {
+    return "";
+  }
+  const time = when.toLocaleTimeString(undefined, {
+    hour: "numeric",
+    minute: "2-digit"
+  });
+  if (when.toDateString() === new Date().toDateString()) {
+    return time;
+  }
+  const day = when.toLocaleDateString(undefined, {
+    month: "short",
+    day: "numeric"
+  });
+  return `${day}, ${time}`;
+}
+
+/**
+ * 5.5: an automation looked and had nothing to say. One line, the same pill as
+ * the playbook chip, but nothing to open — the whole point is that there is no
+ * content behind it.
+ */
+function AutomationSilentChip({
+  marker,
+  at,
+  index,
+  highlighted
+}: {
+  marker: ChatEntryAutomationMarker;
+  at: number;
+  index: number;
+  highlighted: boolean;
+}) {
+  return (
+    <div
+      className={`chat-row chat-row-automation${
+        highlighted ? " is-chat-jump-target" : ""
+      }`}
+      data-chat-entry-index={index}
+    >
+      <span className="chat-automation-chip chat-automation-chip-static">
+        <Zap size={12} aria-hidden="true" />
+        {marker.name} looked, nothing new
+        <span className="chat-automation-chip-trigger">
+          · {formatLookedAt(at)}
+        </span>
+      </span>
+    </div>
+  );
+}
+
   return (
     <div className="chat-view">
       <div className="chat-header">
@@ -4007,6 +4245,7 @@ function AutomationPromptChip({
             api={api}
             sessionId={activeSessionId}
             refreshVersion={automationsVersion}
+            onChanged={() => setAutomationsVersion((value) => value + 1)}
             onManageAutomations={() => setAutomationsOpen(true)}
           />
           <div className="chat-mcp" ref={mcpRef}>
@@ -4276,6 +4515,18 @@ function AutomationPromptChip({
                     <HrZoneCard preview={entry.preview} />
                   </div>
                 </div>
+              );
+            }
+
+            if (entry.kind === "automationSilent") {
+              return (
+                <AutomationSilentChip
+                  key={`automation-silent-${index}`}
+                  marker={entry.automation}
+                  at={entry.at}
+                  index={index}
+                  highlighted={highlightedChatEntryIndex === index}
+                />
               );
             }
 
@@ -4609,6 +4860,7 @@ function AutomationPromptChip({
           // a path that forgot to report itself.
           setAutomationsVersion((value) => value + 1);
         }}
+        onOpenConversation={(sessionId) => void openRunConversation(sessionId)}
       />
     </div>
   );

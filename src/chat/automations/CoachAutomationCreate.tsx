@@ -7,7 +7,7 @@ import type {
   CoachAutomationInput
 } from "../../../electron/types";
 import { AutomationDefinitionForm } from "./AutomationDefinitionForm";
-import { COACH_AUTOMATION_PRESETS } from "./presets";
+import { COACH_AUTOMATION_PRESETS } from "../../../electron/coachAutomationPresets";
 import { describeTrigger } from "./automationLabels";
 import { useAutomationsNav } from "./automationsNav";
 

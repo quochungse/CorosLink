@@ -1,4 +1,4 @@
-import { MoreHorizontal, Pin, PinOff, Trash2 } from "lucide-react";
+import { MoreHorizontal, Pin, PinOff, Trash2, Zap } from "lucide-react";
 import {
   useEffect,
   useLayoutEffect,
@@ -8,7 +8,10 @@ import {
   type MouseEvent
 } from "react";
 import { createPortal } from "react-dom";
-import type { ChatSessionSummary } from "../../electron/types";
+import type {
+  ChatSessionSummary,
+  CoachAutomationSessionAttention
+} from "../../electron/types";
 import { formatSessionRelativeTime } from "./chatSessionGroups";
 
 const MENU_WIDTH = 180;
@@ -207,6 +210,7 @@ export function ChatSessionRow({
   session,
   active,
   disabled,
+  attention,
   onSelect,
   onTogglePin,
   onDelete
@@ -214,11 +218,17 @@ export function ChatSessionRow({
   session: ChatSessionSummary;
   active: boolean;
   disabled?: boolean;
+  /** 9.3: whether a coach speaks here, and whether it has said something new. */
+  attention?: CoachAutomationSessionAttention;
   onSelect: () => void;
   onTogglePin: () => void;
   onDelete: () => void;
 }) {
   const pinned = Boolean(session.pinnedAt);
+  // A run that has landed but not been read is worth marking even once the
+  // binding is gone: the answer is still sitting in the conversation.
+  const unread = attention?.unread ?? 0;
+  const attached = attention?.attached ?? false;
 
   const handleDelete = () => {
     if (
@@ -237,6 +247,7 @@ export function ChatSessionRow({
         "chat-session-row",
         active ? "is-active" : "",
         pinned ? "is-pinned" : "",
+        unread > 0 ? "has-unread" : "",
         disabled ? "is-disabled" : ""
       ]
         .filter(Boolean)
@@ -263,6 +274,18 @@ export function ChatSessionRow({
               aria-hidden="true"
             />
           ) : null}
+          {attached || unread > 0 ? (
+            <Zap
+              className="chat-session-row-automation-mark"
+              size={11}
+              role="img"
+              aria-label={
+                attached
+                  ? "An automation coach writes into this conversation"
+                  : "An automation coach wrote into this conversation"
+              }
+            />
+          ) : null}
           {session.title}
         </span>
         {session.preview ? (
@@ -270,8 +293,20 @@ export function ChatSessionRow({
         ) : null}
       </span>
       <span className="chat-session-row-meta">
-        <span className="chat-session-row-time">
-          {formatSessionRelativeTime(session.updatedAt)}
+        <span className="chat-session-row-time-line">
+          {/* The dot is what stops the row reordering for no visible reason: an
+              auto run changes the transcript, so it bumps the conversation to
+              the top of the list (9.3). */}
+          {unread > 0 ? (
+            <span
+              className="chat-session-row-unread"
+              role="img"
+              aria-label={`${unread} unread coach ${unread === 1 ? "run" : "runs"}`}
+            />
+          ) : null}
+          <span className="chat-session-row-time">
+            {formatSessionRelativeTime(session.updatedAt)}
+          </span>
         </span>
         <ChatSessionRowMenu
           session={session}

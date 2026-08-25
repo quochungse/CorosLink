@@ -23,6 +23,13 @@ const {
   updateCoachAutomation
 } = await import(`${distUrl("coachAutomationStore.js")}?cacheBust=${Date.now()}`);
 
+const { AUTOMATION_DEFAULT_EFFORT } = await import(
+  `${distUrl("types.js")}?cacheBust=${Date.now()}`
+);
+const { COACH_AUTOMATION_PRESETS } = await import(
+  `${distUrl("coachAutomationPresets.js")}?cacheBust=${Date.now()}`
+);
+
 // better-sqlite3 is built for the Electron ABI and will not dlopen under plain
 // node, so the store is exercised through its injectable database interface.
 function createMemoryDatabase() {
@@ -346,5 +353,96 @@ assert.equal(
   "a run that already finished is untouched"
 );
 assert.equal(cancelStaleCoachAutomationRuns(db), 0, "the second startup finds nothing");
+
+// --- the preset gallery survives the store (9.1) ---------------------------
+// A preset is a hand-written definition that goes straight through the same
+// normalizers as anything the athlete types. A malformed trigger degrades
+// silently to "manual" and an out-of-range guard rail is clamped, so a typo in
+// this file ships as a coach that never fires rather than as an error.
+{
+  const presetDb = createMemoryDatabase();
+  const ids = COACH_AUTOMATION_PRESETS.map((preset) => preset.id);
+
+  assert.ok(ids.length >= 4, "the gallery is a gallery, not one starting point");
+  assert.equal(new Set(ids).size, ids.length, "preset ids are unique");
+
+  // Each preset should teach something different, so the kinds of trigger and
+  // binding it offers have to actually differ.
+  const triggerKinds = new Set(
+    COACH_AUTOMATION_PRESETS.map((preset) => preset.definition.trigger.kind)
+  );
+  assert.ok(
+    triggerKinds.has("activity") && triggerKinds.has("schedule"),
+    "the gallery covers both trigger kinds the app can fire"
+  );
+  assert.equal(
+    new Set(
+      COACH_AUTOMATION_PRESETS.map((preset) => preset.suggestedBinding.mode)
+    ).size >= 2,
+    true,
+    "and more than one way of attaching one"
+  );
+
+  for (const preset of COACH_AUTOMATION_PRESETS) {
+    const label = `preset "${preset.id}"`;
+    assert.ok(preset.label.trim(), `${label} has a label`);
+    assert.ok(preset.description.trim(), `${label} has a description`);
+    assert.equal(
+      preset.definition.presetId,
+      preset.id,
+      `${label} must carry its own id, or the attach screen cannot find its hints`
+    );
+
+    const created = createCoachAutomation(preset.definition, presetDb);
+
+    // The trigger is the part that fails silently, so it is asserted whole.
+    assert.deepEqual(
+      created.trigger,
+      preset.definition.trigger,
+      `${label} trigger did not survive normalisation`
+    );
+    assert.notEqual(
+      created.trigger.kind,
+      "manual",
+      `${label} degraded to a manual trigger, so it would never fire on its own`
+    );
+    assert.deepEqual(
+      created.conditions,
+      { ...DEFAULT_AUTOMATION_CONDITIONS, ...preset.definition.conditions },
+      `${label} guard rails were clamped or dropped`
+    );
+    assert.deepEqual(
+      created.runtime,
+      preset.definition.runtime ?? {},
+      `${label} runtime did not survive normalisation`
+    );
+    assert.equal(created.name, preset.definition.name.trim());
+    assert.ok(created.role?.trim(), `${label} has a role`);
+    assert.ok(
+      created.playbook.includes("{{") || created.playbook.length > 80,
+      `${label} playbook is a real brief`
+    );
+
+    // Section 7: silence means `low`. Only a preset that genuinely wants more
+    // says so, and it must say something the effort switch can offer.
+    if (created.runtime.effort) {
+      assert.notEqual(
+        created.runtime.effort,
+        AUTOMATION_DEFAULT_EFFORT,
+        `${label} spells out the default effort, which says nothing`
+      );
+    }
+  }
+
+  // A per-run binding needs a title template, and nothing else should carry one.
+  for (const preset of COACH_AUTOMATION_PRESETS) {
+    const { mode, titleTemplate } = preset.suggestedBinding;
+    assert.equal(
+      mode === "per-run",
+      Boolean(titleTemplate),
+      `preset "${preset.id}" pairs a title template with the wrong binding mode`
+    );
+  }
+}
 
 console.log("coach automation store tests passed");

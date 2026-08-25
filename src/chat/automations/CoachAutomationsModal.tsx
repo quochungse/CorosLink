@@ -16,7 +16,8 @@ export function CoachAutomationsModal({
   open,
   provider,
   onClose,
-  onChanged
+  onChanged,
+  onOpenConversation
 }: {
   api: CorosLinkApi | undefined;
   open: boolean;
@@ -24,6 +25,8 @@ export function CoachAutomationsModal({
   onClose: () => void;
   /** Fired after any change, so the conversation header stays in step. */
   onChanged?: () => void;
+  /** Opens the conversation a run wrote into, from the run log. */
+  onOpenConversation?: (sessionId: string) => void;
 }) {
   // A definition is a paragraph of coaching instructions plus a trigger and
   // guard rails. Clicking the backdrop — or tapping Escape — while writing one
@@ -109,6 +112,7 @@ export function CoachAutomationsModal({
               provider={provider}
               onChanged={onChanged}
               onEditingChange={handleEditingChange}
+              {...(onOpenConversation ? { onOpenConversation } : {})}
             />
           </AutomationsNavProvider>
         </div>

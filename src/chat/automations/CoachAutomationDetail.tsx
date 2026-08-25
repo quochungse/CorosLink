@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ArrowDown,
   ArrowUp,
+  ChevronRight,
   Loader2,
   Play,
   Plus,
@@ -20,7 +21,7 @@ import { AutomationDefinitionForm } from "./AutomationDefinitionForm";
 import { AttachAutomationScreen } from "./AttachAutomationScreen";
 import { useAutomationsNav } from "./automationsNav";
 import { DeleteAutomationDialog } from "./DeleteAutomationDialog";
-import { COACH_AUTOMATION_PRESETS } from "./presets";
+import { COACH_AUTOMATION_PRESETS } from "../../../electron/coachAutomationPresets";
 import {
   bindingModeLabel,
   describeBindingMode,
@@ -89,7 +90,8 @@ export function CoachAutomationDetail({
   automationId,
   initialTab = "definition",
   onBack,
-  onChanged
+  onChanged,
+  onOpenConversation
 }: {
   api: CorosLinkApi | undefined;
   provider: ChatProvider;
@@ -97,6 +99,12 @@ export function CoachAutomationDetail({
   initialTab?: Tab;
   onBack: () => void;
   onChanged: () => void | Promise<void>;
+  /**
+   * Opens the conversation a run wrote into. The run log says what the coach
+   * found; reading it is the obvious next thing to do, and the answer lives
+   * one screen away behind a modal covering it.
+   */
+  onOpenConversation?: (sessionId: string) => void;
 }) {
   const [tab, setTab] = useState<Tab>(initialTab);
   const [automation, setAutomation] = useState<CoachAutomation | null>(null);
@@ -109,6 +117,8 @@ export function CoachAutomationDetail({
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [busyBindingId, setBusyBindingId] = useState<string | null>(null);
+  /** Covers the gap between the click and the run having a record of its own. */
+  const [startingBindingId, setStartingBindingId] = useState<string | null>(null);
   const [attachOpen, setAttachOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -153,6 +163,11 @@ export function CoachAutomationDetail({
     if (!api?.onCoachAutomationRunUpdate) return;
     return api.onCoachAutomationRunUpdate((run) => {
       if (run.automationId !== automationId) return;
+      // On the record now, so the optimistic flag has done its job and the row
+      // can go back to reporting what the run log says.
+      setStartingBindingId((current) =>
+        current === run.bindingId ? null : current
+      );
       setRuns((previous) => [
         run,
         ...previous.filter((entry) => entry.id !== run.id)
@@ -183,6 +198,39 @@ export function CoachAutomationDetail({
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
       setSaving(false);
+    }
+  };
+
+  /**
+   * Not `withBindingBusy`: a run resolves only once it has finished, which for
+   * a tool-using playbook is minutes, and this screen stays mounted through a
+   * tab change and a trip to the attach screen. Tying the row to the promise
+   * left it spinning long after the run it described had gone. The run log is
+   * the source of truth, and every update is pushed here already.
+   */
+  const startBindingRun = async (bindingId: string) => {
+    if (!api) return;
+    setStartingBindingId(bindingId);
+    setError(null);
+    try {
+      await api.runCoachAutomationNow(automationId, [bindingId]);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setStartingBindingId((current) => (current === bindingId ? null : current));
+      await refresh();
+      await onChanged();
+    }
+  };
+
+  /** The way out of a run that is taking longer than the athlete wants to wait. */
+  const stopRun = async (runId: string) => {
+    if (!api) return;
+    setError(null);
+    try {
+      await api.cancelCoachAutomationRun(runId);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
     }
   };
 
@@ -250,6 +298,12 @@ export function CoachAutomationDetail({
       )
   );
 
+  // A preset was written around one binding mode; the attach screen still
+  // offers all three, but says which one this coach was designed for.
+  const suggestedBinding = COACH_AUTOMATION_PRESETS.find(
+    (preset) => preset.id === automation.presetId
+  )?.suggestedBinding;
+
   if (attachOpen) {
     return (
       <AttachAutomationScreen
@@ -258,11 +312,8 @@ export function CoachAutomationDetail({
         automationId={automationId}
         automationName={automation.name}
         existingBindings={bindings}
-        suggestedTitleTemplate={
-          COACH_AUTOMATION_PRESETS.find(
-            (preset) => preset.id === automation.presetId
-          )?.suggestedBinding.titleTemplate
-        }
+        suggestedTitleTemplate={suggestedBinding?.titleTemplate}
+        suggestedMode={suggestedBinding?.mode}
         onClose={() => setAttachOpen(false)}
         onAttached={async () => {
           await refresh();
@@ -366,6 +417,11 @@ export function CoachAutomationDetail({
           <ul className="coach-automation-binding-list">
             {bindings.map((binding) => {
               const busy = busyBindingId === binding.id;
+              const inFlight =
+                runs.find(
+                  (run) => run.bindingId === binding.id && run.status === "running"
+                ) ?? null;
+              const starting = startingBindingId === binding.id;
               // Same rule the runner applies: the master switch gates every
               // place the automation is attached.
               const masterOff = !automation.enabled;
@@ -450,22 +506,41 @@ export function CoachAutomationDetail({
                         </button>
                       </>
                     ) : null}
-                    <button
-                      type="button"
-                      className="icon-button"
-                      aria-label="Run here now"
-                      title="Run here now"
-                      disabled={busy || !api}
-                      onClick={() =>
-                        void withBindingBusy(binding.id, () =>
-                          (api as CorosLinkApi).runCoachAutomationNow(automationId, [
-                            binding.id
-                          ])
-                        )
-                      }
-                    >
-                      <Play size={15} aria-hidden="true" />
-                    </button>
+                    {inFlight ? (
+                      <button
+                        type="button"
+                        className="icon-button"
+                        aria-label="Stop this run"
+                        title="Stop this run"
+                        disabled={!api}
+                        onClick={() => void stopRun(inFlight.id)}
+                      >
+                        <Loader2
+                          className="chat-spinner"
+                          size={15}
+                          aria-hidden="true"
+                        />
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        className="icon-button"
+                        aria-label="Run here now"
+                        title="Run here now"
+                        disabled={busy || starting || !api}
+                        onClick={() => void startBindingRun(binding.id)}
+                      >
+                        {starting ? (
+                          <Loader2
+                            className="chat-spinner"
+                            size={15}
+                            aria-hidden="true"
+                          />
+                        ) : (
+                          <Play size={15} aria-hidden="true" />
+                        )}
+                      </button>
+                    )}
                     <button
                       type="button"
                       className="icon-button"
@@ -512,29 +587,60 @@ export function CoachAutomationDetail({
             </p>
           ) : (
             <ul className="coach-automation-run-list">
-              {filteredRuns.map((run) => (
-                <li key={run.id} className="coach-automation-run-row">
-                  <span
-                    className="coach-automation-run-status"
-                    data-status={run.status}
-                  >
-                    {runStatusLabel(run)}
-                  </span>
-                  <div className="coach-automation-run-body">
-                    <span className="coach-automation-run-summary">
-                      {run.summary ??
-                        (run.skipReason
-                          ? `Skipped — ${skipReasonLabel(run.skipReason)}`
-                          : run.error ?? "—")}
+              {filteredRuns.map((run) => {
+                // Whatever conversation the run names — a skip records the
+                // one it would have written into, and that is still the place
+                // the athlete would go to see why nothing arrived. Whether it
+                // still exists is settled on the way out, not here.
+                const opensInto = onOpenConversation ? run.sessionId : undefined;
+                const body = (
+                  <>
+                    <span
+                      className="coach-automation-run-status"
+                      data-status={run.status}
+                    >
+                      {runStatusLabel(run)}
                     </span>
-                    <span className="coach-automation-run-meta">
-                      {formatTimeAgo(run.startedAt)} · {formatDuration(run)}
-                      {run.model ? ` · ${run.model}` : ""}
-                      {run.effort ? ` · effort ${run.effort}` : ""}
-                    </span>
-                  </div>
-                </li>
-              ))}
+                    <div className="coach-automation-run-body">
+                      <span className="coach-automation-run-summary">
+                        {run.summary ??
+                          (run.skipReason
+                            ? `Skipped — ${skipReasonLabel(run.skipReason)}`
+                            : run.error ?? "—")}
+                      </span>
+                      <span className="coach-automation-run-meta">
+                        {formatTimeAgo(run.startedAt)} · {formatDuration(run)}
+                        {run.model ? ` · ${run.model}` : ""}
+                        {run.effort ? ` · effort ${run.effort}` : ""}
+                      </span>
+                    </div>
+                    {opensInto ? (
+                      <ChevronRight
+                        className="coach-automation-run-open-icon"
+                        size={15}
+                        aria-hidden="true"
+                      />
+                    ) : null}
+                  </>
+                );
+
+                return (
+                  <li key={run.id}>
+                    {opensInto ? (
+                      <button
+                        type="button"
+                        className="coach-automation-run-row coach-automation-run-open"
+                        title="Open the conversation this run wrote into"
+                        onClick={() => onOpenConversation?.(opensInto)}
+                      >
+                        {body}
+                      </button>
+                    ) : (
+                      <div className="coach-automation-run-row">{body}</div>
+                    )}
+                  </li>
+                );
+              })}
             </ul>
           )}
         </div>

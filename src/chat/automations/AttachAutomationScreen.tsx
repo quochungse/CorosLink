@@ -20,6 +20,7 @@ export function AttachAutomationScreen({
   automationName,
   existingBindings,
   suggestedTitleTemplate,
+  suggestedMode,
   onClose,
   onAttached
 }: {
@@ -29,6 +30,8 @@ export function AttachAutomationScreen({
   automationName: string;
   existingBindings: CoachAutomationBindingView[];
   suggestedTitleTemplate?: string;
+  /** The mode this coach's preset was written around, if it came from one. */
+  suggestedMode?: AutomationBindingMode;
   onClose: () => void;
   onAttached: () => void | Promise<void>;
 }) {
@@ -112,6 +115,48 @@ export function AttachAutomationScreen({
     }
   };
 
+  /**
+   * 2.1: a `dedicated` binding creates **one** conversation up front and always
+   * appends to it. The store refuses a dedicated binding with no conversation
+   * (`BINDING_SESSION_REQUIRED`) — correctly, since it has no business creating
+   * chat sessions — so the making of it belongs here.
+   *
+   * It is named now rather than left as "New chat" on purpose (2.5): the first
+   * thing written into it is the automation's own playbook, and a title derived
+   * from that is how a coach's conversation ends up named after its own prompt.
+   */
+  const attachDedicated = async () => {
+    if (!api) return;
+    setBusy(true);
+    setError(null);
+    let created: ChatSessionSummary | null = null;
+    try {
+      created = await api.createChatSession(provider);
+      await api.renameChatSession(created.id, automationName);
+      const result = await api.attachCoachAutomation({
+        automationId,
+        mode: "dedicated",
+        sessionId: created.id
+      });
+      if (!result.ok) {
+        // Nothing was ever written into it, so leaving it behind would just be
+        // an empty conversation the athlete has to work out and delete.
+        await api.deleteChatSession(created.id);
+        setError(result.message);
+        return;
+      }
+      await onAttached();
+      onClose();
+    } catch (caught) {
+      if (created) {
+        await api.deleteChatSession(created.id).catch(() => undefined);
+      }
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const attachMode = (mode: AutomationBindingMode, sessionId?: string) =>
     attach({
       automationId,
@@ -127,13 +172,21 @@ export function AttachAutomationScreen({
       {error ? <p className="coach-automation-error">{error}</p> : null}
 
       <div className="coach-automation-attach-body">
-        <div className="coach-automation-attach-mode">
+        <div
+          className="coach-automation-attach-mode"
+          data-suggested={suggestedMode === "per-run" ? "true" : undefined}
+        >
           <div className="coach-automation-attach-mode-head">
             <Sparkles size={15} aria-hidden="true" />
             <div>
               <strong>A new conversation each run</strong>
               <p>Every trigger starts its own thread. Best for debriefs.</p>
             </div>
+            {suggestedMode === "per-run" ? (
+              <span className="coach-automation-attach-suggested">
+                Recommended
+              </span>
+            ) : null}
           </div>
           <label className="chat-local-field">
             <span>Conversation title</span>
@@ -168,7 +221,10 @@ export function AttachAutomationScreen({
           </button>
         </div>
 
-        <div className="coach-automation-attach-mode">
+        <div
+          className="coach-automation-attach-mode"
+          data-suggested={suggestedMode === "dedicated" ? "true" : undefined}
+        >
           <div className="coach-automation-attach-mode-head">
             <MessageSquare size={15} aria-hidden="true" />
             <div>
@@ -178,12 +234,17 @@ export function AttachAutomationScreen({
                 to it, so the coach sees what it said last time.
               </p>
             </div>
+            {suggestedMode === "dedicated" ? (
+              <span className="coach-automation-attach-suggested">
+                Recommended
+              </span>
+            ) : null}
           </div>
           <button
             type="button"
             className="chat-local-action coach-automation-attach-action"
             disabled={busy || !api}
-            onClick={() => void attachMode("dedicated")}
+            onClick={() => void attachDedicated()}
           >
             Create a dedicated conversation
           </button>

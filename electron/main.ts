@@ -91,6 +91,7 @@ import {
 } from "./hevyService";
 import type {
   HevySettingsInput,
+  SaveChatSessionOptions,
   StrengthHistoryRequest,
   UnitSystem,
   WorkoutSport
@@ -299,6 +300,10 @@ import {
   stopCoachActivityWatcher
 } from "./coachActivityWatcher";
 import {
+  startCoachAutomationScheduler,
+  stopCoachAutomationScheduler
+} from "./coachAutomationScheduler";
+import {
   CoachAutomationBindingError,
   attachCoachAutomation,
   cancelStaleCoachAutomationRuns,
@@ -310,7 +315,9 @@ import {
   listCoachAutomationBindingsForSession,
   listCoachAutomationRuns,
   listCoachAutomationSummaries,
+  listCoachAutomationSessionAttention,
   markCoachAutomationRunsSeen,
+  markCoachAutomationSessionSeen,
   reorderCoachAutomationBindings,
   setCoachAutomationBindingEnabled,
   setCoachAutomationEnabled,
@@ -853,6 +860,7 @@ app.whenReady().then(() => {
   // run log would show it spinning forever (section 10).
   cancelStaleCoachAutomationRuns();
   startCoachActivityWatcher();
+  startCoachAutomationScheduler();
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) {
@@ -870,6 +878,7 @@ app.on("window-all-closed", () => {
 app.on("before-quit", () => {
   stopRouteShare();
   stopCoachActivityWatcher();
+  stopCoachAutomationScheduler();
 });
 
 /**
@@ -1465,8 +1474,12 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle(
     "chat:saveSession",
-    (_event, sessionId: string, entries: PersistedChatEntry[]) =>
-      saveChatSessionEntries(sessionId, entries)
+    (
+      _event,
+      sessionId: string,
+      entries: PersistedChatEntry[],
+      options?: SaveChatSessionOptions
+    ) => saveChatSessionEntries(sessionId, entries, options)
   );
 
   ipcMain.handle(
@@ -1583,6 +1596,15 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle("coachAutomation:markSeen", (_event, runIds: string[]) =>
     markCoachAutomationRunsSeen(runIds)
+  );
+
+  ipcMain.handle("coachAutomation:sessionAttention", () =>
+    listCoachAutomationSessionAttention()
+  );
+
+  ipcMain.handle(
+    "coachAutomation:markSessionSeen",
+    (_event, sessionId: string) => markCoachAutomationSessionSeen(sessionId)
   );
 
   ipcMain.handle("chatMcp:getStatus", () => getCorosMcpStatus());

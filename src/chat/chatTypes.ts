@@ -65,6 +65,14 @@ export interface ChatHrZoneEntry {
   preview: HrZonePreview;
 }
 
+/** An automation looked and found nothing worth saying (5.5). */
+export interface ChatAutomationSilentEntry {
+  kind: "automationSilent";
+  automation: ChatEntryAutomationMarker;
+  /** Epoch milliseconds. */
+  at: number;
+}
+
 export interface ChatToolNoticeEntry {
   kind: "toolNotice";
   message: string;
@@ -78,6 +86,7 @@ export type ChatEntry =
   | ChatActivityVisualEntry
   | ChatFitnessTrendEntry
   | ChatHrZoneEntry
+  | ChatAutomationSilentEntry
   | ChatToolNoticeEntry;
 
 export function isChatVisualEntry(
@@ -234,6 +243,13 @@ function persistVisualEntry(entry: ChatEntry): PersistedChatEntry | null {
   if (entry.kind === "hrZoneSummary") {
     return { kind: "hrZoneSummary", preview: entry.preview };
   }
+  if (entry.kind === "automationSilent") {
+    return {
+      kind: "automationSilent",
+      automation: entry.automation,
+      at: entry.at
+    };
+  }
   if (entry.kind === "toolNotice") {
     return {
       kind: "message",
@@ -309,6 +325,14 @@ export function fromPersistedEntries(entries: PersistedChatEntry[]): ChatEntry[]
     }
     if (entry.kind === "hrZoneSummary") {
       result.push({ kind: "hrZoneSummary", preview: entry.preview });
+      continue;
+    }
+    if (entry.kind === "automationSilent") {
+      result.push({
+        kind: "automationSilent",
+        automation: entry.automation,
+        at: entry.at
+      });
       continue;
     }
     result.push({

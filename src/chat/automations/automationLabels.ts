@@ -130,6 +130,24 @@ export function formatTimeAgo(iso: string | undefined): string {
   return days === 1 ? "yesterday" : `${days}d ago`;
 }
 
+/**
+ * "in 3h" style, for the next slot on a schedule automation's card. Null when
+ * there is no slot booked yet — the scheduler seeds one on its next tick, and
+ * an empty space says that better than a placeholder does.
+ */
+export function formatTimeUntil(iso: string | undefined): string | null {
+  if (!iso) return null;
+  const then = new Date(iso).getTime();
+  if (Number.isNaN(then)) return null;
+  const minutes = Math.round((then - Date.now()) / 60_000);
+  if (minutes <= 0) return "any moment";
+  if (minutes < 60) return `in ${minutes}m`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `in ${hours}h`;
+  const days = Math.round(hours / 24);
+  return days === 1 ? "tomorrow" : `in ${days}d`;
+}
+
 export function formatDuration(run: CoachAutomationRun): string {
   if (!run.finishedAt) return "—";
   const ms = new Date(run.finishedAt).getTime() - new Date(run.startedAt).getTime();

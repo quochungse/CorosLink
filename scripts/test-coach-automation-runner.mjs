@@ -26,7 +26,9 @@ Module._load = function patchedLoad(request, ...rest) {
 
 const {
   AUTOMATION_OUTPUT_CONTRACT,
+  AUTOMATION_DEFAULT_EFFORT,
   NOTHING_TO_REPORT,
+  resolveAutomationRuntime,
   SESSION_BURST_PER_HOUR,
   expandTriggerToQueue,
   isWithinQuietHours,
@@ -130,10 +132,11 @@ assert.match(AUTOMATION_OUTPUT_CONTRACT, new RegExp(NOTHING_TO_REPORT));
 
 // --- the marker never reaches the athlete ----------------------------------
 // It decides silent-vs-success and is not prose. The runner keeps it out of the
-// transcript by writing nothing at all on a silent run; the window has to keep
-// it out of the live bubble too, where it arrives split across chunks. That
-// second half lives in JSX, so it is asserted at the source level — the same
-// trick test-ipc-surface.mjs uses for invariants TypeScript cannot see.
+// transcript by persisting a one-line trace instead of anything the model
+// wrote; the window has to keep it out of the live bubble too, where it arrives
+// split across chunks. That second half lives in JSX, so it is asserted at the
+// source level — the same trick test-ipc-surface.mjs uses for invariants
+// TypeScript cannot see.
 {
   const chatView = fs.readFileSync(
     path.join(repoRoot, "src", "chat", "ChatView.tsx"),
@@ -148,6 +151,65 @@ assert.match(AUTOMATION_OUTPUT_CONTRACT, new RegExp(NOTHING_TO_REPORT));
     chatView,
     /content=\{liveAutomation\.text\}/,
     "the live bubble must render the guarded text, never the raw stream"
+  );
+  // The transcript trace replaced the toast that used to explain the bubble
+  // disappearing. Both saying it would say it twice.
+  assert.doesNotMatch(
+    chatView,
+    /found nothing new to report/,
+    "the silent-run toast is retired by the transcript entry"
+  );
+  assert.match(
+    chatView,
+    /run\.status !== "success" && run\.status !== "silent"/,
+    "a silent run must reload the transcript, like an answer does"
+  );
+
+  // The renderer rebuilds entries field by field in both directions. A missing
+  // *branch* is a compile error, because the union has one; a missing *field*
+  // is not, and would silently drop the timestamp on every reload.
+  const chatTypes = fs.readFileSync(
+    path.join(repoRoot, "src", "chat", "chatTypes.ts"),
+    "utf8"
+  );
+  assert.equal(
+    (
+      chatTypes.match(
+        /kind: "automationSilent",\s*automation: entry\.automation,\s*at: entry\.at/g
+      ) ?? []
+    ).length,
+    2,
+    "both chatTypes converters must carry the trace's marker and its timestamp"
+  );
+
+  // 5.6b: the window saves its whole timeline, so it has to tell the store how
+  // much of the row that array accounts for. Without it, a save issued in the
+  // moment between a run landing and the reload arriving deletes the answer.
+  assert.match(
+    chatView,
+    /saveChatSession\(sessionId, persisted, \{ knownEntryCount \}\)/,
+    "the window must declare what its array is based on when it saves"
+  );
+  // Advanced before the call, not in the reply: handlers run in send order, so
+  // an earlier save's answer arriving late must not roll the base backwards.
+  assert.match(
+    chatView,
+    /persistedBaseRef\.current = persisted\.length;\s*\n\s*void api/,
+    "the base must advance at send time, not when the save replies"
+  );
+  assert.equal(
+    (chatView.match(/persistedBaseRef\.current = entries\.length;/g) ?? []).length,
+    2,
+    "both paths that read the conversation from disk must re-base on it"
+  );
+  // A save waiting on the debounce holds the copy the reload is replacing. If
+  // it fired afterwards it would write that copy back with a base that no
+  // longer covers the run's entries, which is the loss the merge exists to
+  // prevent — so the reload cancels it.
+  assert.match(
+    chatView,
+    /if \(persistTimeoutRef\.current\) \{\s*\n\s*clearTimeout\(persistTimeoutRef\.current\);\s*\n\s*persistTimeoutRef\.current = null;\s*\n\s*\}\s*\n\s*persistedBaseRef\.current = entries\.length;/,
+    "reloading the transcript must cancel a save still waiting on the debounce"
   );
 }
 
@@ -199,7 +261,8 @@ function createWorld(overrides = {}) {
     concurrent: 0,
     maxConcurrent: 0,
     sessionOrder: [],
-    activities: []
+    activities: [],
+    cancelledRunIds: []
   };
 
   let sessionSeq = 0;
@@ -317,6 +380,10 @@ function createWorld(overrides = {}) {
     emitRunUpdate: (run) => {
       state.updates.push({ id: run.id, status: run.status });
     },
+    cancelRun: (runId) => {
+      state.cancelledRunIds.push(runId);
+    },
+    idleTimeoutMs: 60_000,
     ...overrides
   };
 
@@ -486,6 +553,9 @@ function addSession(world, id, entries = []) {
   assert.equal(call.options.roleInstructions, "Strict marathon coach");
   assert.deepEqual(call.options.runtime, { model: "claude-opus-5", effort: "low" });
 
+  // Section 7: an explicit effort is honoured as written.
+  assert.equal(AUTOMATION_DEFAULT_EFFORT, "low");
+
   // The conversation's history is replayed, then the rendered playbook.
   assert.equal(call.messages.length, 3);
   assert.deepEqual(call.messages.slice(0, 2), [
@@ -540,13 +610,105 @@ function addSession(world, id, entries = []) {
   const [run] = await runAutomationTrigger({ automationId: "a1", kind: "schedule" }, world.deps);
   assert.equal(run.status, "silent");
   assert.equal(run.summary, undefined, "a silent run carries no badge text");
-  assert.deepEqual(
-    world.sessions.get("s1").entries,
-    [{ kind: "message", role: "user", content: "Hi" }],
-    "a silent run leaves the transcript untouched"
+
+  // Nothing the model wrote is persisted — the answer was a control token. What
+  // lands is the trace of 5.5, so the conversation records that the coach ran.
+  const entries = world.sessions.get("s1").entries;
+  assert.equal(entries.length, 2, "the athlete's turn is kept, one trace is added");
+  assert.deepEqual(entries[0], { kind: "message", role: "user", content: "Hi" });
+  assert.equal(entries[1].kind, "automationSilent");
+  assert.equal(entries[1].at, world.now.getTime(), "the trace records when it looked");
+  assert.equal(entries[1].automation.runId, run.id);
+  assert.equal(entries[1].automation.name, world.automations.get("a1").name);
+  assert.equal(
+    JSON.stringify(entries).includes(NOTHING_TO_REPORT),
+    false,
+    "and the marker itself never reaches the transcript"
   );
-  assert.equal(world.runs.length, 1, "but it is still logged");
+
+  assert.equal(world.runs.length, 1, "the run is still logged");
   assert.equal(world.bindings.get("b1").lastRunAt, world.now.toISOString());
+}
+
+// The trace appends to the conversation as it stands now, not to the snapshot
+// taken before the stream — same hazard as a reported answer has.
+{
+  resetAutomationQueueForTests();
+  const world = createWorld();
+  world.outcome = { text: NOTHING_TO_REPORT };
+  addAutomation(world, "a1");
+  addSession(world, "s1", [{ kind: "message", role: "user", content: "before" }]);
+  addBinding(world, "b1", { sessionId: "s1" });
+
+  const original = world.deps.streamChat;
+  world.deps.streamChat = async (...args) => {
+    world.sessions.get("s1").entries.push({
+      kind: "message",
+      role: "user",
+      content: "typed mid-run"
+    });
+    return original(...args);
+  };
+
+  await runAutomationTrigger({ automationId: "a1", kind: "schedule" }, world.deps);
+  assert.deepEqual(
+    world.sessions.get("s1").entries.map((entry) => entry.content ?? entry.kind),
+    ["before", "typed mid-run", "automationSilent"],
+    "the athlete's turn is not deleted by the trace's append"
+  );
+}
+
+// --- section 7: silence means `low`, whatever the trigger ------------------
+// The editor renders `runtime.effort ?? "low"`, so a definition saved without
+// touching that control showed `low`. Before this default it then ran at the
+// interactive chat's effort, and the run log recorded nothing at all.
+{
+  for (const trigger of [
+    { kind: "activity", sportTypes: [] },
+    { kind: "schedule", cadence: "daily", timeOfDay: "07:00" },
+    { kind: "schedule", cadence: "weekly", dayOfWeek: 0, timeOfDay: "18:00" },
+    { kind: "manual" }
+  ]) {
+    resetAutomationQueueForTests();
+    const world = createWorld();
+    addAutomation(world, "a1", { trigger, runtime: { model: "claude-opus-5" } });
+    addSession(world, "s1");
+    addBinding(world, "b1", { sessionId: "s1" });
+    // Ignored by every trigger but the activity one, which otherwise has
+    // nothing to analyse and skips before it reaches the provider.
+    addActivity(world, "t1", 1);
+
+    const [run] = await runAutomationTrigger(
+      { automationId: "a1", kind: "manual", bypassGuards: true },
+      world.deps
+    );
+    const label = `${trigger.kind}/${trigger.cadence ?? "-"}`;
+    assert.equal(run.status, "success", label);
+    assert.deepEqual(
+      world.streamCalls[0].options.runtime,
+      { model: "claude-opus-5", effort: AUTOMATION_DEFAULT_EFFORT },
+      `${label}: the run must use the default, not the chat's effort`
+    );
+    assert.equal(
+      run.effort,
+      AUTOMATION_DEFAULT_EFFORT,
+      `${label}: and the run log must record what it actually used`
+    );
+    // The definition is untouched: the default is resolved at run time, so the
+    // athlete's blank stays blank and follows the default if it ever changes.
+    assert.equal(world.automations.get("a1").runtime.effort, undefined, label);
+  }
+
+  // resolveAutomationRuntime is the one place that decision lives.
+  assert.deepEqual(
+    resolveAutomationRuntime({ runtime: {} }),
+    { effort: AUTOMATION_DEFAULT_EFFORT }
+  );
+  assert.deepEqual(
+    resolveAutomationRuntime({ runtime: { effort: "high", model: "m" } }),
+    { effort: "high", model: "m" },
+    "an explicit effort is never overridden"
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1350,6 +1512,107 @@ const analysedIds = (world) =>
     RUNNER_NOW_EPOCH - 3 * 86_400,
     "the model looked and had nothing to say; that is still an answer"
   );
+}
+
+// ---------------------------------------------------------------------------
+// A provider that goes silent
+// ---------------------------------------------------------------------------
+
+const HUNG = Symbol("hung");
+
+/**
+ * Every assertion here is about a promise settling at all, so a regression
+ * would otherwise show up as a test run that hangs rather than one that fails.
+ */
+async function withDeadline(work, ms, what) {
+  const result = await Promise.race([
+    work,
+    new Promise((resolve) => setTimeout(() => resolve(HUNG), ms))
+  ]);
+  assert.notEqual(result, HUNG, what);
+  return result;
+}
+
+// --- the run is given up on rather than left open ---------------------------
+{
+  resetAutomationQueueForTests();
+  const world = createWorld({
+    idleTimeoutMs: 20,
+    // Never settles, and never emits: the shape of an MCP connect or a provider
+    // fetch that has stopped answering. Neither carries a deadline of its own.
+    streamChat: () => new Promise(() => {})
+  });
+  addAutomation(world, "a1");
+  addSession(world, "s1");
+  addBinding(world, "b1");
+
+  const [run] = await withDeadline(
+    runAutomationNow("a1", undefined, world.deps),
+    2_000,
+    "a run whose provider went quiet has to end by itself"
+  );
+  assert.equal(run.status, "failed");
+  assert.match(run.error, /stopped responding/);
+  assert.deepEqual(
+    world.cancelledRunIds,
+    [run.id],
+    "the stream is aborted on the way out, so a provider that does watch the signal stops"
+  );
+}
+
+// --- a stream that keeps talking is never given up on -----------------------
+{
+  resetAutomationQueueForTests();
+  const world = createWorld({
+    idleTimeoutMs: 40,
+    // Six times the window in total, but never quiet for a whole one: a long
+    // tool-using run must not be mistaken for a dead one.
+    streamChat: async (sink) => {
+      for (let tick = 0; tick < 12; tick += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        sink.emit("chat:streamToken", { delta: "." });
+      }
+    }
+  });
+  addAutomation(world, "a1");
+  addSession(world, "s1");
+  addBinding(world, "b1");
+
+  const [run] = await withDeadline(
+    runAutomationNow("a1", undefined, world.deps),
+    2_000,
+    "a talkative run has to finish"
+  );
+  assert.equal(run.status, "success");
+}
+
+// --- and it does not wedge the runs behind it -------------------------------
+{
+  resetAutomationQueueForTests();
+  const stalled = createWorld({
+    idleTimeoutMs: 20,
+    streamChat: () => new Promise(() => {})
+  });
+  addAutomation(stalled, "a1");
+  addSession(stalled, "s1");
+  addBinding(stalled, "b1");
+
+  const healthy = createWorld();
+  addAutomation(healthy, "a2");
+  addSession(healthy, "s1");
+  addBinding(healthy, "b2", { automationId: "a2" });
+
+  // Queued behind the stall, on the process-wide queue of 5.4. Without a bound
+  // on the run in front of it this never resolves, which is what an athlete
+  // sees as a "Run now" button that spins with nothing behind it.
+  const first = runAutomationNow("a1", undefined, stalled.deps);
+  const [behind] = await withDeadline(
+    runAutomationNow("a2", undefined, healthy.deps),
+    2_000,
+    "one stalled run must not hold every later run for the life of the process"
+  );
+  assert.equal(behind.status, "success");
+  await first;
 }
 
 Module._load = originalLoad;

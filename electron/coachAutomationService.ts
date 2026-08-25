@@ -1,5 +1,6 @@
 import { BrowserWindow } from "electron";
 import {
+  cancelChat,
   createCollectorSink,
   getChatAuthStatus,
   getChatSettings,
@@ -28,8 +29,10 @@ import { listCoachActivityRowsAfter } from "./database";
 import type { CoachUnseenActivityRow as CoachActivityRow } from "./database";
 import { getTrainingHubStatus, reconnectTrainingHub } from "./trainingHubService";
 import { corosSportName } from "./corosSportTypes";
-import { NOTHING_TO_REPORT } from "./types";
+import { AUTOMATION_DEFAULT_EFFORT, NOTHING_TO_REPORT } from "./types";
 import type {
+  AnthropicEffort,
+  AutomationRuntime,
   AutomationTriggerKind,
   ChatEntryAutomationMarker,
   ChatMessage,
@@ -109,6 +112,23 @@ export function parseAutomationOutput(text: string): AutomationOutput {
   // sentence, whatever syntax produced it.
   const line = lines.find((candidate) => /\p{L}/u.test(candidate)) ?? lines[0];
   return { silent: false, summary: trimMarkup(line).slice(0, SUMMARY_MAX) };
+}
+
+// ---------------------------------------------------------------------------
+// Model and effort (section 7)
+// ---------------------------------------------------------------------------
+
+// Re-exported so callers that already talk to the runner do not need a second
+// import for the one constant behind its decision.
+export { AUTOMATION_DEFAULT_EFFORT };
+
+/** The runtime a run actually uses, with section 7's default filled in. */
+export function resolveAutomationRuntime(
+  automation: CoachAutomation
+): AutomationRuntime {
+  return automation.runtime.effort
+    ? automation.runtime
+    : { ...automation.runtime, effort: AUTOMATION_DEFAULT_EFFORT };
 }
 
 // ---------------------------------------------------------------------------
@@ -286,7 +306,9 @@ export type AutomationSkipReason =
   | "burst"
   | "batch-window"
   /** Activity-driven, but nothing new to analyse since this binding's watermark. */
-  | "no-activity";
+  | "no-activity"
+  /** Schedule-driven: the slot came due more than a day ago (3.1). */
+  | "stale-slot";
 
 /** 2.3: at most this many automation messages land in one conversation per hour. */
 export const SESSION_BURST_PER_HOUR = 5;
@@ -299,7 +321,12 @@ function localMinutes(value: Date): number {
   return value.getHours() * 60 + value.getMinutes();
 }
 
-function parseTimeOfDay(value: string): number | null {
+/**
+ * Local wall-clock "HH:mm" as minutes since midnight, or null if malformed.
+ * Exported for the scheduler, which reads the same two shapes of time — a
+ * trigger's `timeOfDay` and a quiet window's edges.
+ */
+export function parseTimeOfDay(value: string): number | null {
   const match = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(value);
   return match ? Number(match[1]) * 60 + Number(match[2]) : null;
 }
@@ -378,6 +405,18 @@ export interface CoachAutomationRunnerDeps {
     }
   ): Promise<void>;
   emitRunUpdate(run: CoachAutomationRun): void;
+  /** Aborts an in-flight stream by run id; the same seam "Cancel" uses. */
+  cancelRun(runId: string): void;
+  /** How long a run may emit nothing before it is given up on. */
+  idleTimeoutMs: number;
+}
+
+/**
+ * A run update from outside the runner. The scheduler's `stale-slot` skips
+ * never reach `runOneBinding`, so they need their own way onto the wire.
+ */
+export function emitAutomationRunUpdate(run: CoachAutomationRun): void {
+  emitToAnyWindow("coachAutomation:runUpdate", run);
 }
 
 /**
@@ -448,7 +487,9 @@ function createDefaultDeps(): CoachAutomationRunnerDeps {
     createCollector: (marker) => createCollectorSink(marker),
     streamChat: (sink, runId, messages, options) =>
       streamChat(sink, runId, messages, options),
-    emitRunUpdate: (run) => emitToAnyWindow("coachAutomation:runUpdate", run)
+    emitRunUpdate: (run) => emitAutomationRunUpdate(run),
+    cancelRun: (runId) => cancelChat(runId),
+    idleTimeoutMs: AUTOMATION_IDLE_TIMEOUT_MS
   };
 }
 
@@ -731,6 +772,48 @@ function buildPlaybookTurn(
   return `${body}${focus}\n\n${AUTOMATION_OUTPUT_CONTRACT}`;
 }
 
+/**
+ * A run is bounded by silence rather than by wall clock. A playbook that walks
+ * a month of activities through several tool rounds is legitimately slow; a
+ * provider that has stopped answering emits nothing at all, and the tee sink
+ * sees every token, tool call and status line, so it is the one place that can
+ * tell the two apart.
+ *
+ * The bound matters beyond the run that trips it. Runs are serialised
+ * process-wide (5.4), so a `streamChat` that never settles wedges every later
+ * run and every later "Run now" for the life of the process — the athlete sees
+ * a button that spins with nothing behind it. Neither the MCP connect nor the
+ * provider fetch on this path carries a deadline of its own, so the runner
+ * keeps one.
+ */
+export const AUTOMATION_IDLE_TIMEOUT_MS = 3 * 60_000;
+
+interface IdleWatchdog {
+  /** Resolves — never rejects — once nothing has been emitted for the window. */
+  readonly expired: Promise<void>;
+  /** Called for every stream event: the run is alive, start the clock over. */
+  touch(): void;
+  stop(): void;
+}
+
+function createIdleWatchdog(timeoutMs: number): IdleWatchdog {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let fire: () => void = () => undefined;
+  const expired = new Promise<void>((resolve) => {
+    fire = resolve;
+  });
+  const arm = () => {
+    clearTimeout(timer);
+    timer = setTimeout(fire, timeoutMs);
+  };
+  arm();
+  return {
+    expired,
+    touch: arm,
+    stop: () => clearTimeout(timer)
+  };
+}
+
 async function runOneBinding(
   queued: QueuedRun,
   deps?: Partial<CoachAutomationRunnerDeps>
@@ -805,6 +888,9 @@ async function runOneBinding(
           entries: [] as PersistedChatEntry[]
         };
 
+  // Section 7's default is resolved once, here, so the run log records what the
+  // run actually used rather than what the definition happened to leave blank.
+  const runtime = resolveAutomationRuntime(automation);
   const startedAt = resolved.now().toISOString();
   let run = resolved.recordRun({
     automationId: automation.id,
@@ -812,8 +898,8 @@ async function runOneBinding(
     status: "running",
     triggerKind: event.kind,
     sessionId: session.sessionId,
-    ...(automation.runtime.model ? { model: automation.runtime.model } : {}),
-    ...(automation.runtime.effort ? { effort: automation.runtime.effort } : {}),
+    ...(runtime.model ? { model: runtime.model } : {}),
+    ...(runtime.effort ? { effort: runtime.effort } : {}),
     ...(event.payload ? { triggerPayload: event.payload } : {}),
     startedAt
   } as Omit<CoachAutomationRun, "id" | "startedAt">);
@@ -829,7 +915,8 @@ async function runOneBinding(
 
   const playbook = buildPlaybookTurn(step, resolved);
   const collector = resolved.createCollector(marker);
-  const sink = createTeeSink(collector);
+  const watchdog = createIdleWatchdog(resolved.idleTimeoutMs);
+  const sink = createTeeSink(collector, watchdog.touch);
 
   const finish = (
     patch: Partial<Omit<CoachAutomationRun, "id" | "automationId" | "bindingId">>
@@ -843,21 +930,48 @@ async function runOneBinding(
     return finished;
   };
 
+  let timedOut = false;
   try {
-    await resolved.streamChat(
+    const streaming = resolved.streamChat(
       sink,
       run.id,
       [...toWireMessages(session.entries), { role: "user", content: playbook }],
       {
-        runtime: automation.runtime,
+        runtime,
         toolPolicy: "read-only",
         ...(automation.role ? { roleInstructions: automation.role } : {})
       }
     );
+    // Nothing awaits the stream once the watchdog has won the race, so a
+    // rejection arriving after that would be an unhandled one. Attaching a
+    // handler here does not consume it: the race still sees the rejection.
+    streaming.catch(() => undefined);
+    await Promise.race([
+      streaming,
+      watchdog.expired.then(() => {
+        timedOut = true;
+      })
+    ]);
   } catch (error) {
     return finish({
       status: "failed",
       error: error instanceof Error ? error.message : "Automation run failed."
+    });
+  } finally {
+    watchdog.stop();
+  }
+
+  if (timedOut) {
+    // Abort what can be aborted, and stop waiting on what cannot: a stall
+    // inside a call that never looks at the signal would otherwise hold the
+    // run queue behind it. The stream is left to settle in its own time.
+    resolved.cancelRun(run.id);
+    return finish({
+      status: "failed",
+      error: `The provider stopped responding — nothing arrived for ${Math.max(
+        1,
+        Math.round(resolved.idleTimeoutMs / 60_000)
+      )} minutes.`
     });
   }
 
@@ -893,21 +1007,34 @@ async function runOneBinding(
   // cancelled runs returned above and leave the watermark where it was.
   advanceWatermark();
 
+  // Re-read rather than reuse the snapshot taken before the stream: a run takes
+  // as long as the provider does, and the athlete may well have said something
+  // in that conversation meanwhile. Appending to the stale copy would delete
+  // their turn.
+  const readBack = (): PersistedChatEntry[] =>
+    resolved.getSessionEntries(session.sessionId) ?? session.entries;
+
   const output = parseAutomationOutput(collector.text());
   if (output.silent) {
-    // Nothing lands in the transcript: the run log is what records that the
-    // automation looked and found nothing.
+    // The answer itself is a control token the athlete must never read, so
+    // nothing the model wrote is persisted. What lands instead is a one-line
+    // trace saying the coach looked (5.5): a conversation that keeps no record
+    // of a run reads as a broken automation rather than as a considered "no".
+    resolved.saveSession(session.sessionId, [
+      ...readBack(),
+      {
+        kind: "automationSilent",
+        automation: marker,
+        at: resolved.now().getTime()
+      }
+    ]);
     return finish({ status: "silent" });
   }
 
   const produced = collector.entries().map((entry) =>
     entry.kind === "message" ? { ...entry, automation: marker } : entry
   );
-  // Re-read rather than reuse the snapshot taken before the stream: a run takes
-  // as long as the provider does, and the athlete may well have said something
-  // in that conversation meanwhile. Appending to the stale copy would delete
-  // their turn.
-  const existing = resolved.getSessionEntries(session.sessionId) ?? session.entries;
+  const existing = readBack();
   // 5.6: the synthetic user turn carries the playbook and the same marker, so
   // the UI can render it as a chip rather than an athlete bubble.
   resolved.saveSession(session.sessionId, [
@@ -926,10 +1053,15 @@ async function runOneBinding(
  * The tee sink of 5.2: the collector always, plus the window when one exists,
  * so an open Coach view streams live while persistence happens in main either
  * way. It never wires `bindAbort` — closing the window must not abort a run.
+ * Every event also counts as a sign of life for the run's idle watchdog.
  */
-function createTeeSink(collector: ChatStreamCollectorSink): ChatStreamSink {
+function createTeeSink(
+  collector: ChatStreamCollectorSink,
+  onActivity: () => void
+): ChatStreamSink {
   return {
     emit(channel, payload) {
+      onActivity();
       collector.emit(channel, payload);
       emitToAnyWindow(channel, payload);
     }

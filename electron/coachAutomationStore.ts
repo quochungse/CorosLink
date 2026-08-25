@@ -33,6 +33,7 @@ import type {
   CoachAutomationRun,
   CoachAutomationRunQuery,
   CoachAutomationRunStatus,
+  CoachAutomationSessionAttention,
   CoachAutomationSessionDeletionReport,
   CoachAutomationSummary
 } from "./types";
@@ -459,6 +460,23 @@ export function updateCoachAutomation(
   }
 
   database.updateAutomation(toRow(next));
+
+  // A changed trigger invalidates every slot the scheduler already booked
+  // (3.1): moving a daily briefing from 07:00 to 21:00 must not fire once more
+  // at 07:00 first. Clearing the stamp makes the next tick re-seed it from the
+  // new trigger. Both triggers come out of the same builder, so comparing them
+  // as JSON compares values, not key order.
+  if (
+    patch.trigger !== undefined &&
+    JSON.stringify(next.trigger) !== JSON.stringify(current.trigger)
+  ) {
+    for (const binding of database.listBindings(id)) {
+      if (binding.next_run_at !== null) {
+        database.updateBinding({ ...binding, next_run_at: null });
+      }
+    }
+  }
+
   const nextRow = database.getAutomation(id);
   return nextRow ? toAutomation(nextRow) : null;
 }
@@ -1084,6 +1102,79 @@ export function markCoachAutomationRunsSeen(
     updated += 1;
   }
   return updated;
+}
+
+/**
+ * Runs that landed in a conversation and add up to something the athlete has
+ * not looked at. Only `success` and `silent` count: those are the two that
+ * write to the transcript, and so the two that bump the row to the top of the
+ * conversation list (9.3). A skip or a failure wrote nothing, and belongs in
+ * the run log rather than on a conversation.
+ */
+const ATTENTION_STATUSES: CoachAutomationRunStatus[] = ["success", "silent"];
+
+/**
+ * What the conversation list needs to know, in one pass: which conversations a
+ * coach can speak into, and which of them have said something unread.
+ */
+export function listCoachAutomationSessionAttention(
+  database: CoachAutomationDatabase = defaultDatabase
+): CoachAutomationSessionAttention[] {
+  const attention = new Map<string, CoachAutomationSessionAttention>();
+  const entry = (sessionId: string): CoachAutomationSessionAttention => {
+    const existing = attention.get(sessionId);
+    if (existing) {
+      return existing;
+    }
+    const created = { sessionId, attached: false, unread: 0 };
+    attention.set(sessionId, created);
+    return created;
+  };
+
+  for (const automation of listCoachAutomations(database)) {
+    if (!automation.enabled) {
+      continue;
+    }
+    for (const binding of listCoachAutomationBindings(automation.id, database)) {
+      // A "per-run" binding has no conversation of its own to mark, and a
+      // binding switched off is not going to speak.
+      if (binding.enabled && binding.sessionId) {
+        entry(binding.sessionId).attached = true;
+      }
+    }
+  }
+
+  for (const row of database.listRuns({
+    statuses: ATTENTION_STATUSES,
+    unseenOnly: true
+  })) {
+    // A run whose conversation was deleted has nowhere to be unread.
+    if (row.session_id) {
+      entry(row.session_id).unread += 1;
+    }
+  }
+
+  return [...attention.values()];
+}
+
+/**
+ * Clears the unread mark for one conversation, which is what opening it means.
+ * Scoped to the statuses that made it unread in the first place, so a skip the
+ * athlete never saw is not quietly stamped as read.
+ */
+export function markCoachAutomationSessionSeen(
+  sessionId: string,
+  database: CoachAutomationDatabase = defaultDatabase
+): number {
+  const unread = database.listRuns({
+    sessionId,
+    statuses: ATTENTION_STATUSES,
+    unseenOnly: true
+  });
+  return markCoachAutomationRunsSeen(
+    unread.map((row) => row.id),
+    database
+  );
 }
 
 /**
