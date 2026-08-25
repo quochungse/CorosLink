@@ -118,7 +118,11 @@ function createWorld(overrides = {}) {
     authenticated: true,
     refreshes: [],
     triggers: [],
-    errors: []
+    errors: [],
+    /** 3.3's local cache: every snapshot asked for, and what landed. */
+    sampleReads: [],
+    sampleWrites: [],
+    sampleRows: [{ day: "20260821", resting_hr: 48, sleep_minutes: 430 }]
   };
 
   const deps = {
@@ -158,6 +162,13 @@ function createWorld(overrides = {}) {
     runTrigger: async (event) => {
       state.triggers.push(event);
       return [{ id: `run-${state.triggers.length}`, status: "success" }];
+    },
+    readDailySamples: async (startDay, endDay) => {
+      state.sampleReads.push([startDay, endDay]);
+      return state.sampleRows;
+    },
+    writeDailySamples: (rows, capturedAt) => {
+      state.sampleWrites.push({ rows, capturedAt });
     },
     onError: (error) => state.errors.push(error),
     ...overrides
@@ -430,4 +441,144 @@ const advance = (world, minutes) => {
 }
 
 Module._load = originalLoad;
+// ---------------------------------------------------------------------------
+// 3.3's local cache: snapshotted here, never on the scheduler tick
+// ---------------------------------------------------------------------------
+
+const {
+  DAILY_SAMPLE_INTERVAL_MS,
+  DAILY_SAMPLE_LOOKBACK_DAYS,
+  DAILY_SAMPLE_TIMEOUT_MS
+} = require(path.join(repoRoot, "dist-electron", "coachActivityWatcher.js"));
+
+assert.ok(
+  DAILY_SAMPLE_INTERVAL_MS >= 60 * 60_000,
+  "the metrics read multi-week windows; an hourly poll would buy nothing"
+);
+assert.ok(
+  DAILY_SAMPLE_LOOKBACK_DAYS >= 33,
+  "the widest metric window is a 30-day baseline plus a 3-day streak"
+);
+
+/** The one thing that makes the cache worth filling: a rule that reads it. */
+const thresholdRule = (patch = {}) => ({
+  id: "a-threshold",
+  enabled: true,
+  trigger: { kind: "threshold", metric: "sleepDebt", value: 5 },
+  conditions: { batchWindowMin: 0, cooldownMin: 0, maxRunsPerDay: 3 },
+  ...patch
+});
+
+// --- nothing reads the cache, so nothing fills it -------------------------
+{
+  // This cache feeds threshold rules and nothing else, and most athletes never
+  // write one. Filling it anyway would buy them a COROS request every six hours
+  // forever — exactly the unnoticed cost section 13 exists to notice.
+  const world = createWorld();
+  world.markInitialized();
+  await new CoachActivityWatcher(world.deps).tick();
+  assert.deepEqual(world.sampleReads, [], "no threshold rule, no snapshot");
+
+  // A rule switched off is a rule that will not be evaluated, so it is not one.
+  world.automations = [thresholdRule({ enabled: false })];
+  await new CoachActivityWatcher(world.deps).tick();
+  assert.deepEqual(world.sampleReads, [], "and a paused rule reads nothing either");
+}
+
+// --- it happens, once, and covers the widest window a metric reads ---------
+{
+  const world = createWorld();
+  world.markInitialized();
+  world.automations = [thresholdRule()];
+  const watcher = new CoachActivityWatcher(world.deps);
+
+  await watcher.tick();
+  assert.equal(world.sampleReads.length, 1, "the first tick fills the cache");
+  const [startDay, endDay] = world.sampleReads[0];
+  assert.equal(endDay, "20260821");
+  assert.match(startDay, /^\d{8}$/);
+  assert.deepEqual(
+    world.sampleWrites[0].rows,
+    world.sampleRows,
+    "and what COROS said is what lands in the cache"
+  );
+
+  // Throttled: the scheduler reads this cache every 60 seconds, and the watcher
+  // must not turn that into a COROS request every 15 minutes.
+  await watcher.tick();
+  assert.equal(world.sampleReads.length, 1, "a second tick inside the window asks again");
+
+  advance(world, DAILY_SAMPLE_INTERVAL_MS / 60_000 + 1);
+  await watcher.tick();
+  assert.equal(world.sampleReads.length, 2, "and once the window passes it does");
+}
+
+// --- a threshold automation with no activity trigger still gets its data ----
+{
+  // The snapshot is deliberately not behind the "is anything listening for
+  // activities" check below it: a threshold rule has no activity trigger, so
+  // gating on that would starve exactly the feature the cache exists for.
+  const world = createWorld();
+  world.markInitialized();
+  world.automations = [thresholdRule()];
+
+  await new CoachActivityWatcher(world.deps).tick();
+  assert.equal(world.sampleReads.length, 1);
+  assert.deepEqual(world.triggers, [], "and nothing fired from here");
+}
+
+// --- a failed snapshot leaves the cache alone and is not stamped -----------
+{
+  const world = createWorld({
+    readDailySamples: async () => {
+      throw new Error("COROS said no");
+    }
+  });
+  world.markInitialized();
+  world.automations = [thresholdRule()];
+  const watcher = new CoachActivityWatcher(world.deps);
+
+  await watcher.tick();
+  assert.deepEqual(world.sampleWrites, [], "nothing is written over what was there");
+  assert.equal(world.errors.length, 1);
+  // Not stamped, so the next tick tries again rather than hiding the problem
+  // for six hours. The metrics read multi-week windows, so one missed top-up
+  // changes nothing — but six of them in a row would.
+  await watcher.tick();
+  assert.equal(world.errors.length, 2, "a failure does not buy six hours of silence");
+}
+
+// --- and a snapshot that never answers does not hold the watcher ----------
+{
+  // Neither COROS call on this path carries a deadline of its own, and one of
+  // them can reach an MCP connect. Without the bound this tick never settles,
+  // so the watcher stops polling activities for the life of the process — the
+  // shape section 10 already paid for once.
+  const world = createWorld({
+    dailySampleTimeoutMs: 20,
+    readDailySamples: () => new Promise(() => {})
+  });
+  world.markInitialized();
+  world.automations = [thresholdRule()];
+  const watcher = new CoachActivityWatcher(world.deps);
+
+  const settled = await Promise.race([
+    watcher.tick().then(() => "settled"),
+    new Promise((resolve) => setTimeout(() => resolve("hung"), 2_000))
+  ]);
+  assert.equal(settled, "settled", "a snapshot that never answers has to end by itself");
+  assert.deepEqual(world.sampleWrites, [], "and writes nothing over the cache");
+  assert.match(String(world.errors[0]), /timed out/);
+
+  // Not stamped either: a call that never answered has not had its turn.
+  await watcher.tick();
+  assert.equal(world.errors.length, 2, "so the next tick tries again");
+}
+
+assert.equal(
+  DAILY_SAMPLE_TIMEOUT_MS,
+  60_000,
+  "the shipped bound is a minute, whatever the fixture above uses"
+);
+
 console.log("coach activity watcher tests passed");

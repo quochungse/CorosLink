@@ -154,7 +154,12 @@ export function ConversationCoaches({
     }
   };
 
-  /** The way out of a run that is taking longer than the athlete wants to wait. */
+  /**
+    * The way out of a run that is taking longer than the athlete wants to wait.
+    * It ends the whole trigger, not this conversation's share of it (10) — the
+    * same run is on its way to wherever else the coach is attached, and this
+    * popover cannot see those rows to stop them one by one.
+    */
   const stopRun = async (runId: string) => {
     if (!api) return;
     setError(null);
@@ -323,8 +328,8 @@ export function ConversationCoaches({
                           <button
                             type="button"
                             className="icon-button"
-                            aria-label="Stop this run"
-                            title="Stop this run"
+                            aria-label="Stop — here and everywhere else this run's automation is going"
+                            title="Stop — here and everywhere else this run's automation is going"
                             disabled={!api}
                             onClick={() => void stopRun(inFlight)}
                           >

@@ -24,6 +24,10 @@ const {
   setCoachAutomationBindingEnabled,
   setCoachAutomationBindingSchedule,
   setCoachAutomationBindingSession,
+  getCoachAutomationBudget,
+  getCoachAutomationPause,
+  setCoachAutomationBudget,
+  setCoachAutomationPause,
   listCoachAutomationSessionAttention,
   markCoachAutomationSessionSeen,
   recordCoachAutomationRun,
@@ -44,6 +48,11 @@ function createMemoryDatabase() {
   /** @type {Array<Record<string, any>>} */
   const runs = [];
 
+  /** Section 10's pause, as the single settings row the store writes it to. */
+  let pause;
+  /** 12 (item 6): the monthly token ceiling, in the same settings table. */
+  let budget;
+
   const byOrder = (left, right) =>
     left.sort_order - right.sort_order ||
     left.created_at.localeCompare(right.created_at);
@@ -51,6 +60,18 @@ function createMemoryDatabase() {
   return {
     _automations: automations,
     _bindings: bindings,
+    readPause() {
+      return pause;
+    },
+    writePause(value) {
+      pause = value === null ? undefined : value;
+    },
+    readBudget() {
+      return budget;
+    },
+    writeBudget(value) {
+      budget = value === null ? undefined : value;
+    },
     listAutomations() {
       return [...automations.values()].sort((left, right) =>
         left.created_at.localeCompare(right.created_at)
@@ -402,6 +423,29 @@ assert.equal(setCoachAutomationBindingSchedule("missing", {}, db), null);
     "2026-08-22T07:00:00.000Z",
     "and re-sending the same trigger is not an edit"
   );
+
+  // 3.3's firing state goes with the slot, and for the same reason: it records
+  // whether the *old* condition held, so a rule moved from "ramp over 30%" to
+  // "over 5%" would be comparing today's answer against a question nobody is
+  // asking. Back to NULL means the next tick re-seeds — so an edit, like an
+  // attach, is silent rather than firing on history.
+  setCoachAutomationBindingSchedule(first.id, { thresholdFiring: true }, db);
+  assert.equal(getCoachAutomationBinding(first.id, db).thresholdFiring, true);
+  updateCoachAutomation(
+    rebooked.id,
+    { trigger: { kind: "threshold", metric: "acuteChronicRamp", value: 5 } },
+    db
+  );
+  assert.equal(
+    getCoachAutomationBinding(first.id, db).thresholdFiring,
+    undefined,
+    "a changed trigger resets the binding to never-evaluated"
+  );
+
+  // And an edit that leaves the trigger alone leaves the state alone.
+  setCoachAutomationBindingSchedule(first.id, { thresholdFiring: false }, db);
+  updateCoachAutomation(rebooked.id, { name: "Renamed again" }, db);
+  assert.equal(getCoachAutomationBinding(first.id, db).thresholdFiring, false);
 }
 
 // The activity watermark lives on the same row: a binding attached last month
@@ -433,6 +477,48 @@ assert.equal(
     .lastActivityAt,
   undefined
 );
+
+// The failure backoff (10) is the third clock on the row, and it goes through
+// the same stamp. The runner suite drives it against a hand-written world, so
+// this is the only place that says the two columns exist and round-trip.
+{
+  const backed = setCoachAutomationBindingSchedule(
+    dedicated.id,
+    { backoffUntil: "2026-08-22T07:35:00.000Z", backoffLevel: 2 },
+    db
+  );
+  assert.equal(backed.backoffUntil, "2026-08-22T07:35:00.000Z");
+  assert.equal(backed.backoffLevel, 2);
+  assert.equal(
+    backed.lastRunAt,
+    "2026-08-22T07:30:04.000Z",
+    "absent key is left alone"
+  );
+  assert.equal(
+    getCoachAutomationBinding(dedicated.id, db).backoffLevel,
+    2,
+    "and it survives the row round-trip"
+  );
+
+  // Clearing it is what a non-failure does, and level 0 has to read back as
+  // "no streak" rather than as a streak of zero — the runner tells those apart.
+  const cleared = setCoachAutomationBindingSchedule(
+    dedicated.id,
+    { backoffUntil: null, backoffLevel: 0 },
+    db
+  );
+  assert.equal(cleared.backoffUntil, undefined);
+  assert.equal(cleared.backoffLevel, undefined);
+
+  // A binding written before the columns existed is a healthy one, not a
+  // half-backed-off one.
+  const legacy = db._bindings.get(dedicated.id);
+  delete legacy.backoff_until;
+  delete legacy.backoff_level;
+  const migrated = getCoachAutomationBinding(dedicated.id, db);
+  assert.equal(migrated.backoffUntil, undefined);
+  assert.equal(migrated.backoffLevel, undefined);
+}
 
 // --- 2.4 automation disabled: bindings stop, rows survive -------------------
 assert.equal(listActiveCoachAutomationBindings(briefing.id, db).length, 2);
@@ -703,9 +789,16 @@ assert.match(
 
 // --- the marks reach the conversation list ---------------------------------
 // The projection above is only worth having if the sidebar asks for it, clears
-// it, and keeps asking. All of this lives in JSX and effects, so it is asserted
-// at the source level — the same trick test-ipc-surface.mjs uses for invariants
-// TypeScript cannot see. A dropped argument is still a valid call.
+// it, and keeps asking.
+//
+// What is left here is source that is *about* source: a contract between two
+// files, or a shape TypeScript cannot see. Everything below that was really a
+// claim about behaviour has moved to `test:coach-automation-renderer`, which
+// mounts these components and drives them — the run-now picker's threshold, the
+// popover reporting an attach, the conversation list re-reading on a run
+// update, the marks following a run into a conversation nobody is looking at,
+// and the live bubble re-establishing on a conversation opened mid-run. Each of
+// those passed here as a regex; a regex could not say the code ran.
 {
   const read = (...parts) => readFileSync(path.join(repoRoot, ...parts), "utf8");
 
@@ -732,25 +825,36 @@ assert.match(
     /attention: sessionAttention/,
     "the marks must reach the sidebar"
   );
-  // Three run-update listeners, each doing what the other two deliberately do
-  // not. The live-view subscription returns early for conversations that are
-  // not open, which is exactly the case the dot exists for, so a second one
-  // watches all of them; and neither touches the conversation list, which a
-  // `per-run` binding adds to on every run. Three is the point, not an accident.
-  assert.equal(
-    (view.match(/api\.onCoachAutomationRunUpdate\(/g) ?? []).length,
-    3,
-    "a run into a conversation that is not open must still update the marks"
-  );
-  // 2.2: a `per-run` binding creates a conversation this window has never heard
-  // of, and every run bumps the one it wrote into to the top (9.3). The sidebar
-  // renders from a list read on mount, so without this neither showed up until
-  // the app was restarted.
+  // Stop ends the trigger, not the run it was pressed on (10). All three
+  // surfaces reach that through one IPC handler, so the wire that can silently
+  // rot is the handler's own: `cancelChat` still compiles, still aborts the
+  // stream the athlete was looking at, and leaves the rest of the fan-out to
+  // run — the exact bug this replaced.
+  const mainSource = read("electron", "main.ts");
   assert.match(
-    view,
-    /if \(!run\.sessionId\) return;\n\s*void refreshSessions\(provider\)/,
-    "a run that reaches into the conversation list must make the sidebar re-read it"
+    mainSource,
+    /"coachAutomation:cancelRun",\s*\(_event, runId: string\) => \{\s*cancelAutomationRun\(runId\);/,
+    "Stop must cancel the trigger, not just the run's stream"
   );
+  for (const surface of [
+    "CoachAutomationsPanel.tsx",
+    "CoachAutomationDetail.tsx",
+    "ConversationCoaches.tsx"
+  ]) {
+    const source = read("src", "chat", "automations", surface);
+    assert.match(
+      source,
+      /await api\.cancelCoachAutomationRun\(runId\)/,
+      `${surface} must route Stop through the automation handler, not chat's own cancel`
+    );
+    // And say so: a button that ends a five-conversation fan-out must not still
+    // promise to stop one run.
+    assert.doesNotMatch(
+      source,
+      /"Stop this run"/,
+      `${surface} must not still promise to stop only this run`
+    );
+  }
 
   // The ⚡ mark is derived from the bindings, so attaching or detaching moves
   // it. The header popover is the entry point most athletes use and the only
@@ -768,12 +872,6 @@ assert.match(
     /await work\(\);\n\s*await refresh\(\);\n\s*onChanged\?\.\(\);/,
     "switching, reordering or detaching a coach must say so"
   );
-  assert.match(
-    popover,
-    /onAttached=\{async \(\) => \{\n\s*await refresh\(\);\n\s*onChanged\?\.\(\);/,
-    "and so must attaching one"
-  );
-
   // --- 3.4: which places a manual run reaches ------------------------------
   // From a conversation it is always that one place, whichever surface asked.
   assert.match(
@@ -787,25 +885,7 @@ assert.match(
     "and so must running from one row of the coach's own list"
   );
 
-  // From the automation screen the coach may run in several places at once, so
-  // it asks first — but only where there is something to ask about.
   const runPanel = read("src", "chat", "automations", "CoachAutomationsPanel.tsx");
-  assert.match(
-    runPanel,
-    /if \(summary\.bindingCount > 1\) \{\n\s*setPickingId\(automation\.id\);\n\s*return;\n\s*\}\n\s*void startRun\(automation\.id\);/,
-    "one place runs straight away; several ask which"
-  );
-  assert.match(
-    runPanel,
-    /api\.runCoachAutomationNow\(automationId, bindingIds\)/,
-    "and the answer has to reach the runner"
-  );
-  const runDialog = read("src", "chat", "automations", "RunNowDialog.tsx");
-  assert.match(
-    runDialog,
-    /detail\.bindings\n\s*\.filter\(\(binding\) => binding\.enabled\)/,
-    "the default is every live place, not every place"
-  );
 
   // --- the run log is a way back into the conversation ----------------------
   const detailScreen = read("src", "chat", "automations", "CoachAutomationDetail.tsx");
@@ -849,17 +929,11 @@ assert.match(
     "the card's run flag is set on the click and cleared on the outcome, nowhere else"
   );
 
-  // 5.6: a run streams into the conversation as it happens, but the
-  // subscription that shows it only ever hears about a run whose conversation
-  // is *already* open. Opening one mid-run — which a `per-run` binding invites,
-  // its conversation appearing in the sidebar the moment the run starts — left
-  // an empty transcript with nothing to say why.
-  assert.match(
-    view,
-    /statuses: \["running"\][\s\S]{0,200}?showLiveAutomation\(runs\[0\]\)/,
-    "opening a conversation must pick up a run already streaming into it"
-  );
-
+  // Genuinely about source, and staying: this is a contract between two files
+  // that never run in the same process, and an argument dropped on either side
+  // still type-checks and still compiles into a call that does the wrong thing.
+  // No renderer harness can see across that bridge, because the harness *is*
+  // the stub standing in for it.
   assert.match(
     read("electron", "preload.ts"),
     /invoke\("coachAutomation:markSessionSeen", sessionId\)/,
@@ -926,6 +1000,87 @@ assert.match(
     /className="coach-automation-banner"/,
     "and say so in a banner"
   );
+}
+
+// --- section 10's pause is one row, and it survives a restart -------------
+// One flag for the whole feature rather than a column per binding: the cause is
+// one thing the athlete fixes once, so five copies could only ever disagree.
+{
+  assert.equal(getCoachAutomationPause(db), null, "nothing is paused to begin with");
+
+  const held = {
+    reason: "two-factor-required",
+    since: "2026-08-25T07:30:00.000Z",
+    runId: "run-42"
+  };
+  setCoachAutomationPause(held, db);
+  assert.deepEqual(
+    getCoachAutomationPause(db),
+    held,
+    "and it reads back whole — a restart must not resume a paused world"
+  );
+
+  setCoachAutomationPause(null, db);
+  assert.equal(getCoachAutomationPause(db), null, "resume clears the row entirely");
+
+  // The optional half is optional.
+  setCoachAutomationPause(
+    { reason: "two-factor-required", since: "2026-08-25T07:30:00.000Z" },
+    db
+  );
+  assert.equal(getCoachAutomationPause(db).runId, undefined);
+
+  // A half-written or hand-edited row reads as "not paused". Trusting a shape
+  // nobody checked would hold every automation forever on the strength of a
+  // string somebody once put in a settings table — and the only way out of
+  // that is a banner the athlete cannot reach, because it never renders.
+  for (const broken of [
+    "not json at all",
+    "{}",
+    '{"reason":"two-factor-required"}',
+    '{"since":"2026-08-25T07:30:00.000Z"}',
+    '{"reason":"something-else","since":"2026-08-25T07:30:00.000Z"}',
+    '{"reason":"two-factor-required","since":"   "}'
+  ]) {
+    db.writePause(broken);
+    assert.equal(
+      getCoachAutomationPause(db),
+      null,
+      `a malformed pause row must not hold anything: ${broken}`
+    );
+  }
+  db.writePause(null);
+}
+
+// --- 12 (item 6): the monthly ceiling ------------------------------------
+{
+  assert.equal(getCoachAutomationBudget(db), null, "no ceiling by default");
+
+  assert.equal(setCoachAutomationBudget(500_000, db), 500_000);
+  assert.equal(getCoachAutomationBudget(db), 500_000, "and it survives a restart");
+
+  // Whole tokens: the number is compared against a SUM of integers, and a
+  // fractional ceiling would be a ceiling nothing can land exactly on.
+  assert.equal(setCoachAutomationBudget(1234.7, db), 1234);
+
+  // Everything that is not a positive number means "no ceiling", which is the
+  // default. A budget of zero read as a stop would pause every automation the
+  // moment somebody cleared the field.
+  for (const value of [null, 0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+    assert.equal(
+      setCoachAutomationBudget(value, db),
+      null,
+      `${String(value)} must read as no ceiling, not as a stop`
+    );
+    assert.equal(getCoachAutomationBudget(db), null);
+  }
+
+  // A hand-edited row follows the same rule rather than being trusted.
+  for (const raw of ["", "   ", "not a number", "-5", "0"]) {
+    db.writeBudget(raw);
+    assert.equal(getCoachAutomationBudget(db), null, `a "${raw}" row is no ceiling`);
+  }
+  db.writeBudget(null);
 }
 
 console.log("coach automation binding tests passed");

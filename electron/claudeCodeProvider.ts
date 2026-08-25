@@ -10,6 +10,7 @@ import type { ChatModelOption } from "./chatModels";
 import type {
   AnthropicEffort,
   ChatMessage,
+  ChatTokenUsage,
   ClaudeCodeConnectionTest,
   ClaudeCodeStatus,
   CorosMcpTool
@@ -697,11 +698,16 @@ export async function testClaudeCodeConnection(
 
 export async function streamClaudeCodeCompletion(
   options: StreamClaudeCodeOptions
-): Promise<{ fullText: string }> {
+): Promise<{ fullText: string; usage?: ChatTokenUsage }> {
   const sdk = await import("@anthropic-ai/claude-agent-sdk");
   const controller = new AbortController();
   let externallyCancelled = false;
   let timedOut = false;
+  // Undefined rather than zero when the SDK says nothing: "this run cost
+  // nothing" and "nobody told us" are different facts, and a budget that
+  // conflates them undercounts in silence.
+  let counted = false;
+  const usage: ChatTokenUsage = { inputTokens: 0, outputTokens: 0 };
   const onAbort = () => {
     externallyCancelled = true;
     controller.abort();
@@ -820,6 +826,22 @@ export async function streamClaudeCodeCompletion(
         throw new Error(message.error);
       }
       if (message.type === "result") {
+        // The SDK reports the whole query's usage on its result message, tool
+        // rounds included, so there is nothing to accumulate here. Cache reads
+        // and writes are input the athlete is billed for.
+        const reported = (message as { usage?: Record<string, unknown> }).usage;
+        if (reported) {
+          const count = (key: string): number => {
+            const value = reported[key];
+            return typeof value === "number" && Number.isFinite(value) ? value : 0;
+          };
+          counted = true;
+          usage.inputTokens =
+            count("input_tokens") +
+            count("cache_creation_input_tokens") +
+            count("cache_read_input_tokens");
+          usage.outputTokens = count("output_tokens");
+        }
         if (message.subtype === "success") {
           resultText = message.result;
           if (message.api_error_status === 429) {
@@ -838,7 +860,7 @@ export async function streamClaudeCodeCompletion(
       fullText = resultText;
       options.onToken(resultText);
     }
-    return { fullText };
+    return { fullText, ...(counted ? { usage } : {}) };
   } catch (caught) {
     if (timedOut) {
       throw new ClaudeCodeProviderError(

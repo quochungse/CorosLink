@@ -50,6 +50,7 @@ import { parseFunctionCallArguments } from "./chatToolArguments";
 import {
   buildResponsesRequest,
   extractReasoningSummaryDelta,
+  extractResponseUsage,
   extractResponseTextDelta
 } from "./chatResponsesProtocol";
 import {
@@ -104,6 +105,7 @@ import type {
   ChatEntryAutomationMarker,
   ChatSettings,
   ChatProvider,
+  ChatTokenUsage,
   ChatToolPolicy,
   ClaudeCodeConfig,
   ClaudeCodeConnectionTest,
@@ -957,6 +959,8 @@ export interface ChatStreamCollectorSink extends ChatStreamSink {
   authError(): boolean;
   /** The assistant's final text, for the run's one-line summary. */
   text(): string;
+  /** What the turn cost, when the provider reported it (13). */
+  usage(): ChatTokenUsage | undefined;
 }
 
 function upsertEntry(
@@ -985,6 +989,7 @@ export function createCollectorSink(
   let wasCancelled = false;
   let failure: string | undefined;
   let failureWasAuth = false;
+  let tokenUsage: ChatTokenUsage | undefined;
 
   const reset = () => {
     pendingCoachPrompts = [];
@@ -1122,6 +1127,17 @@ export function createCollectorSink(
 
   const handleDone = (payload: Record<string, unknown>) => {
     isFinished = true;
+    // Recorded even on a cancelled turn: the tokens were spent before the
+    // athlete pressed Stop, and a budget that forgave them would let a fan-out
+    // stopped halfway cost nothing on paper.
+    const reported = payload.usage as ChatTokenUsage | undefined;
+    if (
+      reported &&
+      typeof reported.inputTokens === "number" &&
+      typeof reported.outputTokens === "number"
+    ) {
+      tokenUsage = reported;
+    }
     // ChatView reads the final text off the done payload; fall back to the
     // accumulated tokens so a provider that omits it cannot lose the answer.
     const fullText =
@@ -1194,6 +1210,7 @@ export function createCollectorSink(
       }
     },
     entries: () => [...entries],
+    usage: () => tokenUsage,
     finished: () => isFinished,
     cancelled: () => wasCancelled,
     error: () => failure,
@@ -1210,9 +1227,23 @@ export async function streamChat(
 ): Promise<void> {
   const unitSystem = normalizeUnitSystem(options.unitSystem);
   const toolPolicy: ChatToolPolicy =
-    options.toolPolicy === "read-only" ? "read-only" : "interactive";
+    options.toolPolicy === "read-only" || options.toolPolicy === "none"
+      ? options.toolPolicy
+      : "interactive";
   const roleInstructions = options.roleInstructions;
   const runtime = options.runtime ?? {};
+  // What this turn cost, summed across its tool rounds and across whichever
+  // provider answered. Left undefined when nobody reported: a run that cost
+  // nothing and a run nobody counted are different facts, and a budget that
+  // reads the second as the first undercounts in silence (13).
+  let usage: ChatTokenUsage | undefined;
+  const addUsage = (round: ChatTokenUsage | undefined) => {
+    if (!round) return;
+    usage = {
+      inputTokens: (usage?.inputTokens ?? 0) + round.inputTokens,
+      outputTokens: (usage?.outputTokens ?? 0) + round.outputTokens
+    };
+  };
   const send = (channel: string, payload: unknown) => {
     sink.emit(channel, payload);
   };
@@ -1325,13 +1356,14 @@ export async function streamChat(
         }
       });
       fullText = result.fullText;
+      addUsage(result.usage);
       recordClaudeCodeStatus({
         ...status,
         state: "connected",
         checkedAt: new Date().toISOString(),
         message: "Claude Code is connected and ready for Coach conversations."
       });
-      send("chat:streamDone", { requestId, fullText });
+      send("chat:streamDone", { requestId, fullText, ...(usage ? { usage } : {}) });
       return;
     }
 
@@ -1410,7 +1442,8 @@ export async function streamChat(
         }
       });
       fullText = result.fullText;
-      send("chat:streamDone", { requestId, fullText });
+      addUsage(result.usage);
+      send("chat:streamDone", { requestId, fullText, ...(usage ? { usage } : {}) });
       return;
     }
 
@@ -1493,7 +1526,8 @@ export async function streamChat(
         }
       });
       fullText = result.fullText;
-      send("chat:streamDone", { requestId, fullText });
+      addUsage(result.usage);
+      send("chat:streamDone", { requestId, fullText, ...(usage ? { usage } : {}) });
       return;
     }
 
@@ -1584,7 +1618,8 @@ export async function streamChat(
         }
       });
       fullText = result.fullText;
-      send("chat:streamDone", { requestId, fullText });
+      addUsage(result.usage);
+      send("chat:streamDone", { requestId, fullText, ...(usage ? { usage } : {}) });
       return;
     }
 
@@ -1689,6 +1724,7 @@ export async function streamChat(
             send("chat:streamToken", { requestId, delta });
             continue;
           }
+          addUsage(extractResponseUsage(event));
           const call = extractFunctionCall(event);
           if (call) functionCalls.push(call);
         }
@@ -1748,10 +1784,15 @@ export async function streamChat(
       }
     }
 
-    send("chat:streamDone", { requestId, fullText });
+    send("chat:streamDone", { requestId, fullText, ...(usage ? { usage } : {}) });
   } catch (error) {
     if (controller.signal.aborted) {
-      send("chat:streamDone", { requestId, fullText, finishReason: "cancelled" });
+      send("chat:streamDone", {
+        requestId,
+        fullText,
+        finishReason: "cancelled",
+        ...(usage ? { usage } : {})
+      });
     } else {
       if (getChatSettings().provider === "claude-code") {
         const current = getChatSettings().claudeCode;
@@ -1864,6 +1905,9 @@ export function isToolAllowedUnderPolicy(
   name: string,
   policy: ChatToolPolicy = "interactive"
 ): boolean {
+  if (policy === "none") {
+    return false;
+  }
   if (policy !== "read-only") {
     return true;
   }
@@ -1878,9 +1922,9 @@ export function applyChatToolPolicy(
   tools: CorosMcpTool[],
   policy: ChatToolPolicy = "interactive"
 ): CorosMcpTool[] {
-  return policy === "read-only"
-    ? tools.filter((tool) => isToolAllowedUnderPolicy(tool.name, policy))
-    : tools;
+  return policy === "interactive"
+    ? tools
+    : tools.filter((tool) => isToolAllowedUnderPolicy(tool.name, policy));
 }
 
 export function getClaudeCodeTools(

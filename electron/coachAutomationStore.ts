@@ -16,7 +16,10 @@ import {
   insertCoachAutomationRunRow,
   updateCoachAutomationRunRow,
   updateCoachAutomationBindingRow,
-  updateCoachAutomationRow
+  updateCoachAutomationRow,
+  deleteSettings,
+  getSetting,
+  setSetting
 } from "./database";
 import type {
   AutomationBindingMode,
@@ -30,6 +33,7 @@ import type {
   CoachAutomationBindingErrorCode,
   CoachAutomationBindingInput,
   CoachAutomationInput,
+  CoachAutomationPause,
   CoachAutomationRun,
   CoachAutomationRunQuery,
   CoachAutomationRunStatus,
@@ -69,6 +73,12 @@ export interface CoachAutomationDatabase {
   getRun(id: string): CoachAutomationRunRow | undefined;
   insertRun(row: CoachAutomationRunRow): void;
   updateRun(row: CoachAutomationRunRow): void;
+  /** The one-flag pause of section 10, as stored JSON or undefined. */
+  readPause(): string | undefined;
+  writePause(value: string | null): void;
+  /** The monthly token ceiling, as stored text or undefined for none. */
+  readBudget(): string | undefined;
+  writeBudget(value: string | null): void;
 }
 
 function createSqliteAutomationDatabase(): CoachAutomationDatabase {
@@ -92,8 +102,100 @@ function createSqliteAutomationDatabase(): CoachAutomationDatabase {
     listRuns: (filter) => listCoachAutomationRunRows(filter),
     getRun: (id) => getCoachAutomationRunRow(id),
     insertRun: (row) => insertCoachAutomationRunRow(row),
-    updateRun: (row) => updateCoachAutomationRunRow(row)
+    updateRun: (row) => updateCoachAutomationRunRow(row),
+    readPause: () => getSetting(PAUSE_SETTING),
+    writePause: (value) => {
+      if (value === null) {
+        deleteSettings([PAUSE_SETTING]);
+        return;
+      }
+      setSetting(PAUSE_SETTING, value);
+    },
+    readBudget: () => getSetting(BUDGET_SETTING),
+    writeBudget: (value) => {
+      if (value === null) {
+        deleteSettings([BUDGET_SETTING]);
+        return;
+      }
+      setSetting(BUDGET_SETTING, value);
+    }
   };
+}
+
+/**
+ * Section 10's pause is one row in `app_settings`, not a column per binding.
+ * The cause is one thing the athlete fixes once — COROS is asking for a login
+ * code — so a per-binding flag would be five copies of the same fact, each of
+ * which could disagree with the others.
+ */
+const PAUSE_SETTING = "coachAutomation.pause";
+
+export function getCoachAutomationPause(
+  database: CoachAutomationDatabase = defaultDatabase
+): CoachAutomationPause | null {
+  const raw = database.readPause();
+  if (!raw) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw) as Partial<CoachAutomationPause>;
+    // A half-written row reads as "not paused". The alternative — trusting a
+    // shape nobody checked — is a feature that holds every automation forever
+    // on the strength of a string somebody once put in a settings table.
+    const since = optionalText(parsed.since);
+    if (
+      (parsed.reason !== "two-factor-required" && parsed.reason !== "budget") ||
+      !since
+    ) {
+      return null;
+    }
+    const runId = optionalText(parsed.runId);
+    return {
+      reason: parsed.reason,
+      since,
+      ...(runId ? { runId } : {})
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * section 13: the athlete's monthly ceiling in tokens, or null for no
+ * ceiling — which is the default, because a number nobody chose is a number
+ * that pauses their coaches at an arbitrary moment.
+ */
+const BUDGET_SETTING = "coachAutomation.monthlyTokenBudget";
+
+export function getCoachAutomationBudget(
+  database: CoachAutomationDatabase = defaultDatabase
+): number | null {
+  const raw = database.readBudget();
+  if (!raw) {
+    return null;
+  }
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : null;
+}
+
+export function setCoachAutomationBudget(
+  budget: number | null,
+  database: CoachAutomationDatabase = defaultDatabase
+): number | null {
+  const next =
+    budget !== null && Number.isFinite(budget) && budget > 0
+      ? Math.floor(budget)
+      : null;
+  database.writeBudget(next === null ? null : String(next));
+  return next;
+}
+
+export function setCoachAutomationPause(
+  pause: CoachAutomationPause | null,
+  database: CoachAutomationDatabase = defaultDatabase
+): CoachAutomationPause | null {
+  database.writePause(pause ? JSON.stringify(pause) : null);
+  return pause;
 }
 
 const defaultDatabase = createSqliteAutomationDatabase();
@@ -466,13 +568,24 @@ export function updateCoachAutomation(
   // at 07:00 first. Clearing the stamp makes the next tick re-seed it from the
   // new trigger. Both triggers come out of the same builder, so comparing them
   // as JSON compares values, not key order.
+  //
+  // The threshold firing state (3.3) is invalidated by the same edit and for
+  // the same reason: it records whether the *old* condition held, and a rule
+  // moved from "ramp over 30%" to "over 5%" would compare today's answer
+  // against a question nobody is asking any more. Clearing it back to "never
+  // evaluated" makes the next tick re-seed — so an edit, like an attach, is
+  // silent rather than firing on history.
   if (
     patch.trigger !== undefined &&
     JSON.stringify(next.trigger) !== JSON.stringify(current.trigger)
   ) {
     for (const binding of database.listBindings(id)) {
-      if (binding.next_run_at !== null) {
-        database.updateBinding({ ...binding, next_run_at: null });
+      if (binding.next_run_at !== null || binding.threshold_firing !== null) {
+        database.updateBinding({
+          ...binding,
+          next_run_at: null,
+          threshold_firing: null
+        });
       }
     }
   }
@@ -564,6 +677,21 @@ function toBinding(row: CoachAutomationBindingRow): CoachAutomationBinding {
   ) {
     binding.lastActivityAt = row.last_activity_at;
   }
+  // 3.3: NULL means this binding has never been evaluated, which is a
+  // different thing from "the condition was false" — it is what stops a
+  // binding attached today firing on a condition that has held all week.
+  if (row.threshold_firing !== null && row.threshold_firing !== undefined) {
+    binding.thresholdFiring = row.threshold_firing === 1;
+  }
+  const backoffUntil = optionalText(row.backoff_until);
+  if (backoffUntil) {
+    binding.backoffUntil = backoffUntil;
+  }
+  // Level 0 is the same statement as "no level", and a row that says neither is
+  // one written before the columns existed — all three read as healthy.
+  if (typeof row.backoff_level === "number" && row.backoff_level > 0) {
+    binding.backoffLevel = row.backoff_level;
+  }
   return binding;
 }
 
@@ -581,6 +709,10 @@ function toBindingRow(
     last_run_at: binding.lastRunAt ?? null,
     next_run_at: binding.nextRunAt ?? null,
     last_activity_at: binding.lastActivityAt ?? null,
+    backoff_until: binding.backoffUntil ?? null,
+    backoff_level: binding.backoffLevel ?? 0,
+    threshold_firing:
+      binding.thresholdFiring === undefined ? null : binding.thresholdFiring ? 1 : 0,
     created_at: binding.createdAt
   };
 }
@@ -841,13 +973,22 @@ export function setCoachAutomationBindingSession(
   return nextRow ? toBinding(nextRow) : null;
 }
 
-/** Stamps the last/next run slots the scheduler keeps per binding (3.1). */
+/**
+ * Stamps the clocks a binding keeps for itself: the scheduler's last/next slots
+ * (3.1), the activity watermark (3.2) and the failure backoff (10). Every key
+ * is optional and an absent one is left alone, so a caller that only knows one
+ * of them never has to read the row first.
+ */
 export function setCoachAutomationBindingSchedule(
   bindingId: string,
   schedule: {
     lastRunAt?: string | null;
     nextRunAt?: string | null;
     lastActivityAt?: number | null;
+    backoffUntil?: string | null;
+    backoffLevel?: number | null;
+    /** 3.3: null resets a binding to "never evaluated". */
+    thresholdFiring?: boolean | null;
   },
   database: CoachAutomationDatabase = defaultDatabase
 ): CoachAutomationBinding | null {
@@ -868,7 +1009,23 @@ export function setCoachAutomationBindingSchedule(
     last_activity_at:
       schedule.lastActivityAt === undefined
         ? row.last_activity_at
-        : schedule.lastActivityAt
+        : schedule.lastActivityAt,
+    backoff_until:
+      schedule.backoffUntil === undefined
+        ? row.backoff_until
+        : optionalText(schedule.backoffUntil) ?? null,
+    backoff_level:
+      schedule.backoffLevel === undefined
+        ? row.backoff_level
+        : schedule.backoffLevel ?? 0,
+    threshold_firing:
+      schedule.thresholdFiring === undefined
+        ? row.threshold_firing
+        : schedule.thresholdFiring === null
+          ? null
+          : schedule.thresholdFiring
+            ? 1
+            : 0
   });
   const nextRow = database.getBinding(bindingId);
   return nextRow ? toBinding(nextRow) : null;
@@ -987,6 +1144,14 @@ function toRun(row: CoachAutomationRunRow): CoachAutomationRun {
       (run as unknown as Record<string, unknown>)[key] = text;
     }
   }
+  // Zero is a real answer here — a cancelled run that never reached the model
+  // genuinely cost nothing — so these are read on nullness, not truthiness.
+  if (typeof row.input_tokens === "number" && Number.isFinite(row.input_tokens)) {
+    run.inputTokens = row.input_tokens;
+  }
+  if (typeof row.output_tokens === "number" && Number.isFinite(row.output_tokens)) {
+    run.outputTokens = row.output_tokens;
+  }
   return run;
 }
 
@@ -1007,6 +1172,8 @@ function toRunRow(run: CoachAutomationRun): CoachAutomationRunRow {
     error: run.error ?? null,
     skip_reason: run.skipReason ?? null,
     seen_at: run.seenAt ?? null,
+    input_tokens: run.inputTokens ?? null,
+    output_tokens: run.outputTokens ?? null,
     started_at: run.startedAt,
     finished_at: run.finishedAt ?? null
   };

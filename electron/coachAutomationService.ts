@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { BrowserWindow } from "electron";
 import {
   cancelChat,
@@ -23,9 +24,18 @@ import {
   setCoachAutomationBindingEnabled,
   setCoachAutomationBindingSchedule,
   setCoachAutomationBindingSession,
+  getCoachAutomationBudget,
+  getCoachAutomationPause,
+  setCoachAutomationBudget,
+  setCoachAutomationPause,
   updateCoachAutomationRun
 } from "./coachAutomationStore";
-import { listCoachActivityRowsAfter } from "./database";
+import {
+  getChatSessionCoachSummaryRow,
+  listCoachActivityRowsAfter,
+  setChatSessionCoachSummaryRow,
+  sumCoachAutomationTokensSince
+} from "./database";
 import type { CoachUnseenActivityRow as CoachActivityRow } from "./database";
 import { getTrainingHubStatus, reconnectTrainingHub } from "./trainingHubService";
 import { corosSportName } from "./corosSportTypes";
@@ -33,15 +43,19 @@ import { AUTOMATION_DEFAULT_EFFORT, NOTHING_TO_REPORT } from "./types";
 import type {
   AnthropicEffort,
   AutomationRuntime,
+  ClaudeCodeConnectionState,
   AutomationTriggerKind,
   ChatEntryAutomationMarker,
   ChatMessage,
   ChatProvider,
   CoachAutomation,
   CoachAutomationBinding,
+  CoachAutomationPause,
   CoachAutomationRun,
   CoachAutomationRunQuery,
-  PersistedChatEntry
+  CoachAutomationSpend,
+  PersistedChatEntry,
+  ProviderAuthVerdict
 } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -305,6 +319,8 @@ export type AutomationSkipReason =
   | "budget"
   | "burst"
   | "batch-window"
+  /** Held off after a failed run, until this binding's backoff expires (10). */
+  | "backoff"
   /** Activity-driven, but nothing new to analyse since this binding's watermark. */
   | "no-activity"
   /** Schedule-driven: the slot came due more than a day ago (3.1). */
@@ -312,6 +328,21 @@ export type AutomationSkipReason =
 
 /** 2.3: at most this many automation messages land in one conversation per hour. */
 export const SESSION_BURST_PER_HOUR = 5;
+
+/**
+ * Section 10's per-binding backoff: how long a binding is held off after its
+ * first, second and third consecutive failure. The last step is also the
+ * ceiling — a provider that has been dead for three hours is not more dead at
+ * four, and an hour is already long enough that the athlete notices the silence
+ * rather than the retries.
+ *
+ * The reason it exists at all is that a `failed` run deliberately leaves
+ * `lastRunAt` and the activity watermark where they were, so the work is not
+ * lost. Nothing else then slows the retry down: an activity trigger against a
+ * dead provider would re-offer the same activity on every 15-minute poll,
+ * forever.
+ */
+export const AUTOMATION_BACKOFF_STEPS_MS = [5 * 60_000, 15 * 60_000, 60 * 60_000];
 
 function minutesToMs(minutes: number): number {
   return minutes * 60_000;
@@ -352,6 +383,110 @@ function startOfLocalDay(now: Date): Date {
   return start;
 }
 
+/**
+ * The athlete's month, on their wall clock, as the ISO stamp a run row is
+ * compared against. A budget is something a person plans around, so it rolls
+ * over when their calendar says so rather than at UTC midnight on the 1st.
+ */
+export function startOfLocalMonth(now: Date): string {
+  const start = new Date(now);
+  start.setDate(1);
+  start.setHours(0, 0, 0, 0);
+  return start.toISOString();
+}
+
+/**
+ * 13: whether the automations have spent their month's allowance.
+ *
+ * `>=` rather than `>`: a budget of 500k means five hundred thousand tokens are
+ * what the athlete agreed to, and the run that would take them past it has not
+ * been paid for. A ceiling that lets one more run through every time is not a
+ * ceiling.
+ */
+export function isOverBudget(spent: number, budget: number | null): boolean {
+  return budget !== null && budget > 0 && spent >= budget;
+}
+
+/**
+ * The same question, asked of the deps — and asked in the order that matters.
+ *
+ * The ceiling is read first because the total is a SUM over the whole run log
+ * and no ceiling is the default: without this, every athlete who never set a
+ * budget pays for that scan on every run to discard the answer.
+ */
+function overBudget(deps: CoachAutomationRunnerDeps): boolean {
+  const budget = deps.getBudget();
+  if (budget === null || budget <= 0) {
+    return false;
+  }
+  return isOverBudget(deps.getMonthToDateTokens(), budget);
+}
+
+// ---------------------------------------------------------------------------
+// Guard rail 3: can this provider be asked at all?
+// ---------------------------------------------------------------------------
+
+/**
+ * Everything the pre-flight reads, so the decision itself is pure and can be
+ * driven through every provider without a chat service behind it.
+ *
+ * Every field is a **local** read — a stored OAuth token, the CLI state the app
+ * recorded last time it looked, a key in the keychain, a configured model. None
+ * of it is a network call, and that is a rule rather than an accident: a
+ * pre-flight that reached out would be a second way for a run to hang, on the
+ * one path that already learned what that costs (the idle bound).
+ */
+export interface ProviderAuthInputs {
+  chatgptSignedIn: boolean;
+  /** What the app recorded the last time it inspected the CLI; may be unseen. */
+  claudeCodeState?: ClaudeCodeConnectionState;
+  anthropicHasApiKey: boolean;
+  localModel: string;
+}
+
+/**
+ * Guard rail 3, for every provider rather than only ChatGPT.
+ *
+ * The states that decline are the ones that are both **unambiguous and
+ * stable**: a CLI that is not installed or not signed in will still not be
+ * either in fifteen minutes. Everything else is allowed through and left to the
+ * stream, which reports auth failure the way it always did — `connecting` is in
+ * flight, `connection-failed` may be a network that has since come back, and a
+ * `claude-code` state the app has *never* recorded is the shape of a fresh
+ * install whose Coach view nobody has opened yet. Declining on unknown would
+ * hold every automation on a machine where nothing is actually wrong.
+ */
+export function checkProviderAuth(
+  provider: ChatProvider,
+  inputs: ProviderAuthInputs
+): ProviderAuthVerdict {
+  if (provider === "chatgpt") {
+    return inputs.chatgptSignedIn
+      ? { ok: true }
+      : { ok: false, reason: "ChatGPT is not signed in." };
+  }
+  if (provider === "claude-code") {
+    if (inputs.claudeCodeState === "sign-in-required") {
+      return { ok: false, reason: "Claude Code is not signed in." };
+    }
+    if (inputs.claudeCodeState === "not-installed") {
+      return { ok: false, reason: "The Claude Code CLI is not installed." };
+    }
+    return { ok: true };
+  }
+  if (provider === "claude-api") {
+    return inputs.anthropicHasApiKey
+      ? { ok: true }
+      : { ok: false, reason: "No Anthropic API key is stored." };
+  }
+  // A local server needs no sign-in, but with no model chosen there is nothing
+  // to ask. That is the same class of answer — this run cannot start — and the
+  // athlete fixes it in the same place.
+  return inputs.localModel.trim()
+    ? { ok: true }
+    : { ok: false, reason: "No local model is configured." };
+}
+
 // ---------------------------------------------------------------------------
 // Injectable dependencies
 // ---------------------------------------------------------------------------
@@ -368,6 +503,8 @@ export interface CoachAutomationRunnerDeps {
       lastRunAt?: string | null;
       nextRunAt?: string | null;
       lastActivityAt?: number | null;
+      backoffUntil?: string | null;
+      backoffLevel?: number | null;
     }
   ): void;
   setBindingSession(bindingId: string, sessionId: string): void;
@@ -385,14 +522,34 @@ export interface CoachAutomationRunnerDeps {
   ): CoachAutomationRun | null;
   /** Undefined when the conversation no longer exists (2.4). */
   getSessionEntries(sessionId: string): PersistedChatEntry[] | undefined;
+  /** 5.7: the conversation's rolling summary and what it covers. */
+  getSessionSummary(sessionId: string): StoredTranscriptSummary;
+  setSessionSummary(sessionId: string, summary: string, through: number): void;
+  /**
+   * 5.7: folds entries into the running summary. Null when it could not — a
+   * roll is best-effort, and the run it is preparing for still has to happen.
+   */
+  rollSummary(
+    previous: string | undefined,
+    entries: PersistedChatEntry[]
+  ): Promise<string | null>;
   createSession(provider: ChatProvider): string;
   saveSession(sessionId: string, entries: PersistedChatEntry[]): void;
   setSessionTitle(sessionId: string, title: string): void;
   getChatProvider(): ChatProvider;
-  isProviderAuthenticated(provider: ChatProvider): boolean;
+  /** Guard rail 3, per provider (see `checkProviderAuth`). */
+  checkProviderAuth(provider: ChatProvider): ProviderAuthVerdict;
   ensureCorosSession(): Promise<
     { ok: true } | { ok: false; twoFactorRequired: boolean }
   >;
+  /** Whether COROS credentials are on disk — a local read, never a request. */
+  corosAuthenticated(): boolean;
+  getPause(): CoachAutomationPause | null;
+  setPause(pause: CoachAutomationPause | null): void;
+  /** 13: the monthly ceiling in tokens, or null for none. */
+  getBudget(): number | null;
+  /** Tokens spent by automations since the start of the current local month. */
+  getMonthToDateTokens(): number;
   createCollector(marker: ChatEntryAutomationMarker): ChatStreamCollectorSink;
   streamChat(
     sink: ChatStreamSink,
@@ -417,6 +574,15 @@ export interface CoachAutomationRunnerDeps {
  */
 export function emitAutomationRunUpdate(run: CoachAutomationRun): void {
   emitToAnyWindow("coachAutomation:runUpdate", run);
+}
+
+/**
+ * Section 10's pause, on the wire. Like a run update it may happen with no
+ * window open at all — the trip is a scheduled run finding COROS locked at
+ * 07:30 — so the banner reads the flag on mount and follows this afterwards.
+ */
+export function emitAutomationPauseUpdate(pause: CoachAutomationPause | null): void {
+  emitToAnyWindow("coachAutomation:pauseUpdate", pause);
 }
 
 /**
@@ -455,6 +621,68 @@ function createDefaultDeps(): CoachAutomationRunnerDeps {
       if (!chatSessionExists(sessionId)) return undefined;
       return getChatSession(sessionId);
     },
+    getSessionSummary: (sessionId) => {
+      const row = getChatSessionCoachSummaryRow(sessionId);
+      const summary = row?.coach_summary?.trim();
+      return {
+        ...(summary ? { summary } : {}),
+        through:
+          typeof row?.coach_summary_through === "number" &&
+          Number.isFinite(row.coach_summary_through)
+            ? row.coach_summary_through
+            : 0
+      };
+    },
+    setSessionSummary: (sessionId, summary, through) => {
+      setChatSessionCoachSummaryRow(sessionId, summary, through);
+    },
+    rollSummary: async (previous, entries) => {
+      // Its own request id, not the run's: this happens while the run is being
+      // prepared and has no row yet, so there is nothing for Stop to aim at.
+      // The bound below is what ends it either way.
+      const requestId = `coach-summary-${randomUUID()}`;
+      const collector = createCollectorSink();
+      const watchdog = createIdleWatchdog(AUTOMATION_IDLE_TIMEOUT_MS);
+      const sink: ChatStreamSink = {
+        emit(channel, payload) {
+          watchdog.touch();
+          collector.emit(channel, payload);
+        }
+      };
+      try {
+        const streaming = streamChat(
+          sink,
+          requestId,
+          [{ role: "user", content: buildRollingSummaryTurn(previous, entries) }],
+          {
+            // Nothing to look up: it is compressing text it was handed, and a
+            // tool round-trip here is both slower and a way to wander off.
+            toolPolicy: "none",
+            runtime: { effort: AUTOMATION_DEFAULT_EFFORT }
+          }
+        );
+        streaming.catch(() => undefined);
+        let timedOut = false;
+        await Promise.race([
+          streaming,
+          watchdog.expired.then(() => {
+            timedOut = true;
+          })
+        ]);
+        if (timedOut) {
+          cancelChat(requestId);
+          return null;
+        }
+        if (collector.error() || collector.cancelled()) {
+          return null;
+        }
+        return collector.text().trim() || null;
+      } catch {
+        return null;
+      } finally {
+        watchdog.stop();
+      }
+    },
     createSession: (provider) => createChatSession(provider).id,
     saveSession: (sessionId, entries) => {
       saveChatSession(sessionId, entries);
@@ -463,11 +691,17 @@ function createDefaultDeps(): CoachAutomationRunnerDeps {
       setChatSessionTitle(sessionId, title);
     },
     getChatProvider: () => getChatSettings().provider,
-    isProviderAuthenticated: (provider) =>
-      // Only ChatGPT's sign-in is inspectable from here; the other providers
-      // report their auth state through the stream, which the runner maps to a
-      // "no-auth" skip when it comes back flagged.
-      provider === "chatgpt" ? getChatAuthStatus().signedIn : true,
+    checkProviderAuth: (provider) => {
+      const settings = getChatSettings();
+      return checkProviderAuth(provider, {
+        chatgptSignedIn: getChatAuthStatus().signedIn,
+        ...(settings.claudeCode.lastConnectionStatus
+          ? { claudeCodeState: settings.claudeCode.lastConnectionStatus }
+          : {}),
+        anthropicHasApiKey: settings.anthropic.hasApiKey,
+        localModel: settings.local.model
+      });
+    },
     ensureCorosSession: async () => {
       if (getTrainingHubStatus().authenticated) {
         return { ok: true };
@@ -483,6 +717,17 @@ function createDefaultDeps(): CoachAutomationRunnerDeps {
       } catch {
         return { ok: false, twoFactorRequired: false };
       }
+    },
+    corosAuthenticated: () => getTrainingHubStatus().authenticated,
+    getBudget: () => getCoachAutomationBudget(),
+    getMonthToDateTokens: () => {
+      const totals = sumCoachAutomationTokensSince(startOfLocalMonth(new Date()));
+      return totals.inputTokens + totals.outputTokens;
+    },
+    getPause: () => getCoachAutomationPause(),
+    setPause: (pause) => {
+      setCoachAutomationPause(pause);
+      emitAutomationPauseUpdate(pause);
     },
     createCollector: (marker) => createCollectorSink(marker),
     streamChat: (sink, runId, messages, options) =>
@@ -568,6 +813,81 @@ function enqueue<T>(task: () => Promise<T>): Promise<T> {
 }
 
 // ---------------------------------------------------------------------------
+// Cancelling a whole trigger (10)
+// ---------------------------------------------------------------------------
+
+/**
+ * One fan-out's worth of "stop".
+ *
+ * Stop reaches the provider through the abort map, which is keyed by run id, so
+ * on its own it ends exactly one run — and a trigger fans out to one run per
+ * place (2.3), awaited in turn. Stopping a three-place fan-out therefore took
+ * three presses, and the presses in between had nothing to aim at: the runs
+ * they were meant to stop had not started, so they had no id yet.
+ *
+ * The token is the thing the fan-out is stopped by. `runAutomationTrigger`
+ * checks it between the steps of its plan, and every run it produces is claimed
+ * by it, so Stop on any one of those runs finds the whole trigger — including
+ * the run sitting in the process-wide queue behind a stall.
+ */
+interface TriggerCancellation {
+  cancelled(): boolean;
+  /** Ends the fan-out and aborts whatever it has in flight. */
+  cancel(): void;
+  /** Records a run as this fan-out's, so Stop on it reaches the token. */
+  claim(runId: string): void;
+  owns(runId: string): boolean;
+}
+
+/** Fan-outs in flight right now, so a Stop on one run can find its trigger. */
+const liveTriggers = new Set<TriggerCancellation>();
+
+function createTriggerCancellation(
+  deps: CoachAutomationRunnerDeps
+): TriggerCancellation {
+  const runIds = new Set<string>();
+  let stopped = false;
+  return {
+    cancelled: () => stopped,
+    cancel: () => {
+      stopped = true;
+      // Whatever is streaming right now is one of these; the rest have already
+      // finished, and aborting a finished run is a no-op on the abort map.
+      for (const runId of runIds) {
+        deps.cancelRun(runId);
+      }
+    },
+    claim: (runId) => {
+      runIds.add(runId);
+    },
+    owns: (runId) => runIds.has(runId)
+  };
+}
+
+/**
+ * The Stop control, from any of the three surfaces (10). The athlete pressed it
+ * on one run, but what they meant is "stop this" — so the trigger that produced
+ * the run is ended, not just the stream it happens to be on.
+ */
+export function cancelAutomationRun(
+  runId: string,
+  deps?: Partial<CoachAutomationRunnerDeps>
+): void {
+  let owned = false;
+  for (const token of liveTriggers) {
+    if (token.owns(runId)) {
+      owned = true;
+      token.cancel();
+    }
+  }
+  // No live trigger owns it: a stream left settling in its own time after a
+  // timeout outlives the fan-out that started it, and is still worth aborting.
+  if (!owned) {
+    resolveDeps(deps).cancelRun(runId);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Running one binding
 // ---------------------------------------------------------------------------
 
@@ -575,7 +895,9 @@ function skip(
   queued: QueuedRun,
   reason: AutomationSkipReason,
   deps: CoachAutomationRunnerDeps,
-  sessionId?: string
+  sessionId?: string,
+  /** The reason in words, where the code alone would not say enough. */
+  error?: string
 ): CoachAutomationRun {
   const startedAt = deps.now().toISOString();
   const run = deps.recordRun({
@@ -586,7 +908,8 @@ function skip(
     skipReason: reason,
     finishedAt: startedAt,
     ...(queued.event.payload ? { triggerPayload: queued.event.payload } : {}),
-    ...(sessionId ? { sessionId } : {})
+    ...(sessionId ? { sessionId } : {}),
+    ...(error ? { error } : {})
   });
   deps.emitRunUpdate(run);
   return run;
@@ -603,6 +926,26 @@ function checkRateGuards(
 
   if (event.bypassGuards) {
     return null;
+  }
+
+  // 13. Before the backoff, because it is the one refusal here that is
+  // about the athlete's money rather than about this binding's luck — and the
+  // only one that will not fix itself with time inside the month.
+  if (overBudget(deps)) {
+    return "budget";
+  }
+
+  // Backoff comes first because it outlives the others and explains more: a
+  // binding that is both inside quiet hours and backed off is backed off for a
+  // reason the athlete can act on, and the run log should say so.
+  //
+  // Unlike the cooldown below, this is checked at every step of a catch-up
+  // sequence rather than only the first. A failure part-way through a sequence
+  // is exactly the storm being prevented, and a `skipped` run ends the sequence
+  // (see `runAutomationTrigger`), so the leftovers ride along with the trigger
+  // after the backoff expires.
+  if (binding.backoffUntil && now.getTime() < Date.parse(binding.backoffUntil)) {
+    return "backoff";
   }
 
   if (isWithinQuietHours(now, automation.conditions.quietHours)) {
@@ -640,6 +983,49 @@ function checkRateGuards(
   }
 
   return null;
+}
+
+/**
+ * Section 10's backoff, applied to whatever the run turned out to be.
+ *
+ * A failure steps the binding through `AUTOMATION_BACKOFF_STEPS_MS` and stays
+ * on the last one; anything that reached the provider and did not fail clears
+ * the streak. A *skip* does neither, and that is deliberate rather than an
+ * omission: a skip never got as far as the provider, so it says nothing about
+ * whether the provider is alive — and a `backoff` skip clearing the backoff
+ * would be a guard rail that switches itself off on its first use.
+ *
+ * `binding` is the row as it stood when the run started, which is the right
+ * base: runs are serialised process-wide (5.4), so nothing else can have
+ * touched this binding's streak in between.
+ */
+function applyBackoff(
+  binding: CoachAutomationBinding,
+  status: CoachAutomationRun["status"] | undefined,
+  deps: CoachAutomationRunnerDeps
+): void {
+  if (status === "failed") {
+    const level = Math.min(
+      (binding.backoffLevel ?? 0) + 1,
+      AUTOMATION_BACKOFF_STEPS_MS.length
+    );
+    deps.setBindingSchedule(binding.id, {
+      backoffLevel: level,
+      backoffUntil: new Date(
+        deps.now().getTime() + AUTOMATION_BACKOFF_STEPS_MS[level - 1]
+      ).toISOString()
+    });
+    return;
+  }
+  if (status !== "success" && status !== "silent" && status !== "cancelled") {
+    return;
+  }
+  // Nothing is written for a binding that had no streak to clear: a healthy
+  // automation must not rewrite its own row on every run.
+  if (binding.backoffLevel === undefined && binding.backoffUntil === undefined) {
+    return;
+  }
+  deps.setBindingSchedule(binding.id, { backoffLevel: 0, backoffUntil: null });
 }
 
 /**
@@ -723,6 +1109,128 @@ function toWireMessages(entries: PersistedChatEntry[]): ChatMessage[] {
       ? [{ role: entry.role, content: entry.content }]
       : []
   );
+}
+
+// ---------------------------------------------------------------------------
+// Context trimming (5.7)
+// ---------------------------------------------------------------------------
+
+/**
+ * 5.7: how far a transcript may run past what the summary already covers
+ * before the runner rolls it forward.
+ *
+ * The count is measured from the summary, not from the start of the
+ * conversation, and that is the difference between this and a fixed window. A
+ * fixed "always send the last 20" would need the summary re-rolled on **every**
+ * run, because every run adds two entries to the head. Rolling once every
+ * `LIMIT - KEEP` runs instead is cheaper — a run is a model call and so is a
+ * roll — and, more importantly, less lossy: a summary re-summarised forty times
+ * a year is forty rounds of compression, and what survives is whatever
+ * happened to be in the last one.
+ */
+export const AUTOMATION_CONTEXT_LIMIT = 60;
+
+/** How many recent entries survive a roll and go to the model verbatim. */
+export const AUTOMATION_CONTEXT_KEEP = 20;
+
+/** What the runner has stored about a conversation's summary, if anything. */
+export interface StoredTranscriptSummary {
+  summary?: string;
+  /** Entries at the head of the transcript the summary accounts for. */
+  through: number;
+}
+
+export interface TranscriptContextPlan {
+  /** Sent ahead of the tail, standing in for everything before it. */
+  summary?: string;
+  /** Sent verbatim. */
+  tail: PersistedChatEntry[];
+  /** Entries that have to be folded into the summary first; usually empty. */
+  toSummarise: PersistedChatEntry[];
+  /** What `through` becomes once they are folded in. */
+  through: number;
+}
+
+/**
+ * What of a transcript this run should send, and what has to be folded into the
+ * summary first. Pure: the folding itself is a model call and belongs to the
+ * caller.
+ *
+ * A `through` past the end of the transcript describes a conversation that is
+ * no longer there, so the summary is abandoned rather than trusted. It should
+ * not happen — the window's saves merge rather than truncate (5.6b), and a
+ * deleted conversation takes its row with it — but a summary that claims to
+ * cover entries nobody can see is the one failure here that cannot be noticed
+ * by reading the result.
+ */
+export function planTranscriptContext(
+  entries: PersistedChatEntry[],
+  stored: StoredTranscriptSummary
+): TranscriptContextPlan {
+  const valid = stored.through >= 0 && stored.through <= entries.length;
+  const through = valid ? stored.through : 0;
+  const summary = valid ? stored.summary : undefined;
+
+  const live = entries.length - through;
+  if (live <= AUTOMATION_CONTEXT_LIMIT) {
+    return {
+      ...(summary ? { summary } : {}),
+      tail: entries.slice(through),
+      toSummarise: [],
+      through
+    };
+  }
+
+  const nextThrough = entries.length - AUTOMATION_CONTEXT_KEEP;
+  return {
+    ...(summary ? { summary } : {}),
+    tail: entries.slice(nextThrough),
+    toSummarise: entries.slice(through, nextThrough),
+    through: nextThrough
+  };
+}
+
+/**
+ * How the summary reaches the model. A plain user turn, labelled, rather than
+ * anything provider-specific: it has to read the same way to four providers,
+ * and it has to be obvious to the model that this is a compression of the
+ * conversation rather than something the athlete just said.
+ */
+export function summaryContextMessage(summary: string): ChatMessage {
+  return {
+    role: "user",
+    content: [
+      "[Earlier in this conversation, summarised]",
+      summary,
+      "[End of summary. The messages that follow are the recent turns in full.]"
+    ].join("\n\n")
+  };
+}
+
+/** The turn that folds new entries into the running summary. */
+export function buildRollingSummaryTurn(
+  previous: string | undefined,
+  entries: PersistedChatEntry[]
+): string {
+  const transcript = toWireMessages(entries)
+    .map((message) => `${message.role === "user" ? "Athlete" : "Coach"}: ${message.content}`)
+    .join("\n\n");
+  return [
+    previous
+      ? "Here is the running summary of a coaching conversation so far, followed by the turns that have happened since it was written."
+      : "Here are the opening turns of a coaching conversation.",
+    ...(previous ? ["", "--- Running summary ---", previous] : []),
+    "",
+    "--- Newer turns ---",
+    transcript,
+    "",
+    "Rewrite the running summary so it covers everything above, including the",
+    "newer turns. It is the only record of these turns the coach will have on",
+    "future runs, so keep what a coach would need: the athlete's goals, races,",
+    "injuries and constraints, decisions taken, and how the training has",
+    "actually gone. Drop pleasantries and anything already superseded. Write it",
+    "as notes, not as a letter, and reply with the summary and nothing else."
+  ].join("\n");
 }
 
 /** The 2.5 variables, resolved once from the run's own trigger payload. */
@@ -814,12 +1322,23 @@ function createIdleWatchdog(timeoutMs: number): IdleWatchdog {
   };
 }
 
+/**
+ * Returns null when the fan-out was stopped before this run began — including
+ * while it waited its turn in the process-wide queue behind a stall (5.4).
+ * Nothing was recorded, so there is nothing to log: a run log full of rows for
+ * runs that never happened is not what Stop means.
+ */
 async function runOneBinding(
   queued: QueuedRun,
-  deps?: Partial<CoachAutomationRunnerDeps>
-): Promise<CoachAutomationRun> {
+  deps?: Partial<CoachAutomationRunnerDeps>,
+  cancellation?: TriggerCancellation
+): Promise<CoachAutomationRun | null> {
   const resolved = resolveDeps(deps);
   const { automation, event } = queued;
+
+  if (cancellation?.cancelled()) {
+    return null;
+  }
 
   // The binding was snapshotted when the trigger fanned out, and a catch-up
   // sequence writes to it between runs (its clock, its activity watermark), so
@@ -854,28 +1373,64 @@ async function runOneBinding(
     return skip(step, "no-activity", resolved, knownSessionId);
   }
 
-  // 3. Chat provider authenticated.
+  // 3. Chat provider usable, for every provider rather than only ChatGPT.
+  // The verdict's reason rides along on the row: "not signed in" is the common
+  // case but not the only one, and a run log that cannot tell a missing API key
+  // from a missing CLI sends the athlete to the wrong screen.
   const provider = automation.runtime.provider ?? resolved.getChatProvider();
-  if (!resolved.isProviderAuthenticated(provider)) {
-    return skip(step, "no-auth", resolved, knownSessionId);
+  const auth = resolved.checkProviderAuth(provider);
+  if (!auth.ok) {
+    return skip(step, "no-auth", resolved, knownSessionId, auth.reason);
   }
 
   // 4. COROS session usable.
   const coros = await resolved.ensureCorosSession();
   if (!coros.ok) {
-    return skip(
-      step,
-      coros.twoFactorRequired ? "two-factor-required" : "offline",
-      resolved,
-      knownSessionId
-    );
+    if (!coros.twoFactorRequired) {
+      return skip(step, "offline", resolved, knownSessionId);
+    }
+    // One skip explains it, and the pause is what stops the next fifteen from
+    // repeating it (10). *Every* automation is held, not this binding: what has
+    // to happen is one login code, and no binding can supply it.
+    const held = skip(step, "two-factor-required", resolved, knownSessionId);
+    resolved.setPause({
+      reason: "two-factor-required",
+      since: resolved.now().toISOString(),
+      runId: held.id
+    });
+    return held;
+  }
+
+  // COROS answered, so whatever was locking *it* is unlocked. A pause that
+  // outlives its cause is worse than no pause at all: it is a feature that has
+  // quietly switched itself off and has nothing to say about it.
+  //
+  // Only its own cause, though. A budget pause is about the athlete's money and
+  // a working COROS session says nothing about it — and this line is reachable
+  // with one up, because "Run now" bypasses the gate that would otherwise have
+  // held this run (13). Clearing it here would take the banner down and let one
+  // more unattended run through before guard rail 4b put it back.
+  if (resolved.getPause()?.reason === "two-factor-required") {
+    resolved.setPause(null);
   }
 
   // 5-8. Rate guards. A conversation that does not exist yet cannot be busy,
   // so the burst guard only applies to one the binding already writes into.
   const rateSkip = checkRateGuards(step, knownSessionId ?? null, resolved);
   if (rateSkip) {
-    return skip(step, rateSkip, resolved, knownSessionId);
+    const declined = skip(step, rateSkip, resolved, knownSessionId);
+    if (rateSkip === "budget") {
+      // 13, the same shape as the 2FA demand of section 10: the
+      // month's allowance is one fact about every automation the athlete has,
+      // and one skip per binding per poll until the 1st is the run log this
+      // already learned not to fill.
+      resolved.setPause({
+        reason: "budget",
+        since: resolved.now().toISOString(),
+        runId: declined.id
+      });
+    }
+    return declined;
   }
 
   // Every guard passed: only now is it worth putting a conversation on disk.
@@ -887,6 +1442,27 @@ async function runOneBinding(
           sessionId: createTargetSession(step, resolved),
           entries: [] as PersistedChatEntry[]
         };
+
+  // 5.7: a year-old briefing thread must still cost one turn. Done here, while
+  // the run is still being prepared, so the mid-preparation Stop check below
+  // covers the window a roll opens — a roll is itself a model call.
+  const stored = resolved.getSessionSummary(session.sessionId);
+  const plan = planTranscriptContext(session.entries, stored);
+  let summary = plan.summary;
+  let tail = plan.tail;
+  if (plan.toSummarise.length) {
+    const rolled = await resolved.rollSummary(plan.summary, plan.toSummarise);
+    if (rolled) {
+      summary = rolled;
+      resolved.setSessionSummary(session.sessionId, rolled, plan.through);
+    } else {
+      // Best-effort, and a failure must neither fail the run nor drop the
+      // middle of the conversation on the floor. The run sends what it would
+      // have sent before the roll — everything the stored summary does not
+      // already cover — which costs more this once and rolls again next time.
+      tail = [...plan.toSummarise, ...plan.tail];
+    }
+  }
 
   // Section 7's default is resolved once, here, so the run log records what the
   // run actually used rather than what the definition happened to leave blank.
@@ -903,6 +1479,9 @@ async function runOneBinding(
     ...(event.payload ? { triggerPayload: event.payload } : {}),
     startedAt
   } as Omit<CoachAutomationRun, "id" | "startedAt">);
+  // The run now has an id, which is the only thing Stop can aim at. Claiming it
+  // is what turns a Stop on this run into a Stop on the whole trigger.
+  cancellation?.claim(run.id);
   resolved.emitRunUpdate(run);
 
   const marker: ChatEntryAutomationMarker = {
@@ -919,8 +1498,21 @@ async function runOneBinding(
   const sink = createTeeSink(collector, watchdog.touch);
 
   const finish = (
-    patch: Partial<Omit<CoachAutomationRun, "id" | "automationId" | "bindingId">>
+    patch: Partial<Omit<CoachAutomationRun, "id" | "automationId" | "bindingId">>,
+    /**
+     * False for the one exit taken before the provider was ever called. The
+     * backoff is a claim about the provider, and a run that did not reach it
+     * has nothing to say either way — least of all "it is healthy again".
+     */
+    reachedProvider = true
   ): CoachAutomationRun => {
+    // Every other way out of this run goes through here, which is what makes
+    // the backoff cover the timeout as well as the throw — the two paths
+    // section 10 says must behave alike, and the two that leave the other
+    // clocks alone.
+    if (reachedProvider) {
+      applyBackoff(binding, patch.status, resolved);
+    }
     const finished =
       resolved.updateRun(run.id, {
         ...patch,
@@ -930,12 +1522,24 @@ async function runOneBinding(
     return finished;
   };
 
+  // Stop may have landed while the COROS check above was in flight. The run row
+  // exists by now, so it is finished rather than dropped — but nothing was ever
+  // asked of the provider, so this must not clear a backoff streak: an athlete
+  // pressing Stop would otherwise reset the hold on a binding that is failing.
+  if (cancellation?.cancelled()) {
+    return finish({ status: "cancelled" }, false);
+  }
+
   let timedOut = false;
   try {
     const streaming = resolved.streamChat(
       sink,
       run.id,
-      [...toWireMessages(session.entries), { role: "user", content: playbook }],
+      [
+        ...(summary ? [summaryContextMessage(summary)] : []),
+        ...toWireMessages(tail),
+        { role: "user", content: playbook }
+      ],
       {
         runtime,
         toolPolicy: "read-only",
@@ -982,14 +1586,32 @@ async function runOneBinding(
   });
 
   if (collector.error()) {
+    const usage = collector.usage();
+    const errorCost = usage
+      ? { inputTokens: usage.inputTokens, outputTokens: usage.outputTokens }
+      : {};
     return finish(
       collector.authError()
-        ? { status: "skipped", skipReason: "no-auth", error: collector.error() }
-        : { status: "failed", error: collector.error() }
+        ? {
+            status: "skipped",
+            skipReason: "no-auth",
+            error: collector.error(),
+            ...errorCost
+          }
+        : { status: "failed", error: collector.error(), ...errorCost }
     );
   }
+  // Recorded before the status branches below, so every way out of a run that
+  // reached the provider carries what it cost — a failed or cancelled run spent
+  // tokens too, and a budget that forgave those would be a budget a broken
+  // provider could run through for free.
+  const spent = collector.usage();
+  const cost = spent
+    ? { inputTokens: spent.inputTokens, outputTokens: spent.outputTokens }
+    : {};
+
   if (collector.cancelled()) {
-    return finish({ status: "cancelled" });
+    return finish({ status: "cancelled", ...cost });
   }
 
   // The binding's watermark moves only once the model has actually looked at
@@ -1028,7 +1650,7 @@ async function runOneBinding(
         at: resolved.now().getTime()
       }
     ]);
-    return finish({ status: "silent" });
+    return finish({ status: "silent", ...cost });
   }
 
   const produced = collector.entries().map((entry) =>
@@ -1045,6 +1667,7 @@ async function runOneBinding(
 
   return finish({
     status: "success",
+    ...cost,
     ...(output.summary ? { summary: output.summary } : {})
   });
 }
@@ -1107,61 +1730,200 @@ function planBindingRuns(
   }));
 }
 
-/** Fans a trigger out and runs every resulting binding, one at a time. */
+/**
+ * Section 10's pause, read at the gate rather than as a guard rail.
+ *
+ * The other guard rails record a `skipped` run each, which is right for them —
+ * a cooldown or a quiet hour is a fact about *that* binding and the log is
+ * where the athlete reads it. This one is not: it is the same fact about all of
+ * them, and recording it per binding per poll is precisely the run log full of
+ * identical `two-factor-required` rows that the pause exists to stop. So a held
+ * trigger produces no runs and logs nothing. The one row that *did* get
+ * recorded — the run that tripped it — is what the banner points at.
+ */
+function pauseHolds(
+  event: AutomationTriggerEvent,
+  deps: CoachAutomationRunnerDeps
+): boolean {
+  const pause = deps.getPause();
+  if (!pause) {
+    return false;
+  }
+  // Each reason lifts itself once its own cause is gone, which is the cause
+  // disappearing rather than a second way to resume.
+  if (pause.reason === "budget") {
+    // The month rolled over, or the athlete raised the ceiling. Either way the
+    // number that stopped everything is no longer the number.
+    if (!overBudget(deps)) {
+      deps.setPause(null);
+      return false;
+    }
+    return !event.bypassGuards;
+  }
+  // The athlete may have signed in to COROS the ordinary way, from a settings
+  // screen this banner does not own.
+  if (deps.corosAuthenticated()) {
+    deps.setPause(null);
+    return false;
+  }
+  // A manual run is the athlete asking directly, and the way they find out
+  // whether the fix took. It goes through, and either clears the pause or
+  // records the one skip that says it is still there.
+  return !event.bypassGuards;
+}
+
+/**
+ * Fans a trigger out and runs every resulting binding, one at a time.
+ *
+ * The whole fan-out is one cancellable unit (10). Stop on any run this produces
+ * ends the rest of it, which is what the athlete meant by pressing it, and what
+ * three separate presses used to be needed for.
+ */
 export async function runAutomationTrigger(
   event: AutomationTriggerEvent,
   deps?: Partial<CoachAutomationRunnerDeps>
 ): Promise<CoachAutomationRun[]> {
   const resolved = resolveDeps(deps);
-  const queue = expandTriggerToQueue(event, deps);
+  if (pauseHolds(event, resolved)) {
+    return [];
+  }
+  const cancellation = createTriggerCancellation(resolved);
+  liveTriggers.add(cancellation);
   const runs: CoachAutomationRun[] = [];
-  for (const queued of queue) {
-    const plan = planBindingRuns(queued, resolved);
-
-    if (!plan.length) {
-      // Activity-driven, with nothing new since this binding's watermark. A
-      // manual run records the skip so the UI can say so out loud; the
-      // 15-minute poll stays quiet rather than filling the log with non-events.
-      if (event.kind === "manual") {
-        runs.push(
-          skip(queued, "no-activity", resolved, queued.binding.sessionId ?? undefined)
-        );
+  let stopped = false;
+  try {
+    for (const queued of expandTriggerToQueue(event, deps)) {
+      // A shortcut, not the guard: the token is read at the top of every step
+      // (see `runOneBinding`), which is what covers a step already queued
+      // behind a stall. This only stops the fan-out queueing one dead step per
+      // remaining binding on the way out.
+      if (stopped) {
+        break;
       }
-      continue;
-    }
+      const plan = planBindingRuns(queued, resolved);
 
-    for (const step of plan) {
-      let run: CoachAutomationRun;
-      try {
-        run = await enqueue(() => runOneBinding(step, deps));
-      } catch (error) {
-        // One binding blowing up must not starve the rest of the fan-out, and
-        // the failure still has to be visible in the run log.
-        const failedAt = resolved.now().toISOString();
-        run = resolved.recordRun({
-          automationId: step.automation.id,
-          bindingId: step.binding.id,
-          status: "failed",
-          triggerKind: event.kind,
-          error: error instanceof Error ? error.message : "Automation run failed.",
-          finishedAt: failedAt
-        } as Omit<CoachAutomationRun, "id" | "startedAt">);
-        resolved.emitRunUpdate(run);
+      if (!plan.length) {
+        // Activity-driven, with nothing new since this binding's watermark. A
+        // manual run records the skip so the UI can say so out loud; the
+        // 15-minute poll stays quiet rather than filling the log with
+        // non-events.
+        if (event.kind === "manual") {
+          runs.push(
+            skip(queued, "no-activity", resolved, queued.binding.sessionId ?? undefined)
+          );
+        }
+        continue;
+      }
+
+      for (const step of plan) {
+        let run: CoachAutomationRun | null;
+        try {
+          run = await enqueue(() => runOneBinding(step, deps, cancellation));
+        } catch (error) {
+          // One binding blowing up must not starve the rest of the fan-out, and
+          // the failure still has to be visible in the run log — and count
+          // against the binding's backoff, like any other failure.
+          const failedAt = resolved.now().toISOString();
+          run = resolved.recordRun({
+            automationId: step.automation.id,
+            bindingId: step.binding.id,
+            status: "failed",
+            triggerKind: event.kind,
+            error: error instanceof Error ? error.message : "Automation run failed.",
+            finishedAt: failedAt
+          } as Omit<CoachAutomationRun, "id" | "startedAt">);
+          applyBackoff(
+            resolved.getBinding(step.binding.id) ?? step.binding,
+            "failed",
+            resolved
+          );
+          resolved.emitRunUpdate(run);
+          runs.push(run);
+          break;
+        }
+        // Stop ended the trigger while this step waited its turn in the queue.
+        if (!run) {
+          stopped = true;
+          break;
+        }
         runs.push(run);
-        break;
-      }
-      runs.push(run);
-      // A refusal applies to the whole catch-up sequence — the daily cap or
-      // quiet hours will not have changed by the next activity in the list —
-      // so stop rather than logging the same skip once per pending activity.
-      // The watermark stays put, and the leftovers ride along with the next
-      // trigger.
-      if (run.status === "skipped") {
-        break;
+        // Stop, arriving through some other route than the token — the athlete
+        // cancelling the chat request itself. It still means this fan-out.
+        if (run.status === "cancelled") {
+          stopped = true;
+          break;
+        }
+        // COROS asked for a login code, or the month's allowance is gone.
+        // Every remaining place in this fan-out would get the same answer, and
+        // the pause this run just set means the next poll will not even ask —
+        // so the log carries the one row that explains it rather than one per
+        // binding.
+        if (
+          run.skipReason === "two-factor-required" ||
+          run.skipReason === "budget"
+        ) {
+          stopped = true;
+          break;
+        }
+        // A refusal applies to the whole catch-up sequence — the daily cap,
+        // quiet hours or the backoff will not have changed by the next activity
+        // in the list — so stop rather than logging the same skip once per
+        // pending activity. The watermark stays put, and the leftovers ride
+        // along with the next trigger.
+        if (run.status === "skipped") {
+          break;
+        }
       }
     }
+  } finally {
+    liveTriggers.delete(cancellation);
   }
   return runs;
+}
+
+
+export function getAutomationSpend(): CoachAutomationSpend {
+  const monthStart = startOfLocalMonth(new Date());
+  const totals = sumCoachAutomationTokensSince(monthStart);
+  return {
+    monthStart,
+    inputTokens: totals.inputTokens,
+    outputTokens: totals.outputTokens,
+    budget: getCoachAutomationBudget(),
+    countedRuns: totals.countedRuns,
+    providerRuns: totals.providerRuns
+  };
+}
+
+/**
+ * Setting the ceiling is also the way back from a budget pause: raising it (or
+ * clearing it) removes the reason, and the gate notices on the next trigger.
+ * Lowering it below what is already spent pauses at the next trigger instead.
+ */
+export function setAutomationBudget(budget: number | null): CoachAutomationSpend {
+  setCoachAutomationBudget(budget);
+  return getAutomationSpend();
+}
+
+/** What the banner reads on mount, before any push has happened. */
+export function getAutomationPause(
+  deps?: Partial<CoachAutomationRunnerDeps>
+): CoachAutomationPause | null {
+  return resolveDeps(deps).getPause();
+}
+
+/**
+ * Section 10's single way to resume. It clears the flag and nothing else — it
+ * does not assert that COROS is reachable, because it cannot: the next trigger
+ * asks, and re-trips the pause if the answer is still a login code. "Resume"
+ * therefore means *try again*, which is the only thing a button here can
+ * honestly promise.
+ */
+export function resumeAutomations(
+  deps?: Partial<CoachAutomationRunnerDeps>
+): CoachAutomationPause | null {
+  resolveDeps(deps).setPause(null);
+  return null;
 }
 
 /** 3.4 "Run now": bypasses cooldown, quiet hours and the daily cap. */
@@ -1181,7 +1943,8 @@ export function runAutomationNow(
   );
 }
 
-/** Test seam: resets the process-wide queue between scenarios. */
+/** Test seam: resets the process-wide queue and live tokens between scenarios. */
 export function resetAutomationQueueForTests(): void {
   queueTail = Promise.resolve();
+  liveTriggers.clear();
 }

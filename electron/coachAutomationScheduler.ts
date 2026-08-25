@@ -10,6 +10,18 @@ import {
   recordCoachAutomationRun,
   setCoachAutomationBindingSchedule
 } from "./coachAutomationStore";
+import {
+  PLAN_ADHERENCE_LOOKBACK_DAYS,
+  THRESHOLD_LOOKBACK_DAYS,
+  evaluateThresholdTrigger,
+  toDayKey
+} from "./coachThresholdMetrics";
+import type { ThresholdSnapshot } from "./coachThresholdMetrics";
+import {
+  listCoachDailySamples,
+  listCoachThresholdLoads,
+  listCoachThresholdSlots
+} from "./database";
 import type {
   AutomationTrigger,
   CoachAutomation,
@@ -27,6 +39,7 @@ export const SCHEDULER_TICK_INTERVAL_MS = 60_000;
 export const STALE_SLOT_MS = 24 * 60 * 60_000;
 
 type ScheduleTrigger = Extract<AutomationTrigger, { kind: "schedule" }>;
+type ThresholdTrigger = Extract<AutomationTrigger, { kind: "threshold" }>;
 
 export interface CoachAutomationSchedulerDeps {
   now(): Date;
@@ -42,9 +55,13 @@ export interface CoachAutomationSchedulerDeps {
   }): CoachAutomationRun;
   runTrigger(event: {
     automationId: string;
-    kind: "schedule";
+    kind: "schedule" | "threshold";
     bindingIds: string[];
   }): Promise<CoachAutomationRun[]>;
+  /** 3.3: every local row the four metrics read, fetched once per tick. */
+  readThresholdSnapshot(now: Date): ThresholdSnapshot;
+  /** 3.3: the transition state, beside the binding's other clocks. */
+  setBindingThresholdFiring(bindingId: string, firing: boolean): void;
   onError(error: unknown): void;
 }
 
@@ -72,6 +89,31 @@ function createDefaultDeps(): CoachAutomationSchedulerDeps {
       return run;
     },
     runTrigger: (event) => runAutomationTrigger(event),
+    readThresholdSnapshot: (now) => {
+      const since = new Date(now);
+      since.setDate(since.getDate() - THRESHOLD_LOOKBACK_DAYS);
+      const slotsSince = new Date(now);
+      slotsSince.setDate(slotsSince.getDate() - PLAN_ADHERENCE_LOOKBACK_DAYS);
+      return {
+        loads: listCoachThresholdLoads(Math.floor(since.getTime() / 1000)).map(
+          (row) => ({ startTime: row.start_time, load: row.training_load })
+        ),
+        daily: listCoachDailySamples(toDayKey(since)).map((row) => ({
+          day: row.day,
+          ...(row.resting_hr === null ? {} : { restingHr: row.resting_hr }),
+          ...(row.sleep_minutes === null
+            ? {}
+            : { sleepMinutes: row.sleep_minutes })
+        })),
+        planned: listCoachThresholdSlots(toDayKey(slotsSince)).map((row) => ({
+          day: row.happen_day,
+          matched: row.matched === 1
+        }))
+      };
+    },
+    setBindingThresholdFiring: (bindingId, firing) => {
+      setCoachAutomationBindingSchedule(bindingId, { thresholdFiring: firing });
+    },
     onError: (error) => {
       console.error("[coach-automation] scheduler tick failed:", error);
     }
@@ -190,16 +232,47 @@ export class CoachAutomationScheduler {
     }
     this.ticking = true;
     try {
-      for (const automation of this.deps.listAutomations()) {
-        if (!automation.enabled || automation.trigger.kind !== "schedule") {
+      const automations = this.deps.listAutomations();
+      // Read once per tick and only when something asks for it: the four
+      // metrics of 3.3 read the same local rows, and a snapshot per binding
+      // would scan a month of activities five times to get one answer.
+      let snapshot: ThresholdSnapshot | null = null;
+      const thresholdSnapshot = (now: Date): ThresholdSnapshot =>
+        (snapshot ??= this.deps.readThresholdSnapshot(now));
+
+      for (const automation of automations) {
+        if (!automation.enabled) {
           continue;
         }
         const trigger = automation.trigger;
-        for (const binding of this.deps.listActiveBindings(automation.id)) {
-          // Each binding keeps its own slot, so one that is broken, deferred or
-          // brand new cannot hold up the others (3.1, per-binding independence).
+        if (trigger.kind !== "schedule" && trigger.kind !== "threshold") {
+          continue;
+        }
+        const bindings = this.deps.listActiveBindings(automation.id);
+        if (!bindings.length) {
+          continue;
+        }
+
+        // The condition is a fact about the athlete, not about a binding, so it
+        // is answered once for the automation and compared per binding. One
+        // `now` for both halves: two reads can straddle a midnight and answer
+        // about different days.
+        const now = this.deps.now();
+        const firing =
+          trigger.kind === "threshold"
+            ? evaluateThresholdTrigger(trigger, now, thresholdSnapshot(now))
+            : false;
+
+        for (const binding of bindings) {
+          // Each binding keeps its own slot and its own firing state, so one
+          // that is broken, deferred or brand new cannot hold up the others
+          // (3.1, per-binding independence).
           try {
-            await this.evaluateBinding(automation, trigger, binding);
+            if (trigger.kind === "threshold") {
+              await this.evaluateThresholdBinding(automation, firing, binding);
+            } else {
+              await this.evaluateBinding(automation, trigger, binding);
+            }
           } catch (error) {
             this.deps.onError(error);
           }
@@ -210,6 +283,57 @@ export class CoachAutomationScheduler {
     } finally {
       this.ticking = false;
     }
+  }
+
+  /**
+   * 3.3: a rule fires when its condition *becomes* true, not on every tick it
+   * stays true.
+   *
+   * Three states, and the third is the one that matters. `undefined` means this
+   * binding has never been evaluated — a coach attached this morning — and its
+   * first look records the answer and says nothing. Without it, attaching a
+   * "tell me when my ramp is steep" rule during a steep block would fire
+   * immediately on history the athlete already knows about.
+   *
+   * The state is written **before** the run, for the same reason 3.1 books the
+   * next slot before firing: a run takes as long as the provider does and the
+   * app may be closed mid-flight, so the worst case has to be one missed
+   * announcement rather than the same one re-announced on every tick.
+   */
+  private async evaluateThresholdBinding(
+    automation: CoachAutomation,
+    firing: boolean,
+    binding: CoachAutomationBinding
+  ): Promise<void> {
+    const previous = binding.thresholdFiring;
+
+    if (previous === undefined) {
+      this.deps.setBindingThresholdFiring(binding.id, firing);
+      return;
+    }
+
+    // The hovering case: a metric sitting on its threshold reports the same
+    // answer tick after tick, and the athlete hears about it once.
+    if (firing === previous) {
+      return;
+    }
+
+    this.deps.setBindingThresholdFiring(binding.id, firing);
+
+    // Falling back below is recorded, not announced. The rule is "tell me when
+    // this becomes true", and a coach that also spoke up every time a metric
+    // recovered would be twice as loud for no more information.
+    if (!firing) {
+      return;
+    }
+
+    // Guard rails 1-8 belong to the runner (section 4), exactly as they do for
+    // a schedule: this decides *when*, and whether it may is the runner's call.
+    await this.deps.runTrigger({
+      automationId: automation.id,
+      kind: "threshold",
+      bindingIds: [binding.id]
+    });
   }
 
   private async evaluateBinding(

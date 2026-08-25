@@ -105,6 +105,8 @@ import type {
   CoachAutomationDetail,
   CoachAutomationInput,
   CoachAutomationRun,
+  CoachAutomationPause,
+  CoachAutomationSpend,
   CoachAutomationRunQuery,
   CoachAutomationSummary,
   ChatSettings,
@@ -1046,6 +1048,14 @@ const api = {
     ipcRenderer.invoke("coachAutomation:listRuns", filter),
   cancelCoachAutomationRun: (runId: string): Promise<void> =>
     ipcRenderer.invoke("coachAutomation:cancelRun", runId),
+  getCoachAutomationPause: (): Promise<CoachAutomationPause | null> =>
+    ipcRenderer.invoke("coachAutomation:getPause"),
+  resumeCoachAutomations: (): Promise<CoachAutomationPause | null> =>
+    ipcRenderer.invoke("coachAutomation:resume"),
+  getCoachAutomationSpend: (): Promise<CoachAutomationSpend> =>
+    ipcRenderer.invoke("coachAutomation:getSpend"),
+  setCoachAutomationBudget: (budget: number | null): Promise<CoachAutomationSpend> =>
+    ipcRenderer.invoke("coachAutomation:setBudget", budget),
   markCoachAutomationRunsSeen: (runIds: string[]): Promise<number> =>
     ipcRenderer.invoke("coachAutomation:markSeen", runIds),
   listCoachAutomationSessionAttention: (): Promise<
@@ -1062,6 +1072,17 @@ const api = {
     ) => callback(run);
     ipcRenderer.on("coachAutomation:runUpdate", listener);
     return () => ipcRenderer.removeListener("coachAutomation:runUpdate", listener);
+  },
+  onCoachAutomationPauseUpdate: (
+    callback: (pause: CoachAutomationPause | null) => void
+  ): (() => void) => {
+    const listener = (
+      _event: Electron.IpcRendererEvent,
+      pause: CoachAutomationPause | null
+    ) => callback(pause);
+    ipcRenderer.on("coachAutomation:pauseUpdate", listener);
+    return () =>
+      ipcRenderer.removeListener("coachAutomation:pauseUpdate", listener);
   },
   onChatStreamStart: (
     callback: (payload: ChatStreamStart) => void

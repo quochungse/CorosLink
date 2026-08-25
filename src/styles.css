@@ -32353,6 +32353,47 @@ body.is-backgrounded .training-backup-progress-track.is-indeterminate span {
   color: var(--warning-text);
 }
 
+/* Section 13: what the automations have cost this month, beside the ceiling
+   that stops them. One line, because a number nobody set a budget against is
+   still worth seeing and a whole panel for it would not be. */
+.coach-automation-spend {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 0;
+  padding: 8px 11px;
+  border: 1px solid var(--border-subtle, rgba(128, 128, 128, 0.24));
+  border-radius: var(--radius-md);
+  color: var(--text-secondary, inherit);
+  font-size: 12.5px;
+}
+
+.coach-automation-spend > span:first-child {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.coach-automation-budget {
+  flex: none;
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+}
+
+.coach-automation-budget input {
+  width: 96px;
+}
+
+/* The pause banner carries the one control that lifts it (10). It sits beside
+   the prose rather than under it, and never shrinks: a Resume button squeezed
+   to two characters by a long sentence is not a way out of anything. */
+.coach-automation-banner > button {
+  flex: none;
+  align-self: center;
+  margin-left: auto;
+}
+
 .coach-automation-card-list,
 .coach-automation-binding-list,
 .coach-automation-run-list,

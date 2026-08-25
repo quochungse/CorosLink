@@ -11,6 +11,7 @@ import type {
   AnthropicApiConnectionTest,
   AnthropicEffort,
   ChatMessage,
+  ChatTokenUsage,
   CorosMcpTool
 } from "./types";
 
@@ -198,7 +199,7 @@ function createAnthropicClient(apiKey: string): Anthropic {
 
 export async function streamAnthropicChatCompletion(
   options: StreamAnthropicChatOptions
-): Promise<{ fullText: string }> {
+): Promise<{ fullText: string; usage?: ChatTokenUsage }> {
   const apiKey = options.config.apiKey?.trim();
   if (!apiKey) {
     throw new AnthropicProviderError(
@@ -220,6 +221,11 @@ export async function streamAnthropicChatCompletion(
   const tuning = buildAnthropicRequestTuning(options.config);
   const tools = buildAnthropicTools(options.tools);
   let fullText = "";
+  // Summed across rounds: a tool-using answer is several API calls and the
+  // athlete pays for every one of them. `counted` stays false until a round
+  // actually reports, so a run nobody told us about is undefined, not zero.
+  let counted = false;
+  const usage: ChatTokenUsage = { inputTokens: 0, outputTokens: 0 };
 
   try {
     for (let round = 0; round < options.maxToolRounds; round++) {
@@ -244,6 +250,17 @@ export async function streamAnthropicChatCompletion(
       }
 
       const message = await stream.finalMessage();
+
+      if (message.usage) {
+        counted = true;
+        // Cache reads and writes are input the athlete is billed for, so they
+        // belong in the input count rather than being quietly dropped.
+        usage.inputTokens +=
+          (message.usage.input_tokens ?? 0) +
+          (message.usage.cache_creation_input_tokens ?? 0) +
+          (message.usage.cache_read_input_tokens ?? 0);
+        usage.outputTokens += message.usage.output_tokens ?? 0;
+      }
 
       if (message.stop_reason === "refusal") {
         throw new AnthropicProviderError(
@@ -293,7 +310,7 @@ export async function streamAnthropicChatCompletion(
       conversation.push({ role: "user", content: results });
     }
 
-    return { fullText };
+    return { fullText, ...(counted ? { usage } : {}) };
   } catch (caught) {
     throw normalizeAnthropicError(caught);
   }

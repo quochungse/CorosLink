@@ -31,6 +31,8 @@ const run = (patch) => ({
   error: null,
   skip_reason: patch.skip_reason ?? null,
   seen_at: patch.seen_at ?? null,
+  input_tokens: patch.input_tokens ?? null,
+  output_tokens: patch.output_tokens ?? null,
   started_at: patch.started_at ?? "2026-08-25T07:00:00.000Z",
   finished_at: patch.finished_at ?? "2026-08-25T07:00:04.000Z"
 });
@@ -146,6 +148,248 @@ assert.match(
   /idx_training_activities_start_time/,
   `the activity scan must use its index, got: ${plan}`
 );
+
+// --- and the index the monthly spend leans on (13) ------------------------
+// The budget guard rail asks "what did every automation cost since the 1st" on
+// every run. It narrows by nothing but the date, so neither of the run log's
+// other two indexes — both prefixed by an id — can serve it.
+{
+  const spendPlan = database
+    .requireDatabase()
+    .prepare(
+      `EXPLAIN QUERY PLAN
+       SELECT COALESCE(SUM(input_tokens), 0) FROM coach_automation_runs
+       WHERE started_at >= ?
+         AND status IN ('success', 'silent', 'failed', 'cancelled')`
+    )
+    .all("2026-09-01T00:00:00.000Z")
+    .map((step) => step.detail)
+    .join(" | ");
+  assert.match(
+    spendPlan,
+    /idx_automation_runs_started/,
+    `the monthly spend must use its index, got: ${spendPlan}`
+  );
+}
+
+// --- the binding's three clocks are really columns (10) -------------------
+// The runner suite drives the backoff against a hand-written world, and the
+// store suite against a fake row, so both would stay green with the columns
+// missing from the real table — `ensureColumn` is the only thing that adds
+// them, and it runs once, on a database that already exists.
+{
+  // The binding's foreign key is a real constraint here, unlike in the fakes.
+  database.insertCoachAutomationRow({
+    id: "auto-1",
+    name: "Post-run debrief",
+    role: null,
+    playbook: "Summarise the run.",
+    enabled: 1,
+    preset_id: null,
+    trigger_json: JSON.stringify({ kind: "activity", sportTypes: [] }),
+    conditions_json: JSON.stringify({
+      batchWindowMin: 0,
+      cooldownMin: 0,
+      maxRunsPerDay: 3
+    }),
+    runtime_json: null,
+    created_at: "2026-08-25T07:00:00.000Z",
+    updated_at: "2026-08-25T07:00:00.000Z"
+  });
+
+  database.insertCoachAutomationBindingRow({
+    id: "bind-backoff",
+    automation_id: "auto-1",
+    mode: "existing",
+    session_id: "s-backoff",
+    title_template: null,
+    enabled: 1,
+    sort_order: 0,
+    last_run_at: null,
+    next_run_at: null,
+    last_activity_at: null,
+    backoff_until: null,
+    backoff_level: null,
+    threshold_firing: null,
+    created_at: "2026-08-25T07:00:00.000Z"
+  });
+
+  const stored = database.getCoachAutomationBindingRow("bind-backoff");
+  assert.equal(stored.backoff_until, null, "a fresh binding is not backing off");
+  assert.equal(stored.backoff_level, null);
+
+  database.updateCoachAutomationBindingRow({
+    ...stored,
+    backoff_until: "2026-08-25T07:05:00.000Z",
+    backoff_level: 1
+  });
+  const failing = database.getCoachAutomationBindingRow("bind-backoff");
+  assert.equal(failing.backoff_until, "2026-08-25T07:05:00.000Z");
+  assert.equal(failing.backoff_level, 1);
+  assert.equal(
+    failing.last_activity_at,
+    null,
+    "and the column it was added next to still reads back"
+  );
+
+  // 3.3's transition state is the same kind of column and the same kind of
+  // risk: the threshold suite drives it against a hand-written world, so
+  // nothing else would notice it missing from the real table. Its three values
+  // all have to survive, NULL most of all — that is "never evaluated", and it
+  // is what stops a binding attached today firing on history.
+  assert.equal(
+    failing.threshold_firing,
+    null,
+    "a binding that has never been evaluated says so"
+  );
+  for (const value of [0, 1]) {
+    database.updateCoachAutomationBindingRow({ ...failing, threshold_firing: value });
+    assert.equal(
+      database.getCoachAutomationBindingRow("bind-backoff").threshold_firing,
+      value
+    );
+  }
+  database.updateCoachAutomationBindingRow({ ...failing, threshold_firing: null });
+  assert.equal(
+    database.getCoachAutomationBindingRow("bind-backoff").threshold_firing,
+    null,
+    "and it can be put back to never-evaluated, which a trigger edit does"
+  );
+}
+
+// --- 3.3's local sample cache, against the real table ----------------------
+{
+  database.upsertCoachDailySamples(
+    [
+      { day: "20260820", resting_hr: 48, sleep_minutes: 430 },
+      { day: "20260821", resting_hr: 51, sleep_minutes: null }
+    ],
+    "2026-08-25T07:00:00.000Z"
+  );
+  assert.deepEqual(database.listCoachDailySamples("20260820"), [
+    { day: "20260820", resting_hr: 48, sleep_minutes: 430 },
+    { day: "20260821", resting_hr: 51, sleep_minutes: null }
+  ]);
+  assert.deepEqual(
+    database.listCoachDailySamples("20260821").map((row) => row.day),
+    ["20260821"],
+    "the window is a string comparison on a sortable key"
+  );
+
+  // A snapshot that reached COROS for resting HR and could not reach the MCP
+  // server for sleep must not blank the sleep it already had — otherwise every
+  // disconnected poll would erase a night.
+  database.upsertCoachDailySamples(
+    [{ day: "20260820", resting_hr: 49, sleep_minutes: null }],
+    "2026-08-25T13:00:00.000Z"
+  );
+  assert.deepEqual(database.listCoachDailySamples("20260820")[0], {
+    day: "20260820",
+    resting_hr: 49,
+    sleep_minutes: 430
+  });
+}
+
+// --- 5.7's rolling summary, against the real column -----------------------
+// The runner suite drives trimming against a hand-written world, so nothing
+// else would notice the columns missing from the real table — and a summary
+// that cannot be stored turns "one turn a year" back into "a year a turn".
+{
+  database.insertChatSessionRow(
+    "sess-long",
+    "claude-code",
+    "Morning briefing",
+    "[]",
+    "2026-08-01T07:00:00.000Z",
+    "2026-08-25T07:00:00.000Z"
+  );
+
+  assert.deepEqual(
+    database.getChatSessionCoachSummaryRow("sess-long"),
+    { coach_summary: null, coach_summary_through: null },
+    "a conversation nobody has summarised says so"
+  );
+
+  database.setChatSessionCoachSummaryRow(
+    "sess-long",
+    "Marathon in October. Calf grumbling since July.",
+    80
+  );
+  assert.deepEqual(database.getChatSessionCoachSummaryRow("sess-long"), {
+    coach_summary: "Marathon in October. Calf grumbling since July.",
+    coach_summary_through: 80
+  });
+
+  // Rolling it forward replaces both halves together: a summary and the count
+  // it covers are one fact, and a row carrying one without the other would send
+  // the model a description of turns it is also about to read in full.
+  database.setChatSessionCoachSummaryRow("sess-long", "Calf settled.", 130);
+  assert.deepEqual(database.getChatSessionCoachSummaryRow("sess-long"), {
+    coach_summary: "Calf settled.",
+    coach_summary_through: 130
+  });
+
+  // The transcript is untouched by any of it — 5.7 trims the context window,
+  // never what is on disk.
+  const row = database
+    .requireDatabase()
+    .prepare("SELECT messages_json, title FROM chat_sessions WHERE id = ?")
+    .get("sess-long");
+  assert.equal(row.messages_json, "[]");
+  assert.equal(row.title, "Morning briefing");
+
+  assert.equal(database.getChatSessionCoachSummaryRow("no-such-session"), undefined);
+}
+
+// --- the month's spend, summed against the real table ---------------------
+// The runner suite hands the month-to-date total in as a number, so nothing
+// else would notice this query counting the wrong rows — and a budget built on
+// the wrong rows pauses the athlete's coaches for the wrong reason.
+{
+  const spent = (patch) =>
+    database.insertCoachAutomationRunRow(
+      run({
+        automation_id: "auto-spend",
+        binding_id: "bind-spend",
+        started_at: patch.started_at,
+        status: patch.status ?? "success",
+        skip_reason: patch.skip_reason ?? null,
+        input_tokens: patch.input_tokens ?? null,
+        output_tokens: patch.output_tokens ?? null,
+        id: patch.id
+      })
+    );
+
+  spent({ id: "t-1", started_at: "2026-09-01T00:00:00.000Z", input_tokens: 100, output_tokens: 20 });
+  spent({ id: "t-2", started_at: "2026-09-14T09:00:00.000Z", input_tokens: 300, output_tokens: 40 });
+  // Before the window: last month is somebody else's problem.
+  spent({ id: "t-old", started_at: "2026-08-31T23:59:59.000Z", input_tokens: 9_000, output_tokens: 9_000 });
+  // Reached the provider and cost something, whatever it turned into.
+  spent({ id: "t-fail", started_at: "2026-09-15T09:00:00.000Z", status: "failed", input_tokens: 50, output_tokens: 5 });
+  spent({ id: "t-silent", started_at: "2026-09-15T10:00:00.000Z", status: "silent", input_tokens: 10, output_tokens: 1 });
+  // Never reached a provider, so it is not a run the budget has to count.
+  spent({ id: "t-skip", started_at: "2026-09-16T09:00:00.000Z", status: "skipped", skip_reason: "cooldown" });
+  // Reached the provider, which said nothing about what it cost.
+  spent({ id: "t-quiet", started_at: "2026-09-17T09:00:00.000Z" });
+
+  const totals = database.sumCoachAutomationTokensSince("2026-09-01T00:00:00.000Z");
+  assert.equal(totals.inputTokens, 100 + 300 + 50 + 10);
+  assert.equal(totals.outputTokens, 20 + 40 + 5 + 1);
+  assert.equal(totals.providerRuns, 5, "the cooldown skip is not a run that spent anything");
+  assert.equal(
+    totals.countedRuns,
+    4,
+    "and the one whose provider said nothing is reported as uncounted, not as free"
+  );
+
+  const empty = database.sumCoachAutomationTokensSince("2027-01-01T00:00:00.000Z");
+  assert.deepEqual(empty, {
+    inputTokens: 0,
+    outputTokens: 0,
+    countedRuns: 0,
+    providerRuns: 0
+  });
+}
 
 fs.rmSync(tempRoot, { recursive: true, force: true });
 console.log("coach automation sql tests passed");

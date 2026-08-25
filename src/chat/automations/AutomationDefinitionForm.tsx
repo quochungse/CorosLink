@@ -1,5 +1,6 @@
 import type {
   AnthropicEffort,
+  AutomationThresholdMetric,
   AutomationTrigger,
   ChatProvider,
   CoachAutomationInput
@@ -7,7 +8,10 @@ import type {
 import { ModelSwitch } from "../ModelSwitch";
 import { EffortSwitch } from "../EffortSwitch";
 import { supportsReasoningEffort } from "../../../electron/chatModels";
-import { SPORT_FILTER_OPTIONS } from "./automationLabels";
+import {
+  SPORT_FILTER_OPTIONS,
+  THRESHOLD_METRIC_OPTIONS
+} from "./automationLabels";
 
 /**
  * The definition fields, shared by the create screen and the detail view's
@@ -26,6 +30,13 @@ export function AutomationDefinitionForm({
 }) {
   const activityTrigger = draft.trigger.kind === "activity" ? draft.trigger : null;
   const scheduleTrigger = draft.trigger.kind === "schedule" ? draft.trigger : null;
+  const thresholdTrigger =
+    draft.trigger.kind === "threshold" ? draft.trigger : null;
+  const thresholdOption = thresholdTrigger
+    ? THRESHOLD_METRIC_OPTIONS.find(
+        (option) => option.value === thresholdTrigger.metric
+      )
+    : undefined;
   const quietHours = draft.conditions?.quietHours ?? null;
   const runtimeProvider = draft.runtime?.provider ?? provider;
   // Mirrors what the two switches themselves decide to render.
@@ -106,16 +117,69 @@ export function AutomationDefinitionForm({
         >
           <option value="activity">After a new activity</option>
           <option value="schedule">On a schedule</option>
+          <option value="threshold">When a metric crosses a threshold</option>
           <option value="manual">Manual only</option>
-          {/* Phase 3. Shown only when a definition already carries one, so the
-              select never renders with nothing selected. */}
-          {draft.trigger.kind === "threshold" ? (
-            <option value="threshold" disabled>
-              When a metric crosses a threshold
-            </option>
-          ) : null}
         </select>
       </label>
+
+      {thresholdTrigger ? (
+        <fieldset className="coach-automation-fieldset" disabled={disabled}>
+          <legend>Fires on a transition</legend>
+          <div className="coach-automation-row">
+            <label className="chat-local-field">
+              <span>Metric</span>
+              <select
+                value={thresholdTrigger.metric}
+                onChange={(event) =>
+                  onChange({
+                    trigger: {
+                      kind: "threshold",
+                      metric: event.target.value as AutomationThresholdMetric,
+                      // The number means something different per metric — per
+                      // cent, bpm, hours — so switching carries the metric's own
+                      // starting point rather than the last one's number.
+                      value:
+                        THRESHOLD_METRIC_DEFAULTS[
+                          event.target.value as AutomationThresholdMetric
+                        ]
+                    }
+                  })
+                }
+              >
+                {THRESHOLD_METRIC_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="chat-local-field">
+              <span>{thresholdOption?.unit ?? "Threshold"}</span>
+              <input
+                type="number"
+                min={0}
+                step={1}
+                value={thresholdTrigger.value}
+                onChange={(event) =>
+                  onChange({
+                    trigger: {
+                      ...thresholdTrigger,
+                      value: Number(event.target.value)
+                    }
+                  })
+                }
+              />
+            </label>
+          </div>
+          {/* 3.3: it fires on the transition, which is the thing an athlete
+              would otherwise have to discover by being surprised twice. */}
+          <p className="chat-settings-copy">
+            {thresholdOption?.hint} It speaks once when this becomes true, not
+            every hour it stays true — and a coach attached today starts from
+            where things already stand rather than announcing history.
+          </p>
+        </fieldset>
+      ) : null}
 
       {scheduleTrigger ? (
         <fieldset className="coach-automation-fieldset" disabled={disabled}>
@@ -418,5 +482,24 @@ function blankTrigger(kind: string): AutomationTrigger {
   if (kind === "activity") {
     return { kind: "activity", sportTypes: [] };
   }
+  if (kind === "threshold") {
+    return {
+      kind: "threshold",
+      metric: "acuteChronicRamp",
+      value: THRESHOLD_METRIC_DEFAULTS.acuteChronicRamp
+    };
+  }
   return { kind: "manual" };
 }
+
+/**
+ * A starting number per metric, because the number is a different quantity in
+ * each: a 30 that means "per cent over the 4-week average" is nonsense as
+ * "bpm above baseline".
+ */
+const THRESHOLD_METRIC_DEFAULTS: Record<AutomationThresholdMetric, number> = {
+  acuteChronicRamp: 30,
+  restingHrDrift: 5,
+  planAdherence: 24,
+  sleepDebt: 5
+};

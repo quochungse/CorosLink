@@ -1,5 +1,6 @@
 import { COROS_KNOWN_SPORT_TYPES } from "../../../electron/corosSportTypes";
 import type {
+  AutomationThresholdMetric,
   AutomationTrigger,
   CoachAutomationBindingView,
   CoachAutomationRun
@@ -62,9 +63,53 @@ export function describeTrigger(trigger: AutomationTrigger): string {
   }
 
   if (trigger.kind === "threshold") {
-    return `When ${trigger.metric} crosses ${trigger.value}`;
+    return describeThresholdMetric(trigger.metric, trigger.value);
   }
   return "Manual only";
+}
+
+/** The four metrics of 3.3, named the way an athlete would say them. */
+export const THRESHOLD_METRIC_OPTIONS: Array<{
+  value: AutomationThresholdMetric;
+  label: string;
+  /** What the number means, so the field never reads as a bare quantity. */
+  unit: string;
+  hint: string;
+}> = [
+  {
+    value: "acuteChronicRamp",
+    label: "Training load is ramping",
+    unit: "% over the 4-week average",
+    hint: "Last 7 days of load compared with the trailing 28-day average week."
+  },
+  {
+    value: "restingHrDrift",
+    label: "Resting heart rate is drifting up",
+    unit: "bpm above baseline",
+    hint: "Three days running, against the 30-day baseline before them."
+  },
+  {
+    value: "planAdherence",
+    label: "A planned workout was missed",
+    unit: "hours after the day it was due",
+    hint: "Counts scheduled workouts from the last two weeks with nothing matched to them."
+  },
+  {
+    value: "sleepDebt",
+    label: "Sleep debt is building",
+    unit: "hours short over 7 nights",
+    hint: "Against 8 hours a night, counting only the nights with a reading."
+  }
+];
+
+export function describeThresholdMetric(
+  metric: AutomationThresholdMetric,
+  value: number
+): string {
+  const option = THRESHOLD_METRIC_OPTIONS.find((entry) => entry.value === metric);
+  return option ? `${option.label} — ${value}${
+    option.unit.startsWith("%") ? "" : " "
+  }${option.unit}` : `When ${metric} crosses ${value}`;
 }
 
 export function describeBindingMode(binding: CoachAutomationBindingView): string {
@@ -105,9 +150,10 @@ const SKIP_REASON_LABELS: Record<string, string> = {
   "two-factor-required": "COROS needs a login code",
   "quiet-hours": "quiet hours",
   cooldown: "too soon after the last run",
-  budget: "daily limit reached",
+  budget: "monthly token budget reached",
   burst: "conversation busy",
   "batch-window": "waiting for more activities",
+  backoff: "backing off after a failure",
   "no-activity": "no new activity to analyse",
   "stale-slot": "missed slot"
 };
@@ -146,6 +192,30 @@ export function formatTimeUntil(iso: string | undefined): string | null {
   if (hours < 24) return `in ${hours}h`;
   const days = Math.round(hours / 24);
   return days === 1 ? "tomorrow" : `in ${days}d`;
+}
+
+/**
+ * "12.4k" / "1.2M". A token count is an order-of-magnitude fact — nobody
+ * budgets to the token — and 483,912 on a run-log row is six characters of
+ * noise where two would do.
+ */
+export function formatTokens(count: number): string {
+  if (!Number.isFinite(count) || count < 0) return "—";
+  if (count < 1_000) return `${Math.round(count)}`;
+  if (count < 1_000_000) {
+    const thousands = count / 1_000;
+    return `${thousands < 10 ? thousands.toFixed(1) : Math.round(thousands)}k`;
+  }
+  const millions = count / 1_000_000;
+  return `${millions < 10 ? millions.toFixed(1) : Math.round(millions)}M`;
+}
+
+/** What one run cost, or null when the provider reported nothing. */
+export function formatRunTokens(run: CoachAutomationRun): string | null {
+  if (run.inputTokens === undefined && run.outputTokens === undefined) {
+    return null;
+  }
+  return formatTokens((run.inputTokens ?? 0) + (run.outputTokens ?? 0));
 }
 
 export function formatDuration(run: CoachAutomationRun): string {

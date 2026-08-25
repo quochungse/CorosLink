@@ -2601,7 +2601,27 @@ export interface ChatSessionSummary {
  * What a turn is allowed to do. Automation runs are `read-only` (decision 3):
  * they may read, analyse and draft, but never write to COROS.
  */
-export type ChatToolPolicy = "interactive" | "read-only";
+/**
+ * What one turn cost, summed across its tool rounds — a tool-using answer is
+ * several provider calls and the athlete pays for all of them.
+ *
+ * Both counts are whole tokens as the provider reported them. A provider that
+ * reports nothing leaves this undefined rather than zero: "this run cost
+ * nothing" and "nobody told us what this run cost" are different facts, and a
+ * budget that treats the second as the first undercounts silently.
+ */
+export interface ChatTokenUsage {
+  inputTokens: number;
+  outputTokens: number;
+}
+
+/**
+ * What a turn may reach for. `read-only` is decision 3's automation set; `none`
+ * is for a turn that works on text it was handed and has no business calling
+ * anything — the rolling summariser of 5.7, where a tool round-trip would be
+ * both slower and a chance to wander off the one job it has.
+ */
+export type ChatToolPolicy = "interactive" | "read-only" | "none";
 
 export type AutomationTriggerKind =
   | "schedule"
@@ -2750,6 +2770,26 @@ export interface CoachAutomationBinding {
    * (`createdAt`) becomes the floor instead.
    */
   lastActivityAt?: number;
+  /**
+   * Section 10's per-binding backoff, beside the other clocks because it is one
+   * of them. A `failed` run deliberately leaves `lastRunAt` and the watermark
+   * where they were, so without this a dead provider is re-offered the same
+   * activity on every 15-minute poll for as long as it stays dead.
+   *
+   * `backoffUntil` is the wall clock the binding is held off until; absent
+   * means it is not. `backoffLevel` counts consecutive failures and picks the
+   * step (5m, 15m, 60m); 0 or absent means healthy.
+   */
+  backoffUntil?: string;
+  backoffLevel?: number;
+  /**
+   * 3.3's transition state: whether this binding's threshold condition held the
+   * last time the scheduler looked. **Absent means never evaluated**, which is
+   * the state that matters most — a binding attached today must not fire on a
+   * condition that has been true all week, so its first look records the answer
+   * and says nothing.
+   */
+  thresholdFiring?: boolean;
   createdAt: string;
 }
 
@@ -2805,6 +2845,9 @@ export interface CoachAutomationRun {
   summary?: string;
   model?: string;
   effort?: string;
+  /** What this run cost, when the provider said (13). */
+  inputTokens?: number;
+  outputTokens?: number;
   error?: string;
   /** cooldown | quiet-hours | no-auth | offline | budget | stale-slot */
   skipReason?: string;
@@ -2863,6 +2906,52 @@ export type CoachAutomationAttachResult =
   | { ok: false; code: CoachAutomationBindingErrorCode; message: string };
 
 /** List-screen projection. */
+/**
+ * Section 10: why every automation is held, and since when.
+ *
+ * One flag for the whole feature rather than a column per binding, because the
+ * cause is one thing the athlete has to fix once — COROS is asking for a login
+ * code, and no amount of retrying anywhere will answer it. Persisted, so a
+ * restart does not quietly resume a paused world.
+ */
+export interface CoachAutomationPause {
+  /**
+   * `two-factor-required` — COROS wants a login code and no automation can
+   * supply one. `budget` — this month's token spend reached the athlete's
+   * ceiling. Both are one fact about the whole feature that the athlete fixes
+   * once, which is why they share one flag.
+   */
+  reason: "two-factor-required" | "budget";
+  since: string;
+  /** The run that tripped it, so the banner can point at something real. */
+  runId?: string;
+}
+
+/**
+ * Guard rail 3's answer for one provider. The reason is prose, not a code: it
+ * lands on the skipped run and in the banner, and both are read by a person.
+ */
+export interface ProviderAuthVerdict {
+  ok: boolean;
+  reason?: string;
+}
+
+/** 13: what the athlete has spent this month, and their ceiling. */
+export interface CoachAutomationSpend {
+  monthStart: string;
+  inputTokens: number;
+  outputTokens: number;
+  /** Null when no ceiling is set, which is the default. */
+  budget: number | null;
+  /**
+   * Runs that reported a cost, out of those that reached a provider. When these
+   * differ the total is short of the truth, and a budget that did not say so
+   * would read as comfortably under when nobody knows.
+   */
+  countedRuns: number;
+  providerRuns: number;
+}
+
 export interface CoachAutomationSummary {
   automation: CoachAutomation;
   bindingCount: number;

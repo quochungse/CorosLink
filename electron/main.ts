@@ -323,7 +323,14 @@ import {
   setCoachAutomationEnabled,
   updateCoachAutomation
 } from "./coachAutomationStore";
-import { runAutomationNow } from "./coachAutomationService";
+import {
+  cancelAutomationRun,
+  getAutomationPause,
+  getAutomationSpend,
+  resumeAutomations,
+  runAutomationNow,
+  setAutomationBudget
+} from "./coachAutomationService";
 import { getChatSessionTitle, setChatSessionTitle } from "./chatHistoryStore";
 import {
   cancelChat,
@@ -1589,10 +1596,27 @@ function registerIpcHandlers(): void {
       listCoachAutomationRuns(filter ?? {})
   );
 
-  // A run streams under its own id, so the existing abort map cancels it.
+  // Stop means the trigger, not the run: a trigger fans out to one run per
+  // place (2.3), and stopping one of them used to leave the rest to run (10).
+  // The run's own stream is still aborted — that is where the id comes in.
   ipcMain.handle("coachAutomation:cancelRun", (_event, runId: string) => {
-    cancelChat(runId);
+    cancelAutomationRun(runId);
   });
+
+  // Section 10's pause: read on mount, then followed by push. The renderer
+  // needs both because the trip usually happens with no window open at all —
+  // a scheduled run finding COROS asking for a login code at 07:30.
+  ipcMain.handle("coachAutomation:getPause", () => getAutomationPause());
+
+  ipcMain.handle("coachAutomation:resume", () => resumeAutomations());
+
+  // 13: what the automations have cost this month, and the ceiling.
+  ipcMain.handle("coachAutomation:getSpend", () => getAutomationSpend());
+
+  ipcMain.handle(
+    "coachAutomation:setBudget",
+    (_event, budget: number | null) => setAutomationBudget(budget)
+  );
 
   ipcMain.handle("coachAutomation:markSeen", (_event, runIds: string[]) =>
     markCoachAutomationRunsSeen(runIds)

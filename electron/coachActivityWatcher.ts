@@ -3,15 +3,19 @@ import {
   listUnseenCoachActivityRows,
   markAllCoachActivitiesSeen,
   markCoachActivitiesSeen,
-  setSetting
+  setSetting,
+  upsertCoachDailySamples
 } from "./database";
-import type { CoachUnseenActivityRow } from "./database";
+import type { CoachDailySampleRow, CoachUnseenActivityRow } from "./database";
+import { getCorosMcpStatus } from "./corosMcpService";
+import { getTrainingSleepData } from "./sleepDataService";
 import { listCoachAutomations } from "./coachAutomationStore";
 import {
   activityMatchesAutomation,
   runAutomationTrigger
 } from "./coachAutomationService";
 import {
+  getDailyMetrics,
   getTrainingHubStatus,
   listTrainingHubActivities
 } from "./trainingHubService";
@@ -24,6 +28,28 @@ export const ACTIVITY_POLL_INTERVAL_MS = 15 * 60_000;
 export const ACTIVITY_LOOKBACK_DAYS = 7;
 
 const INITIALIZED_SETTING = "coachAutomation.activityWatcherInitializedAt";
+
+/**
+ * 3.3: the two series COROS owns rather than the app — resting HR and sleep —
+ * snapshotted into `coach_daily_samples` so the scheduler's 60-second tick can
+ * evaluate a threshold without a request of its own.
+ *
+ * It lives here because this is already the thing that talks to COROS on a slow
+ * cadence, and at six hours it is slower still: the metrics it feeds are 7-,
+ * 28- and 30-day windows, which do not move in an afternoon.
+ */
+const DAILY_SAMPLE_SETTING = "coachAutomation.dailySamplesCapturedAt";
+export const DAILY_SAMPLE_INTERVAL_MS = 6 * 60 * 60_000;
+
+/** Enough history for the widest window a metric reads (30 days), plus slack. */
+export const DAILY_SAMPLE_LOOKBACK_DAYS = 35;
+
+/**
+ * A snapshot is best-effort and must never hold the watcher. Neither COROS call
+ * on this path carries a deadline of its own, and one of them can reach an MCP
+ * connect — the shape section 10 already paid for once.
+ */
+export const DAILY_SAMPLE_TIMEOUT_MS = 60_000;
 
 export interface CoachActivityWatcherDeps {
   now(): Date;
@@ -41,6 +67,11 @@ export interface CoachActivityWatcherDeps {
     automationId: string;
     kind: "activity";
   }): Promise<CoachAutomationRun[]>;
+  /** 3.3's local cache: what COROS says about these days, or [] if it cannot. */
+  readDailySamples(startDay: string, endDay: string): Promise<CoachDailySampleRow[]>;
+  writeDailySamples(rows: CoachDailySampleRow[], capturedAt: string): void;
+  /** How long a snapshot may take before the watcher stops waiting on it. */
+  dailySampleTimeoutMs: number;
   onError(error: unknown): void;
 }
 
@@ -65,6 +96,48 @@ function createDefaultDeps(): CoachActivityWatcherDeps {
     getSetting: (key) => getSetting(key),
     setSetting: (key, value) => setSetting(key, value),
     runTrigger: (event) => runAutomationTrigger(event),
+    readDailySamples: async (startDay, endDay) => {
+      const byDay = new Map<string, CoachDailySampleRow>();
+      const row = (day: string): CoachDailySampleRow => {
+        let existing = byDay.get(day);
+        if (!existing) {
+          existing = { day, resting_hr: null, sleep_minutes: null };
+          byDay.set(day, existing);
+        }
+        return existing;
+      };
+
+      const metrics = await getDailyMetrics([startDay, endDay]);
+      for (const entry of metrics.dayList) {
+        if (typeof entry.rhr === "number" && Number.isFinite(entry.rhr)) {
+          row(entry.happenDay).resting_hr = entry.rhr;
+        }
+      }
+
+      // Sleep comes through the COROS MCP server, and its own helper will open
+      // an OAuth window to get there. That is fine when the athlete asked for a
+      // sleep screen and unacceptable here: this runs unattended, possibly with
+      // no window at all. So sleep is read only when the connection already
+      // exists, and the cache keeps yesterday's answer when it does not.
+      if (getCorosMcpStatus().connected) {
+        const sleep = await getTrainingSleepData(null, DAILY_SAMPLE_LOOKBACK_DAYS);
+        for (const record of sleep.records) {
+          if (record.kind === "nap") continue;
+          if (
+            typeof record.totalMinutes === "number" &&
+            Number.isFinite(record.totalMinutes)
+          ) {
+            row(record.happenDay).sleep_minutes = record.totalMinutes;
+          }
+        }
+      }
+
+      return [...byDay.values()];
+    },
+    writeDailySamples: (rows, capturedAt) => {
+      upsertCoachDailySamples(rows, capturedAt);
+    },
+    dailySampleTimeoutMs: DAILY_SAMPLE_TIMEOUT_MS,
     onError: (error) => {
       console.error("[coach-automation] activity watcher tick failed:", error);
     }
@@ -74,6 +147,26 @@ function createDefaultDeps(): CoachActivityWatcherDeps {
 // The matcher lives with the runner, which now owns activity selection too;
 // re-exported here because this is where callers expect to find it.
 export { activityMatchesAutomation };
+
+const TIMED_OUT = Symbol("timed-out");
+
+/** Resolves to `TIMED_OUT` rather than rejecting: a slow COROS is not an error. */
+async function withDeadline<T>(
+  work: Promise<T>,
+  ms: number
+): Promise<T | typeof TIMED_OUT> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<typeof TIMED_OUT>((resolve) => {
+        timer = setTimeout(() => resolve(TIMED_OUT), ms);
+      })
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 interface PendingBatch {
   automationId: string;
@@ -127,6 +220,14 @@ export class CoachActivityWatcher {
     try {
       await this.poll();
       await this.flushDueBatches();
+    } catch (error) {
+      this.deps.onError(error);
+    }
+    try {
+      // Last, and outside the work above: activities are the time-sensitive
+      // half of this tick — a run the athlete is waiting for — and a slow COROS
+      // asked about a 30-day baseline must not stand in front of them.
+      await this.snapshotDailySamples(this.deps.now());
     } catch (error) {
       this.deps.onError(error);
     } finally {
@@ -194,6 +295,66 @@ export class CoachActivityWatcher {
         .map((activity) => activity.activity_id)
         .filter((id) => !batched.has(id))
     );
+  }
+
+  /**
+   * 3.3's local cache, topped up at most every six hours and never allowed to
+   * hold the watcher. A snapshot that fails leaves the cache exactly as it was,
+   * which is the right answer: the metrics read multi-week windows, so one
+   * missed top-up changes nothing, and a threshold that fired on a *cache* gap
+   * rather than on the athlete's data would be worse than one that waited.
+   */
+  private async snapshotDailySamples(now: Date): Promise<void> {
+    // Deliberately not behind the "is anything listening for activities" check
+    // in `poll`: a threshold rule has no activity trigger, so gating on *that*
+    // would starve exactly the feature this cache exists for.
+    //
+    // It is gated on a threshold rule existing, though. This cache feeds
+    // nothing else, and most athletes never write one — buying them a COROS
+    // request every six hours forever to fill a table nobody reads is the kind
+    // of cost section 13 exists to notice. A rule created later finds the cache
+    // empty for one tick and then full, and its first evaluation only seeds
+    // (3.3), so nothing is missed by waiting.
+    if (!this.deps.isCorosAuthenticated()) {
+      return;
+    }
+    const wanted = this.deps
+      .listAutomations()
+      .some(
+        (automation) =>
+          automation.enabled && automation.trigger.kind === "threshold"
+      );
+    if (!wanted) {
+      return;
+    }
+    const last = this.deps.getSetting(DAILY_SAMPLE_SETTING);
+    const lastAt = last ? Date.parse(last) : Number.NaN;
+    if (
+      Number.isFinite(lastAt) &&
+      now.getTime() - lastAt < DAILY_SAMPLE_INTERVAL_MS
+    ) {
+      return;
+    }
+
+    const start = new Date(now);
+    start.setDate(start.getDate() - DAILY_SAMPLE_LOOKBACK_DAYS);
+
+    try {
+      const rows = await withDeadline(
+        this.deps.readDailySamples(happenDay(start), happenDay(now)),
+        this.deps.dailySampleTimeoutMs
+      );
+      if (rows === TIMED_OUT) {
+        // Deliberately not stamped: a call that never answered has not had its
+        // turn, and stamping would hide the problem for six hours.
+        this.deps.onError(new Error("Daily sample snapshot timed out."));
+        return;
+      }
+      this.deps.writeDailySamples(rows, now.toISOString());
+      this.deps.setSetting(DAILY_SAMPLE_SETTING, now.toISOString());
+    } catch (error) {
+      this.deps.onError(error);
+    }
   }
 
   /**

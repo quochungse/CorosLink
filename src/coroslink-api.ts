@@ -102,6 +102,8 @@ import type {
   CoachAutomationDetail,
   CoachAutomationInput,
   CoachAutomationRun,
+  CoachAutomationPause,
+  CoachAutomationSpend,
   CoachAutomationRunQuery,
   CoachAutomationSummary,
   ChatSettings,
@@ -682,6 +684,10 @@ export interface CorosLinkApi {
     filter?: CoachAutomationRunQuery
   ) => Promise<CoachAutomationRun[]>;
   cancelCoachAutomationRun: (runId: string) => Promise<void>;
+  getCoachAutomationPause: () => Promise<CoachAutomationPause | null>;
+  resumeCoachAutomations: () => Promise<CoachAutomationPause | null>;
+  getCoachAutomationSpend: () => Promise<CoachAutomationSpend>;
+  setCoachAutomationBudget: (budget: number | null) => Promise<CoachAutomationSpend>;
   markCoachAutomationRunsSeen: (runIds: string[]) => Promise<number>;
   listCoachAutomationSessionAttention: () => Promise<
     CoachAutomationSessionAttention[]
@@ -689,6 +695,9 @@ export interface CorosLinkApi {
   markCoachAutomationSessionSeen: (sessionId: string) => Promise<number>;
   onCoachAutomationRunUpdate: (
     callback: (run: CoachAutomationRun) => void
+  ) => () => void;
+  onCoachAutomationPauseUpdate: (
+    callback: (pause: CoachAutomationPause | null) => void
   ) => () => void;
   onChatStreamStart: (callback: (payload: ChatStreamStart) => void) => () => void;
   onChatStreamToken: (callback: (payload: ChatStreamToken) => void) => () => void;

@@ -24,6 +24,7 @@ import { DeleteAutomationDialog } from "./DeleteAutomationDialog";
 import { COACH_AUTOMATION_PRESETS } from "../../../electron/coachAutomationPresets";
 import {
   bindingModeLabel,
+  formatRunTokens,
   describeBindingMode,
   formatDuration,
   formatTimeAgo,
@@ -223,7 +224,12 @@ export function CoachAutomationDetail({
     }
   };
 
-  /** The way out of a run that is taking longer than the athlete wants to wait. */
+  /**
+    * The way out of a run that is taking longer than the athlete wants to wait.
+    * Pressed on one binding row, it ends the whole trigger (10) — the rows
+    * below this one are the same run reaching the athlete's other
+    * conversations, and stopping one of five was never what Stop meant.
+    */
   const stopRun = async (runId: string) => {
     if (!api) return;
     setError(null);
@@ -510,8 +516,8 @@ export function CoachAutomationDetail({
                       <button
                         type="button"
                         className="icon-button"
-                        aria-label="Stop this run"
-                        title="Stop this run"
+                        aria-label="Stop — here and everywhere else this run's automation is going"
+                        title="Stop — here and everywhere else this run's automation is going"
                         disabled={!api}
                         onClick={() => void stopRun(inFlight.id)}
                       >
@@ -593,6 +599,7 @@ export function CoachAutomationDetail({
                 // the athlete would go to see why nothing arrived. Whether it
                 // still exists is settled on the way out, not here.
                 const opensInto = onOpenConversation ? run.sessionId : undefined;
+                const runTokens = formatRunTokens(run);
                 const body = (
                   <>
                     <span
@@ -612,6 +619,10 @@ export function CoachAutomationDetail({
                         {formatTimeAgo(run.startedAt)} · {formatDuration(run)}
                         {run.model ? ` · ${run.model}` : ""}
                         {run.effort ? ` · effort ${run.effort}` : ""}
+                        {/* 13. Absent rather than zero when the
+                            provider reported nothing: a run whose cost nobody
+                            knows must not read as a free one. */}
+                        {runTokens ? ` · ${runTokens} tokens` : ""}
                       </span>
                     </div>
                     {opensInto ? (

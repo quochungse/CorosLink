@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import path from "node:path";
+import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 
@@ -110,6 +111,43 @@ assert.deepEqual(
 
 // Empty and already-clean inputs are handled.
 assert.deepEqual(applyChatToolPolicy([], "read-only"), []);
+
+// 5.7's summariser gets nothing at all. It is compressing text it was handed,
+// so a tool round-trip is both slower and a way to wander off the one job it
+// has — and the whole point of trimming is what a long conversation costs.
+assert.deepEqual(
+  applyChatToolPolicy(everything, "none"),
+  [],
+  "a no-tools turn is handed no tools, not the read-only set"
+);
+for (const tool of everything) {
+  assert.equal(
+    isToolAllowedUnderPolicy(tool.name, "none"),
+    false,
+    `${tool.name} must be unavailable under "none"`
+  );
+}
+assert.equal(
+  isToolAllowedUnderPolicy("get_recent_activities", "read-only"),
+  true,
+  "and the read-only set is untouched by adding it"
+);
+
+// The one caller of "none" is 5.7's summariser, and the runner suite injects
+// that dep — so nothing executes the policy the real one asks for. This is the
+// shape test-ipc-surface.mjs exists for: a wire that type-checks either way and
+// silently costs a tool round-trip per roll if it rots.
+{
+  const runner = readFileSync(
+    path.join(repoRoot, "electron", "coachAutomationService.ts"),
+    "utf8"
+  );
+  assert.match(
+    runner,
+    /buildRollingSummaryTurn\(previous, entries\)[\s\S]{0,400}?toolPolicy: "none"/,
+    "the rolling summariser must ask for no tools at all"
+  );
+}
 assert.deepEqual(
   namesOf(applyChatToolPolicy(named("draft_workout"), "read-only")),
   ["draft_workout"]

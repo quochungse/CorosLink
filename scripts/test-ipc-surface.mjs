@@ -127,7 +127,12 @@ for (const method of [
   "listCoachAutomationRuns",
   "cancelCoachAutomationRun",
   "markCoachAutomationRunsSeen",
-  "onCoachAutomationRunUpdate"
+  "onCoachAutomationRunUpdate",
+  "getCoachAutomationPause",
+  "resumeCoachAutomations",
+  "onCoachAutomationPauseUpdate",
+  "getCoachAutomationSpend",
+  "setCoachAutomationBudget"
 ]) {
   assert.ok(apiKeys.has(method), `CorosLinkApi is missing ${method}`);
 }

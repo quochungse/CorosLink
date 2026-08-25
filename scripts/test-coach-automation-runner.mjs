@@ -25,9 +25,21 @@ Module._load = function patchedLoad(request, ...rest) {
 };
 
 const {
+  AUTOMATION_BACKOFF_STEPS_MS,
+  isOverBudget,
+  startOfLocalMonth,
+  AUTOMATION_CONTEXT_KEEP,
+  AUTOMATION_CONTEXT_LIMIT,
+  buildRollingSummaryTurn,
+  planTranscriptContext,
+  summaryContextMessage,
+  checkProviderAuth,
+  getAutomationPause,
+  resumeAutomations,
   AUTOMATION_OUTPUT_CONTRACT,
   AUTOMATION_DEFAULT_EFFORT,
   NOTHING_TO_REPORT,
+  cancelAutomationRun,
   resolveAutomationRuntime,
   SESSION_BURST_PER_HOUR,
   expandTriggerToQueue,
@@ -255,13 +267,38 @@ function createWorld(overrides = {}) {
     updates: [],
     streamCalls: [],
     corosResult: { ok: true },
-    authenticated: true,
+    /**
+     * Credentials on disk, which is a *different* fact from "a reconnect would
+     * work". Collapsing the two into one field hid the case where they differ:
+     * the gate finds no credentials and holds, and only the run's own reconnect
+     * discovers COROS is reachable again.
+     */
+    corosOnDisk: true,
+    // Guard rail 3's verdict for whatever provider a run asks about.
+    providerAuth: { ok: true },
+    /** Section 10's pause, and every write to it in order. */
+    pause: null,
+    pauseWrites: [],
+    /** 12 (item 6): the month's ceiling and what the run log says was spent. */
+    budget: null,
+    monthToDateTokens: 0,
+    /** How often each half of the budget check was asked. */
+    budgetReads: 0,
+    spendReads: 0,
+    /** What the collector reports the turn cost; null is a silent provider. */
+    usage: { inputTokens: 120, outputTokens: 45 },
     // What the scripted collector reports back for the next run.
     outcome: { text: "Load is ramping fast.\nEase off Thursday.", entries: null },
     concurrent: 0,
     maxConcurrent: 0,
     sessionOrder: [],
     activities: [],
+    /** 5.7: sessionId -> { summary, through }, and every roll asked for. */
+    summaries: new Map(),
+    summaryWrites: [],
+    rolls: [],
+    /** What the summariser comes back with; null is a roll that failed. */
+    rollResult: "Rolled summary.",
     cancelledRunIds: []
   };
 
@@ -286,6 +323,15 @@ function createWorld(overrides = {}) {
       if (schedule.nextRunAt !== undefined) binding.nextRunAt = schedule.nextRunAt;
       if (schedule.lastActivityAt !== undefined) {
         binding.lastActivityAt = schedule.lastActivityAt ?? undefined;
+      }
+      if (schedule.backoffUntil !== undefined) {
+        binding.backoffUntil = schedule.backoffUntil ?? undefined;
+      }
+      // Level 0 reads back as absent, the way the real row does: the store only
+      // surfaces a level above zero, and a fake that kept the 0 would let
+      // `applyBackoff` see a streak where the database shows none.
+      if (schedule.backoffLevel !== undefined) {
+        binding.backoffLevel = schedule.backoffLevel || undefined;
       }
     },
     setBindingSession: (bindingId, sessionId) => {
@@ -332,6 +378,16 @@ function createWorld(overrides = {}) {
       const session = state.sessions.get(sessionId);
       return session ? [...session.entries] : undefined;
     },
+    getSessionSummary: (sessionId) =>
+      state.summaries.get(sessionId) ?? { through: 0 },
+    setSessionSummary: (sessionId, summary, through) => {
+      state.summaries.set(sessionId, { summary, through });
+      state.summaryWrites.push({ sessionId, summary, through });
+    },
+    rollSummary: async (previous, entries) => {
+      state.rolls.push({ previous, count: entries.length });
+      return state.rollResult;
+    },
     createSession: () => {
       sessionSeq += 1;
       const id = `session-new-${sessionSeq}`;
@@ -345,8 +401,22 @@ function createWorld(overrides = {}) {
       state.sessions.get(sessionId).title = title;
     },
     getChatProvider: () => "claude-code",
-    isProviderAuthenticated: () => state.authenticated,
+    checkProviderAuth: () => state.providerAuth,
     ensureCorosSession: async () => state.corosResult,
+    corosAuthenticated: () => state.corosOnDisk,
+    getBudget: () => {
+      state.budgetReads += 1;
+      return state.budget;
+    },
+    getMonthToDateTokens: () => {
+      state.spendReads += 1;
+      return state.monthToDateTokens;
+    },
+    getPause: () => state.pause,
+    setPause: (pause) => {
+      state.pause = pause;
+      state.pauseWrites.push(pause);
+    },
     createCollector: (marker) => {
       const outcome = state.outcome;
       const entries =
@@ -362,6 +432,7 @@ function createWorld(overrides = {}) {
         error: () => outcome.error,
         authError: () => outcome.authError === true,
         text: () => outcome.text ?? "",
+        usage: () => state.usage ?? undefined,
         marker
       };
     },
@@ -819,7 +890,7 @@ async function runWith(configure) {
 // 3. provider not authenticated
 {
   const { run } = await runWith((w) => {
-    w.authenticated = false;
+    w.providerAuth = { ok: false, reason: "ChatGPT is not signed in." };
   });
   assert.equal(run.skipReason, "no-auth");
   assert.equal(run.sessionId, "s1", "the resolved session is still recorded");
@@ -947,7 +1018,7 @@ async function runWith(configure) {
 // activity watcher polls every 15 minutes.
 
 for (const [label, configure] of [
-  ["not signed in", (w) => { w.authenticated = false; }],
+  ["not signed in", (w) => { w.providerAuth = { ok: false, reason: "ChatGPT is not signed in." }; }],
   ["COROS offline", (w) => { w.corosResult = { ok: false, twoFactorRequired: false }; }],
   ["quiet hours", (w) => {
     w.automations.get("a1").conditions.quietHours = { start: "00:00", end: "23:59" };
@@ -981,7 +1052,7 @@ for (const [label, configure] of [
 {
   resetAutomationQueueForTests();
   const world = createWorld();
-  world.authenticated = false;
+  world.providerAuth = { ok: false, reason: "ChatGPT is not signed in." };
   addAutomation(world, "a1");
   addBinding(world, "b1", { mode: "dedicated", sessionId: "s-gone" });
 
@@ -1613,6 +1684,1318 @@ async function withDeadline(work, ms, what) {
   );
   assert.equal(behind.status, "success");
   await first;
+}
+
+
+// ---------------------------------------------------------------------------
+// Per-binding backoff after a failure (10)
+// ---------------------------------------------------------------------------
+
+const MINUTE = 60_000;
+
+assert.deepEqual(
+  AUTOMATION_BACKOFF_STEPS_MS,
+  [5 * MINUTE, 15 * MINUTE, 60 * MINUTE],
+  "section 10's steps, and the last one is the ceiling"
+);
+
+/** How far ahead of the world clock a binding is held off, in minutes. */
+const backoffMinutes = (world, bindingId = "b1") => {
+  const binding = world.bindings.get(bindingId);
+  return binding.backoffUntil
+    ? Math.round((Date.parse(binding.backoffUntil) - world.now.getTime()) / MINUTE)
+    : null;
+};
+
+/** Waits for something the runner does on its own clock, not on this one. */
+async function waitFor(read, what) {
+  for (let attempt = 0; attempt < 400; attempt += 1) {
+    const value = read();
+    if (value) return value;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  return assert.fail(what);
+}
+
+// --- 5m, 15m, 60m, and the dead provider is not called in between -----------
+{
+  resetAutomationQueueForTests();
+  const world = createWorld();
+  addAutomation(world, "a1", { conditions: NO_LIMITS });
+  addSession(world, "s1");
+  addBinding(world, "b1");
+  world.outcome.throws = "the provider hung up";
+
+  const fire = async () => {
+    const [run] = await runAutomationTrigger(
+      { automationId: "a1", kind: "schedule" },
+      world.deps
+    );
+    return run;
+  };
+
+  assert.equal((await fire()).status, "failed");
+  assert.equal(backoffMinutes(world), 5, "the first failure is worth five minutes");
+  assert.equal(world.bindings.get("b1").backoffLevel, 1);
+
+  // Enforced in the runner, not in the scheduler: the schedule trigger fires as
+  // usual and is declined here, with a reason on the row for the athlete.
+  world.now = new Date(world.now.getTime() + 4 * MINUTE);
+  const early = await fire();
+  assert.equal(early.status, "skipped");
+  assert.equal(early.skipReason, "backoff");
+  assert.equal(world.streamCalls.length, 1, "and the dead provider is left alone");
+
+  // A declined run is not a failure and not a success, so it neither escalates
+  // the backoff nor clears it — the second of those would be a guard rail that
+  // switched itself off the first time it did anything.
+  assert.equal(world.bindings.get("b1").backoffLevel, 1);
+  assert.equal(backoffMinutes(world), 1);
+
+  world.now = new Date(world.now.getTime() + MINUTE);
+  assert.equal((await fire()).status, "failed", "the window closed, so it tries again");
+  assert.equal(backoffMinutes(world), 15, "and the second failure is worth fifteen");
+
+  world.now = new Date(world.now.getTime() + 15 * MINUTE);
+  await fire();
+  assert.equal(backoffMinutes(world), 60);
+
+  world.now = new Date(world.now.getTime() + 60 * MINUTE);
+  await fire();
+  assert.equal(backoffMinutes(world), 60, "an hour is the ceiling, not a step on the way up");
+  assert.equal(world.bindings.get("b1").backoffLevel, 3);
+}
+
+// --- a timed-out run backs off exactly as a thrown one does -----------------
+{
+  // The two paths of section 10 that leave `lastRunAt` and the watermark where
+  // they were. They have to be indistinguishable here, or the backoff covers
+  // only half of what made "give up on a run that has gone quiet" safe.
+  const backoffTrace = async (streamChat) => {
+    resetAutomationQueueForTests();
+    const world = createWorld({ idleTimeoutMs: 20, streamChat });
+    addAutomation(world, "a1", { conditions: NO_LIMITS });
+    addSession(world, "s1");
+    addBinding(world, "b1");
+
+    const trace = [];
+    for (const wait of [0, 5, 15]) {
+      world.now = new Date(world.now.getTime() + wait * MINUTE);
+      const [run] = await withDeadline(
+        runAutomationTrigger({ automationId: "a1", kind: "schedule" }, world.deps),
+        2_000,
+        "a run that never ends has to end by itself"
+      );
+      trace.push({
+        status: run.status,
+        level: world.bindings.get("b1").backoffLevel,
+        minutes: backoffMinutes(world)
+      });
+    }
+    return trace;
+  };
+
+  const thrown = await backoffTrace(async () => {
+    throw new Error("the provider hung up");
+  });
+  assert.deepEqual(thrown, [
+    { status: "failed", level: 1, minutes: 5 },
+    { status: "failed", level: 2, minutes: 15 },
+    { status: "failed", level: 3, minutes: 60 }
+  ]);
+
+  const timedOut = await backoffTrace(() => new Promise(() => {}));
+  assert.deepEqual(
+    timedOut,
+    thrown,
+    "a run given up on backs off exactly as a run that threw does"
+  );
+}
+
+// --- reset on any non-failure ----------------------------------------------
+{
+  const afterRun = async (outcome) => {
+    resetAutomationQueueForTests();
+    const world = createWorld();
+    addAutomation(world, "a1", { conditions: NO_LIMITS });
+    addSession(world, "s1");
+    addBinding(world, "b1", {
+      backoffLevel: 2,
+      // Already expired, so the guard lets this run through — it is the run's
+      // outcome being tested, not the guard.
+      backoffUntil: new Date(world.now.getTime() - MINUTE).toISOString()
+    });
+    Object.assign(world.outcome, outcome);
+    const [run] = await runAutomationTrigger(
+      { automationId: "a1", kind: "schedule" },
+      world.deps
+    );
+    return { status: run.status, binding: world.bindings.get("b1") };
+  };
+
+  for (const [expected, outcome] of [
+    ["success", {}],
+    ["silent", { text: NOTHING_TO_REPORT }],
+    ["cancelled", { cancelled: true }]
+  ]) {
+    const { status, binding } = await afterRun(outcome);
+    assert.equal(status, expected);
+    assert.equal(binding.backoffLevel, undefined, `a ${expected} run clears the streak`);
+    assert.equal(binding.backoffUntil, undefined);
+  }
+}
+
+// --- the one skip that reaches the end of a run does not clear the streak ---
+{
+  // `no-auth` is the only skip decided after the provider has answered, so it
+  // is the only one that goes through the same exit as a success. Section 10
+  // already promises no retry storm for it; clearing a streak of real failures
+  // on the way past would start one.
+  resetAutomationQueueForTests();
+  const world = createWorld();
+  addAutomation(world, "a1", { conditions: NO_LIMITS });
+  addSession(world, "s1");
+  addBinding(world, "b1", {
+    backoffLevel: 2,
+    backoffUntil: new Date(world.now.getTime() - MINUTE).toISOString()
+  });
+  Object.assign(world.outcome, { error: "Sign in to continue.", authError: true });
+
+  const [run] = await runAutomationTrigger(
+    { automationId: "a1", kind: "schedule" },
+    world.deps
+  );
+  assert.equal(run.status, "skipped");
+  assert.equal(run.skipReason, "no-auth");
+  assert.equal(world.bindings.get("b1").backoffLevel, 2, "the streak is left alone");
+}
+
+// --- "Run now" overrules it, like every other rate guard (3.4) --------------
+{
+  resetAutomationQueueForTests();
+  const world = createWorld();
+  addAutomation(world, "a1", { conditions: NO_LIMITS });
+  addSession(world, "s1");
+  addBinding(world, "b1", {
+    backoffLevel: 3,
+    backoffUntil: new Date(world.now.getTime() + 60 * MINUTE).toISOString()
+  });
+
+  const [automatic] = await runAutomationTrigger(
+    { automationId: "a1", kind: "schedule" },
+    world.deps
+  );
+  assert.equal(automatic.skipReason, "backoff");
+
+  // The athlete has just fixed whatever was broken and wants to know whether it
+  // worked. An hour of silence is the wrong answer to that.
+  const [manual] = await runAutomationNow("a1", undefined, world.deps);
+  assert.equal(manual.status, "success");
+  assert.equal(
+    world.bindings.get("b1").backoffLevel,
+    undefined,
+    "and the answer it got clears the streak"
+  );
+}
+
+// --- a failure part-way through a catch-up sequence stops the sequence ------
+{
+  resetAutomationQueueForTests();
+  const world = createWorld();
+  addAutomation(world, "a1", {
+    trigger: { ...ACTIVITY_TRIGGER, multiActivity: true },
+    conditions: NO_LIMITS
+  });
+  addSession(world, "s1");
+  addBinding(world, "b1", {
+    sessionId: "s1",
+    lastActivityAt: RUNNER_NOW_EPOCH - 8 * 86_400
+  });
+  addActivity(world, "t1", 5);
+  addActivity(world, "t2", 4);
+  addActivity(world, "t3", 3);
+  world.outcome.throws = "the provider hung up";
+
+  const runs = await runAutomationTrigger(
+    { automationId: "a1", kind: "activity" },
+    world.deps
+  );
+  // Unlike the cooldown, the backoff is checked at every step of a sequence:
+  // a failure part-way through is exactly the storm being prevented.
+  assert.deepEqual(runs.map((run) => run.status), ["failed", "skipped"]);
+  assert.equal(runs[1].skipReason, "backoff");
+  assert.equal(world.streamCalls.length, 1, "the second activity is not attempted");
+  assert.equal(
+    world.bindings.get("b1").lastActivityAt,
+    RUNNER_NOW_EPOCH - 8 * 86_400,
+    "and all three are still owed once the backoff expires"
+  );
+}
+
+// --- a run that blows up before it reaches the provider backs off too -------
+{
+  resetAutomationQueueForTests();
+  const world = createWorld({
+    getSessionEntries: () => {
+      throw new Error("the transcript could not be read");
+    }
+  });
+  addAutomation(world, "a1", { conditions: NO_LIMITS });
+  addSession(world, "s1");
+  addBinding(world, "b1");
+
+  const [run] = await runAutomationTrigger(
+    { automationId: "a1", kind: "schedule" },
+    world.deps
+  );
+  assert.equal(run.status, "failed");
+  assert.equal(
+    backoffMinutes(world),
+    5,
+    "the fan-out's own catch records a failure, so it has to back off like one"
+  );
+}
+
+// --- a healthy binding does not rewrite its own row on every run ------------
+{
+  resetAutomationQueueForTests();
+  const world = createWorld();
+  addAutomation(world, "a1", { conditions: NO_LIMITS });
+  addSession(world, "s1");
+  addBinding(world, "b1");
+
+  const writes = [];
+  const stamp = world.deps.setBindingSchedule;
+  world.deps.setBindingSchedule = (bindingId, schedule) => {
+    writes.push(schedule);
+    stamp(bindingId, schedule);
+  };
+
+  await runAutomationTrigger({ automationId: "a1", kind: "schedule" }, world.deps);
+  assert.ok(writes.length, "the run still stamps its clock");
+  assert.ok(
+    writes.every(
+      (write) => write.backoffLevel === undefined && write.backoffUntil === undefined
+    ),
+    "an automation that has never failed has no streak to clear"
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Stop ends a trigger, not one run of it (10)
+// ---------------------------------------------------------------------------
+
+// --- one press stops a three-place fan-out ---------------------------------
+{
+  resetAutomationQueueForTests();
+  const world = createWorld({
+    // The athlete presses Stop on the run they can see. Two more conversations
+    // are queued behind it, and before the token each needed its own press —
+    // aimed at runs that did not exist yet, so there was nothing to aim at.
+    //
+    // This run then finishes normally: the abort raced the provider and lost.
+    // Nothing about the run itself says Stop was pressed, so the token is the
+    // only thing that can stop the two behind it.
+    streamChat: async (_sink, runId) => {
+      world.streamCalls.push({ runId });
+      cancelAutomationRun(runId, world.deps);
+    }
+  });
+  addAutomation(world, "a1", { conditions: NO_LIMITS });
+  addSession(world, "s1");
+  addSession(world, "s2");
+  addSession(world, "s3");
+  addBinding(world, "b1", { sessionId: "s1" });
+  addBinding(world, "b2", { sessionId: "s2" });
+  addBinding(world, "b3", { sessionId: "s3" });
+
+  const runs = await withDeadline(
+    runAutomationNow("a1", undefined, world.deps),
+    2_000,
+    "a cancelled fan-out still has to return"
+  );
+  assert.deepEqual(runs.map((run) => run.status), ["success"]);
+  assert.equal(world.streamCalls.length, 1, "the other two conversations are never asked");
+  assert.equal(world.runs.length, 1, "and no run is logged for them either");
+  assert.deepEqual(
+    world.cancelledRunIds,
+    [runs[0].id],
+    "the run's own stream is still aborted, exactly once"
+  );
+}
+
+// --- Stop landing while a run was still getting itself ready ---------------
+{
+  // The token was clear when this step started, so the check at the top of it
+  // saw nothing; by the time there was a provider to call, the athlete had
+  // already pressed Stop on the step before it.
+  resetAutomationQueueForTests();
+  let ready = () => undefined;
+  const gettingReady = new Promise((resolve) => {
+    ready = resolve;
+  });
+  let release = () => undefined;
+  const world = createWorld({
+    ensureCorosSession: async () => {
+      if (world.streamCalls.length === 1) {
+        ready();
+        await new Promise((resolve) => {
+          release = resolve;
+        });
+      }
+      return { ok: true };
+    },
+    streamChat: async (_sink, runId) => {
+      world.streamCalls.push({ runId });
+    }
+  });
+  addAutomation(world, "a1", {
+    trigger: { ...ACTIVITY_TRIGGER, multiActivity: true },
+    conditions: NO_LIMITS
+  });
+  addSession(world, "s1");
+  addBinding(world, "b1", {
+    sessionId: "s1",
+    lastActivityAt: RUNNER_NOW_EPOCH - 8 * 86_400
+  });
+  addActivity(world, "t1", 5);
+  addActivity(world, "t2", 4);
+
+  const fanOut = runAutomationNow("a1", undefined, world.deps);
+  await gettingReady;
+  cancelAutomationRun(world.runs[0].id, world.deps);
+  release();
+
+  const runs = await withDeadline(fanOut, 2_000, "a cancelled step still has to return");
+  assert.deepEqual(runs.map((run) => run.status), ["success", "cancelled"]);
+  assert.equal(world.streamCalls.length, 1, "the second run never reaches the provider");
+  assert.equal(
+    world.bindings.get("b1").lastActivityAt,
+    RUNNER_NOW_EPOCH - 5 * 86_400,
+    "and the activity it was cancelled over is still owed"
+  );
+}
+
+// --- and the run queued behind a stall -------------------------------------
+{
+  resetAutomationQueueForTests();
+  let release = () => undefined;
+  const world = createWorld({
+    // Long enough that the idle bound is not what ends this: the point is that
+    // Stop ends it, rather than three minutes of nothing followed by a run
+    // nobody wanted.
+    idleTimeoutMs: 10_000,
+    streamChat: (_sink, runId) =>
+      new Promise((resolve) => {
+        world.streamCalls.push({ runId });
+        release = resolve;
+      }),
+    // Aborting is what lets a stalled stream go, which is what really happens.
+    cancelRun: (runId) => {
+      world.cancelledRunIds.push(runId);
+      world.outcome.cancelled = true;
+      release();
+    }
+  });
+  addAutomation(world, "a1", { conditions: NO_LIMITS });
+  addSession(world, "s1");
+  addSession(world, "s2");
+  addBinding(world, "b1", { sessionId: "s1" });
+  addBinding(world, "b2", { sessionId: "s2" });
+
+  const fanOut = runAutomationNow("a1", undefined, world.deps);
+  const stalled = await waitFor(() => world.runs[0], "the first run has to start");
+  cancelAutomationRun(stalled.id, world.deps);
+
+  const runs = await withDeadline(fanOut, 2_000, "Stop has to end the fan-out");
+  assert.deepEqual(runs.map((run) => run.status), ["cancelled"]);
+  assert.equal(world.streamCalls.length, 1, "the run behind the stall never starts");
+}
+
+// --- the token, not the run's status, is what ends a sequence ---------------
+{
+  // This run finishes normally — the abort raced the provider and lost — and
+  // the two activities behind it are dropped all the same. Nothing about the
+  // run itself says the athlete pressed Stop, so the sequence has only the
+  // token to go on.
+  resetAutomationQueueForTests();
+  const world = createWorld({
+    streamChat: async (_sink, runId) => {
+      world.streamCalls.push({ runId });
+      cancelAutomationRun(runId, world.deps);
+    }
+  });
+  addAutomation(world, "a1", {
+    trigger: { ...ACTIVITY_TRIGGER, multiActivity: true },
+    conditions: NO_LIMITS
+  });
+  addSession(world, "s1");
+  addBinding(world, "b1", {
+    sessionId: "s1",
+    lastActivityAt: RUNNER_NOW_EPOCH - 8 * 86_400
+  });
+  addActivity(world, "t1", 5);
+  addActivity(world, "t2", 4);
+  addActivity(world, "t3", 3);
+
+  const runs = await withDeadline(
+    runAutomationNow("a1", undefined, world.deps),
+    2_000,
+    "a cancelled sequence still has to return"
+  );
+  assert.deepEqual(runs.map((run) => run.status), ["success"]);
+  assert.deepEqual(analysedIds(world), ["t1"], "the two behind it are dropped, not run");
+  assert.equal(
+    world.bindings.get("b1").lastActivityAt,
+    RUNNER_NOW_EPOCH - 5 * 86_400,
+    "and what the model did look at is not thrown away"
+  );
+}
+
+// --- a Stop no live trigger owns still reaches the abort map ----------------
+{
+  resetAutomationQueueForTests();
+  const world = createWorld({
+    streamChat: async (_sink, runId) => {
+      world.streamCalls.push({ runId });
+      if (world.streamCalls.length === 1) {
+        // Somebody else's run, or one this trigger has already let go of — a
+        // stream left settling in its own time after a timeout outlives the
+        // fan-out that started it.
+        cancelAutomationRun("run-from-another-life", world.deps);
+      }
+    }
+  });
+  addAutomation(world, "a1", { conditions: NO_LIMITS });
+  addSession(world, "s1");
+  addSession(world, "s2");
+  addBinding(world, "b1", { sessionId: "s1" });
+  addBinding(world, "b2", { sessionId: "s2" });
+
+  const runs = await runAutomationNow("a1", undefined, world.deps);
+  assert.equal(runs.length, 2, "an unrelated Stop does not end a live trigger");
+  assert.deepEqual(world.cancelledRunIds, ["run-from-another-life"]);
+}
+
+
+// ---------------------------------------------------------------------------
+// Guard rail 3, for every provider (10)
+// ---------------------------------------------------------------------------
+
+const SIGNED_IN = {
+  chatgptSignedIn: true,
+  claudeCodeState: "connected",
+  anthropicHasApiKey: true,
+  localModel: "qwen3:8b"
+};
+
+// Each provider is asked about its own credential and nothing else. This is
+// the whole point of widening the pre-flight: an automation may override the
+// provider (decision 2), so a signed-out ChatGPT must not hold back a rule
+// running on Claude Code, and never did — it simply used to be invisible.
+for (const [provider, broken, expected] of [
+  ["chatgpt", { chatgptSignedIn: false }, /ChatGPT/],
+  ["claude-code", { claudeCodeState: "sign-in-required" }, /Claude Code.*signed in/],
+  ["claude-code", { claudeCodeState: "not-installed" }, /CLI is not installed/],
+  ["claude-api", { anthropicHasApiKey: false }, /Anthropic API key/],
+  ["local", { localModel: "   " }, /local model/]
+]) {
+  assert.deepEqual(
+    checkProviderAuth(provider, SIGNED_IN),
+    { ok: true },
+    `${provider} is usable when everything is in place`
+  );
+
+  const verdict = checkProviderAuth(provider, { ...SIGNED_IN, ...broken });
+  assert.equal(verdict.ok, false, `${provider} must decline on ${Object.keys(broken)[0]}`);
+  assert.match(
+    verdict.reason,
+    expected,
+    "and say which thing is missing, or the athlete opens the wrong screen"
+  );
+
+  // The other three are unaffected by it. Before this, the answer for all of
+  // them was a flat `true`, so nothing could be.
+  for (const other of ["chatgpt", "claude-code", "claude-api", "local"]) {
+    if (other === provider) continue;
+    assert.deepEqual(
+      checkProviderAuth(other, { ...SIGNED_IN, ...broken }),
+      { ok: true },
+      `${other} must not be held back by ${provider}'s problem`
+    );
+  }
+}
+
+// The states that decline are the ones that are unambiguous *and* stable. A
+// fresh install whose Coach view nobody has opened has no recorded state at
+// all, and holding every automation on a machine where nothing is wrong is a
+// worse answer than letting the stream report it.
+for (const state of [undefined, "connecting", "connection-failed", "usage-limit-reached"]) {
+  assert.deepEqual(
+    checkProviderAuth("claude-code", { ...SIGNED_IN, claudeCodeState: state }),
+    { ok: true },
+    `a "${state}" CLI is not a pre-flight refusal`
+  );
+}
+
+// --- the verdict's reason rides along on the row ---------------------------
+{
+  const { run } = await runWith((w) => {
+    w.providerAuth = { ok: false, reason: "No Anthropic API key is stored." };
+  });
+  assert.equal(run.skipReason, "no-auth");
+  assert.equal(
+    run.error,
+    "No Anthropic API key is stored.",
+    "a run log that cannot tell a missing key from a missing CLI sends the athlete to the wrong screen"
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Pausing every automation on a 2FA demand (10)
+// ---------------------------------------------------------------------------
+
+const TWO_FACTOR = { ok: false, twoFactorRequired: true };
+
+/** An automation attached in three places, so a fan-out has somewhere to go. */
+function threePlaceWorld(configure = () => undefined) {
+  const world = createWorld();
+  addAutomation(world, "a1", { conditions: NO_LIMITS });
+  for (const [index, id] of ["b1", "b2", "b3"].entries()) {
+    addSession(world, `s${index + 1}`);
+    addBinding(world, id, { sessionId: `s${index + 1}` });
+  }
+  configure(world);
+  // COROS asking for a login code means there is nothing usable on disk either.
+  if (world.corosResult.twoFactorRequired) {
+    world.corosOnDisk = false;
+  }
+  return world;
+}
+
+// --- one row, not one per binding, and then silence ------------------------
+{
+  resetAutomationQueueForTests();
+  const world = threePlaceWorld((w) => {
+    w.corosResult = TWO_FACTOR;
+  });
+
+  const first = await runAutomationTrigger(
+    { automationId: "a1", kind: "schedule" },
+    world.deps
+  );
+  assert.deepEqual(
+    first.map((run) => run.skipReason),
+    ["two-factor-required"],
+    "every remaining place gets the same answer, so the log carries it once"
+  );
+  assert.equal(world.pause.reason, "two-factor-required");
+  assert.equal(
+    world.pause.runId,
+    first[0].id,
+    "the pause points at the row that explains it"
+  );
+
+  // And the next fifteen minutes, and the fifteen after that.
+  world.now = new Date(world.now.getTime() + 15 * MINUTE);
+  const later = await runAutomationTrigger(
+    { automationId: "a1", kind: "activity" },
+    world.deps
+  );
+  assert.deepEqual(later, [], "a held trigger produces no runs");
+  assert.equal(
+    world.runs.length,
+    1,
+    "and logs nothing — the run log filling with the same skip is what this stops"
+  );
+}
+
+// --- a manual run is the athlete asking, so it still goes through ----------
+{
+  resetAutomationQueueForTests();
+  const world = threePlaceWorld((w) => {
+    w.corosResult = TWO_FACTOR;
+  });
+  await runAutomationTrigger({ automationId: "a1", kind: "schedule" }, world.deps);
+  world.runs.length = 0;
+
+  // Still locked: the athlete gets the one skip that says so, rather than a
+  // button that silently does nothing.
+  const [again] = await runAutomationNow("a1", undefined, world.deps);
+  assert.equal(again.skipReason, "two-factor-required");
+  assert.ok(world.pause, "and it stays paused");
+
+  // Now reachable — but through a *reconnect*, with nothing yet on disk for the
+  // gate to see. The gate therefore still holds, and the only thing that can
+  // lift the pause is the run's own COROS check coming back usable. This is the
+  // case a fake that collapsed the two facts into one could not tell apart.
+  world.corosResult = { ok: true };
+  assert.equal(world.corosOnDisk, false, "nothing the gate can read has changed");
+  const [fixed] = await runAutomationNow("a1", ["b1"], world.deps);
+  assert.equal(fixed.status, "success");
+  assert.equal(world.pause, null, "a COROS session that answers clears the pause");
+}
+
+// --- the cause disappearing is not a second way to resume ------------------
+{
+  // The athlete signs in to COROS from the settings screen, which knows nothing
+  // about automations. Nothing would ever ask again, because the gate is what
+  // stops the asking — so the gate is where the pause has to notice.
+  resetAutomationQueueForTests();
+  const world = threePlaceWorld((w) => {
+    w.corosResult = TWO_FACTOR;
+  });
+  await runAutomationTrigger({ automationId: "a1", kind: "schedule" }, world.deps);
+  assert.ok(world.pause);
+
+  world.corosResult = { ok: true };
+  world.corosOnDisk = true;
+  const runs = await runAutomationTrigger(
+    { automationId: "a1", kind: "schedule" },
+    world.deps
+  );
+  assert.equal(world.pause, null, "the pause lifts itself once its cause is gone");
+  assert.deepEqual(
+    runs.map((run) => run.status),
+    ["success", "success", "success"],
+    "and the whole fan-out runs again"
+  );
+}
+
+// --- Resume clears it, and promises nothing else ---------------------------
+{
+  resetAutomationQueueForTests();
+  const world = threePlaceWorld((w) => {
+    w.corosResult = TWO_FACTOR;
+  });
+  await runAutomationTrigger({ automationId: "a1", kind: "schedule" }, world.deps);
+  assert.ok(getAutomationPause(world.deps), "the banner reads the flag it shows");
+
+  assert.equal(resumeAutomations(world.deps), null);
+  assert.equal(getAutomationPause(world.deps), null);
+
+  // Resume means "try again", not "fixed": COROS is still asking, so the next
+  // trigger re-trips it rather than quietly declining forever.
+  const runs = await runAutomationTrigger(
+    { automationId: "a1", kind: "schedule" },
+    world.deps
+  );
+  assert.deepEqual(runs.map((run) => run.skipReason), ["two-factor-required"]);
+  assert.ok(world.pause, "and the pause is back, because the reason is");
+}
+
+// --- an offline COROS is not a 2FA demand ----------------------------------
+{
+  // The two arrive on the same path and only one of them is unanswerable by
+  // retrying. Pausing everything for a flaky network would be a feature that
+  // switches the app off every time a train goes into a tunnel.
+  resetAutomationQueueForTests();
+  const world = threePlaceWorld((w) => {
+    w.corosResult = { ok: false, twoFactorRequired: false };
+  });
+
+  const runs = await runAutomationTrigger(
+    { automationId: "a1", kind: "schedule" },
+    world.deps
+  );
+  assert.deepEqual(
+    runs.map((run) => run.skipReason),
+    ["offline", "offline", "offline"],
+    "an offline skip is per binding and the fan-out carries on"
+  );
+  assert.equal(world.pause, null, "and nothing is paused");
+}
+
+
+// ---------------------------------------------------------------------------
+// Context trimming (5.7)
+// ---------------------------------------------------------------------------
+
+assert.equal(AUTOMATION_CONTEXT_LIMIT, 60);
+assert.equal(AUTOMATION_CONTEXT_KEEP, 20);
+assert.ok(
+  AUTOMATION_CONTEXT_KEEP < AUTOMATION_CONTEXT_LIMIT,
+  "the gap between them is how many runs happen between two rolls"
+);
+
+/** `count` message entries, numbered so a slice can be identified on sight. */
+const transcript = (count, offset = 0) =>
+  Array.from({ length: count }, (_unused, index) => ({
+    kind: "message",
+    role: index % 2 === 0 ? "user" : "assistant",
+    content: `entry ${index + offset}`
+  }));
+
+const contentsOf = (entries) => entries.map((entry) => entry.content);
+
+// --- under the limit, everything goes ---------------------------------------
+{
+  const entries = transcript(AUTOMATION_CONTEXT_LIMIT);
+  const plan = planTranscriptContext(entries, { through: 0 });
+  assert.equal(plan.summary, undefined);
+  assert.equal(plan.tail.length, AUTOMATION_CONTEXT_LIMIT, "exactly at the limit is under it");
+  assert.deepEqual(plan.toSummarise, [], "and nothing has to be summarised");
+  assert.equal(plan.through, 0);
+}
+
+// --- one past it rolls, and keeps exactly the tail --------------------------
+{
+  const entries = transcript(AUTOMATION_CONTEXT_LIMIT + 1);
+  const plan = planTranscriptContext(entries, { through: 0 });
+  assert.equal(plan.tail.length, AUTOMATION_CONTEXT_KEEP);
+  assert.deepEqual(
+    contentsOf(plan.tail),
+    contentsOf(entries.slice(-AUTOMATION_CONTEXT_KEEP)),
+    "the tail is the most recent entries, not the oldest"
+  );
+  assert.deepEqual(
+    contentsOf(plan.toSummarise),
+    contentsOf(entries.slice(0, entries.length - AUTOMATION_CONTEXT_KEEP)),
+    "and everything in front of it is folded in — nothing is dropped"
+  );
+  assert.equal(plan.through, entries.length - AUTOMATION_CONTEXT_KEEP);
+  assert.equal(
+    plan.toSummarise.length + plan.tail.length,
+    entries.length,
+    "the two halves account for the whole transcript"
+  );
+}
+
+// --- the count is measured from the summary, not from the start -------------
+{
+  // This is the difference between a rolling summary and a fixed window. A
+  // conversation of 200 entries whose summary already covers 180 has 20 live
+  // entries and needs no roll at all — where a fixed window would re-roll on
+  // every run, paying a model call each time and compressing a compression.
+  const entries = transcript(200);
+  const settled = planTranscriptContext(entries, { summary: "So far.", through: 180 });
+  assert.deepEqual(settled.toSummarise, [], "20 live entries is nothing to do");
+  assert.equal(settled.summary, "So far.");
+  assert.equal(settled.tail.length, 20);
+
+  // The case that tells the two readings apart. 100 entries is well past the
+  // limit; 50 of them past the summary is not. A count taken from the start
+  // would roll here — and go on rolling on every run for the life of the
+  // conversation, which is the cost this is supposed to avoid.
+  const midway = planTranscriptContext(transcript(100), {
+    summary: "So far.",
+    through: 50
+  });
+  assert.deepEqual(midway.toSummarise, [], "a long conversation is not a reason to roll");
+  assert.equal(midway.through, 50, "the summary stays where it is");
+  assert.equal(
+    midway.tail.length,
+    50,
+    "and the live stretch goes in full, however long the whole thread is"
+  );
+
+  // It rolls again only once the live stretch has grown past the limit, which
+  // is `LIMIT - KEEP` runs' worth of entries later.
+  const grown = planTranscriptContext(transcript(241), {
+    summary: "So far.",
+    through: 180
+  });
+  assert.equal(grown.through, 241 - AUTOMATION_CONTEXT_KEEP);
+  assert.equal(
+    grown.toSummarise.length,
+    grown.through - 180,
+    "and folds in everything between the old summary and the new tail"
+  );
+}
+
+// --- a summary that outlived its transcript is abandoned --------------------
+{
+  // It should not happen: the window's saves merge rather than truncate (5.6b)
+  // and a deleted conversation takes its row with it. But a summary claiming to
+  // cover entries nobody can see is the one failure here that cannot be noticed
+  // by reading the answer, so it is not trusted.
+  const plan = planTranscriptContext(transcript(5), {
+    summary: "About a conversation that is gone.",
+    through: 90
+  });
+  assert.equal(plan.summary, undefined, "the stale summary is dropped, not sent");
+  assert.equal(plan.through, 0);
+  assert.deepEqual(contentsOf(plan.tail), contentsOf(transcript(5)));
+
+  const negative = planTranscriptContext(transcript(5), { through: -1 });
+  assert.equal(negative.through, 0);
+  assert.equal(negative.tail.length, 5);
+}
+
+// --- what the summary looks like on the wire --------------------------------
+{
+  const message = summaryContextMessage("Marathon in October. Calf grumbling.");
+  assert.equal(message.role, "user", "one shape that reads the same to four providers");
+  assert.match(message.content, /summarised/i);
+  assert.match(message.content, /Marathon in October/);
+  assert.match(
+    message.content,
+    /recent turns in full/i,
+    "the model has to know where the compression stops"
+  );
+
+  // The roll's own turn carries the previous summary when there is one, and
+  // says so — a model handed two blocks of text with no labels merges them.
+  const first = buildRollingSummaryTurn(undefined, transcript(2));
+  assert.doesNotMatch(first, /Running summary/);
+  assert.match(first, /opening turns/i);
+
+  const later = buildRollingSummaryTurn("Marathon in October.", transcript(2));
+  assert.match(later, /Running summary/);
+  assert.match(later, /Marathon in October\./);
+  assert.match(later, /Newer turns/);
+  assert.match(later, /Athlete: entry 0/, "the turns are attributed, not run together");
+  assert.match(later, /Coach: entry 1/);
+  assert.match(
+    later,
+    /only record of these turns/i,
+    "and the model is told what it is for, which is what makes it keep the right things"
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Trimming, in a run
+// ---------------------------------------------------------------------------
+
+/** The messages the last run put on the wire. */
+const lastWire = (world) =>
+  world.streamCalls[world.streamCalls.length - 1].messages;
+
+// --- a short conversation is untouched --------------------------------------
+{
+  resetAutomationQueueForTests();
+  const world = createWorld();
+  addAutomation(world, "a1", { conditions: NO_LIMITS });
+  addSession(world, "s1", transcript(4));
+  addBinding(world, "b1");
+
+  await runAutomationNow("a1", undefined, world.deps);
+  assert.deepEqual(world.rolls, [], "nothing to summarise");
+  assert.deepEqual(
+    lastWire(world).map((message) => message.content).slice(0, 4),
+    contentsOf(transcript(4)),
+    "and the whole transcript goes as it always did"
+  );
+}
+
+// --- a long one is rolled, stored, and sent as summary + tail ---------------
+{
+  resetAutomationQueueForTests();
+  const world = createWorld();
+  addAutomation(world, "a1", { conditions: NO_LIMITS });
+  addSession(world, "s1", transcript(100));
+  addBinding(world, "b1");
+
+  await runAutomationNow("a1", undefined, world.deps);
+
+  assert.equal(world.rolls.length, 1);
+  assert.equal(world.rolls[0].previous, undefined, "the first roll has nothing to build on");
+  assert.equal(world.rolls[0].count, 100 - AUTOMATION_CONTEXT_KEEP);
+
+  assert.deepEqual(world.summaryWrites, [
+    { sessionId: "s1", summary: "Rolled summary.", through: 80 }
+  ]);
+
+  const wire = lastWire(world);
+  assert.match(wire[0].content, /Rolled summary\./, "the summary leads");
+  assert.deepEqual(
+    wire.slice(1, 1 + AUTOMATION_CONTEXT_KEEP).map((message) => message.content),
+    contentsOf(transcript(100).slice(-AUTOMATION_CONTEXT_KEEP)),
+    "then the recent turns, in order"
+  );
+  assert.equal(
+    wire.length,
+    1 + AUTOMATION_CONTEXT_KEEP + 1,
+    "and the playbook — a year-old thread costs one turn's worth of context"
+  );
+}
+
+// --- the next run reuses it rather than rolling again -----------------------
+{
+  resetAutomationQueueForTests();
+  const world = createWorld();
+  addAutomation(world, "a1", { conditions: NO_LIMITS });
+  addSession(world, "s1", transcript(100));
+  addBinding(world, "b1");
+  world.summaries.set("s1", { summary: "Already rolled.", through: 80 });
+
+  await runAutomationNow("a1", undefined, world.deps);
+  assert.deepEqual(world.rolls, [], "20 live entries needs no model call at all");
+  assert.deepEqual(world.summaryWrites, [], "and writes nothing");
+  assert.match(lastWire(world)[0].content, /Already rolled\./);
+}
+
+// --- a roll that builds on the last one carries it forward ------------------
+{
+  resetAutomationQueueForTests();
+  const world = createWorld();
+  addAutomation(world, "a1", { conditions: NO_LIMITS });
+  addSession(world, "s1", transcript(150));
+  addBinding(world, "b1");
+  world.summaries.set("s1", { summary: "Marathon in October.", through: 80 });
+
+  await runAutomationNow("a1", undefined, world.deps);
+  assert.equal(world.rolls.length, 1);
+  assert.equal(
+    world.rolls[0].previous,
+    "Marathon in October.",
+    "a rolling summary rolls — it is not rewritten from the tail alone"
+  );
+  assert.equal(world.rolls[0].count, 150 - AUTOMATION_CONTEXT_KEEP - 80);
+  assert.equal(world.summaryWrites[0].through, 130);
+}
+
+// --- a roll that fails costs more, and loses nothing ------------------------
+{
+  resetAutomationQueueForTests();
+  const world = createWorld();
+  addAutomation(world, "a1", { conditions: NO_LIMITS });
+  addSession(world, "s1", transcript(100));
+  addBinding(world, "b1");
+  world.rollResult = null;
+
+  const [run] = await runAutomationNow("a1", undefined, world.deps);
+  assert.equal(run.status, "success", "a summary that could not be written is not a failed run");
+  assert.deepEqual(world.summaryWrites, [], "and nothing is stored that was not written");
+
+  const wire = lastWire(world);
+  assert.equal(
+    wire.length,
+    100 + 1,
+    "the run falls back to the whole transcript rather than dropping the middle"
+  );
+  assert.deepEqual(
+    wire.map((message) => message.content).slice(0, 100),
+    contentsOf(transcript(100))
+  );
+
+  // And it rolls again next time rather than giving up on the conversation.
+  world.rollResult = "Second time lucky.";
+  await runAutomationNow("a1", undefined, world.deps);
+  assert.equal(world.summaryWrites.length, 1);
+}
+
+// --- a per-run binding never reaches the limit ------------------------------
+{
+  // 5.7 is about `dedicated` and `existing` bindings. A `per-run` binding gets
+  // a conversation of its own every time, so it is covered by the same count
+  // rather than by a mode check — there is nothing there to trim.
+  resetAutomationQueueForTests();
+  const world = createWorld();
+  addAutomation(world, "a1", { conditions: NO_LIMITS });
+  addBinding(world, "b1", { mode: "per-run", sessionId: null });
+
+  await runAutomationNow("a1", undefined, world.deps);
+  assert.deepEqual(world.rolls, []);
+  assert.equal(lastWire(world).length, 1, "a fresh conversation is just the playbook");
+}
+
+
+// ---------------------------------------------------------------------------
+// Cost: what a run spent, and the month's ceiling (12, phase 3 item 6)
+// ---------------------------------------------------------------------------
+
+// --- the month is the athlete's, on their wall clock ------------------------
+{
+  const start = new Date(startOfLocalMonth(new Date(2026, 7, 21, 9, 30)));
+  assert.equal(start.getDate(), 1);
+  assert.equal(start.getMonth(), 7);
+  assert.equal(start.getHours(), 0);
+  assert.equal(start.getMinutes(), 0);
+
+  // A budget is something a person plans around, so it rolls over when their
+  // calendar says so. The first instant of the month is inside it.
+  assert.equal(
+    startOfLocalMonth(new Date(2026, 7, 1, 0, 0, 0)),
+    start.toISOString(),
+    "the 1st belongs to its own month"
+  );
+}
+
+// --- the ceiling is a ceiling ----------------------------------------------
+{
+  assert.equal(isOverBudget(0, null), false, "no ceiling is not a ceiling of zero");
+  assert.equal(isOverBudget(1_000_000, null), false);
+  assert.equal(isOverBudget(499_999, 500_000), false);
+  assert.equal(
+    isOverBudget(500_000, 500_000),
+    true,
+    "500k means 500k is what was agreed — the run that would pass it is not paid for"
+  );
+  assert.equal(isOverBudget(500_001, 500_000), true);
+  assert.equal(isOverBudget(10, 0), false, "a budget of zero reads as no budget, not as a stop");
+}
+
+// --- a run records what it cost, whatever it turned into --------------------
+{
+  for (const [label, configure, expected] of [
+    ["success", () => undefined, "success"],
+    ["silent", (w) => { w.outcome = { text: NOTHING_TO_REPORT }; }, "silent"],
+    ["cancelled", (w) => { w.outcome = { ...w.outcome, cancelled: true }; }, "cancelled"],
+    [
+      "failed",
+      (w) => { w.outcome = { ...w.outcome, error: "the provider fell over" }; },
+      "failed"
+    ]
+  ]) {
+    resetAutomationQueueForTests();
+    const world = createWorld();
+    addAutomation(world, "a1", { conditions: NO_LIMITS });
+    addSession(world, "s1");
+    addBinding(world, "b1");
+    configure(world);
+
+    const [run] = await runAutomationNow("a1", undefined, world.deps);
+    assert.equal(run.status, expected, `${label}: fixture sanity`);
+    // A failed or cancelled run spent tokens too. A budget that forgave those
+    // is a budget a broken provider can run through for nothing.
+    assert.equal(run.inputTokens, 120, `${label} must carry what it cost`);
+    assert.equal(run.outputTokens, 45);
+  }
+}
+
+// --- a provider that reports nothing leaves it unknown, not zero ------------
+{
+  resetAutomationQueueForTests();
+  const world = createWorld();
+  addAutomation(world, "a1", { conditions: NO_LIMITS });
+  addSession(world, "s1");
+  addBinding(world, "b1");
+  world.usage = null;
+
+  const [run] = await runAutomationNow("a1", undefined, world.deps);
+  assert.equal(run.status, "success");
+  assert.equal(
+    run.inputTokens,
+    undefined,
+    "\"nobody told us\" is a different fact from \"it was free\""
+  );
+  assert.equal(run.outputTokens, undefined);
+}
+
+// --- a run that never reached the provider has nothing to record ------------
+{
+  resetAutomationQueueForTests();
+  const world = createWorld();
+  addAutomation(world, "a1", { conditions: NO_LIMITS });
+  addSession(world, "s1");
+  addBinding(world, "b1");
+  world.corosResult = { ok: false, twoFactorRequired: false };
+
+  const [run] = await runAutomationNow("a1", undefined, world.deps);
+  assert.equal(run.skipReason, "offline");
+  assert.equal(run.inputTokens, undefined, "a skip costs nothing and claims nothing");
+}
+
+// --- over the ceiling: one row, then everything is held ---------------------
+{
+  resetAutomationQueueForTests();
+  const world = threePlaceWorld();
+  world.budget = 500_000;
+  world.monthToDateTokens = 500_000;
+
+  const runs = await runAutomationTrigger(
+    { automationId: "a1", kind: "schedule" },
+    world.deps
+  );
+  assert.deepEqual(
+    runs.map((run) => run.skipReason),
+    ["budget"],
+    "every remaining place would get the same answer, so the log carries it once"
+  );
+  assert.equal(world.streamCalls.length, 0, "and nothing is sent to a provider");
+  assert.equal(world.pause.reason, "budget");
+  assert.equal(world.pause.runId, runs[0].id, "the pause points at the row that explains it");
+
+  // And the fifteen minutes after that, and the fifteen after those.
+  const later = await runAutomationTrigger(
+    { automationId: "a1", kind: "activity" },
+    world.deps
+  );
+  assert.deepEqual(later, [], "a held trigger produces no runs");
+  assert.equal(world.runs.length, 1, "and logs nothing");
+}
+
+// --- raising the ceiling lifts it, without a second control -----------------
+{
+  resetAutomationQueueForTests();
+  const world = threePlaceWorld();
+  world.budget = 500_000;
+  world.monthToDateTokens = 500_000;
+  await runAutomationTrigger({ automationId: "a1", kind: "schedule" }, world.deps);
+  assert.ok(world.pause);
+
+  world.budget = 900_000;
+  const runs = await runAutomationTrigger(
+    { automationId: "a1", kind: "schedule" },
+    world.deps
+  );
+  assert.equal(world.pause, null, "the number that stopped everything is no longer the number");
+  assert.equal(runs.length, 3, "and the whole fan-out runs again");
+}
+
+// --- and so does the month rolling over -------------------------------------
+{
+  resetAutomationQueueForTests();
+  const world = threePlaceWorld();
+  world.budget = 500_000;
+  world.monthToDateTokens = 500_000;
+  await runAutomationTrigger({ automationId: "a1", kind: "schedule" }, world.deps);
+  assert.ok(world.pause);
+
+  // The 1st: the month-to-date total is a fresh month's.
+  world.monthToDateTokens = 0;
+  await runAutomationTrigger({ automationId: "a1", kind: "schedule" }, world.deps);
+  assert.equal(world.pause, null, "a budget pause does not outlive its month");
+}
+
+// --- clearing the ceiling lifts it too --------------------------------------
+{
+  resetAutomationQueueForTests();
+  const world = threePlaceWorld();
+  world.budget = 500_000;
+  world.monthToDateTokens = 900_000;
+  await runAutomationTrigger({ automationId: "a1", kind: "schedule" }, world.deps);
+  assert.ok(world.pause);
+
+  world.budget = null;
+  await runAutomationTrigger({ automationId: "a1", kind: "schedule" }, world.deps);
+  assert.equal(world.pause, null, "no ceiling is not a ceiling of zero here either");
+}
+
+// --- "Run now" is the athlete spending their own money on purpose -----------
+{
+  // Every other rate guard yields to 3.4's bypass, and this one is no different:
+  // the athlete pressing the button while over budget has been told the number
+  // and pressed it anyway. A ceiling that also refused them would be a ceiling
+  // on their own decisions rather than on unattended spend.
+  resetAutomationQueueForTests();
+  const world = threePlaceWorld();
+  world.budget = 500_000;
+  world.monthToDateTokens = 500_000;
+  await runAutomationTrigger({ automationId: "a1", kind: "schedule" }, world.deps);
+  assert.ok(world.pause);
+
+  const [run] = await runAutomationNow("a1", ["b1"], world.deps);
+  assert.equal(run.status, "success");
+  assert.equal(run.inputTokens, 120, "and it is counted like any other run");
+}
+
+// --- a ceiling nobody set costs nothing to check ----------------------------
+{
+  // The total is a SUM over the whole run log and no ceiling is the default, so
+  // reading it first would make every athlete who never set a budget pay for
+  // that scan on every run — to discard the answer.
+  resetAutomationQueueForTests();
+  const world = threePlaceWorld();
+  world.monthToDateTokens = 50_000_000;
+
+  await runAutomationTrigger({ automationId: "a1", kind: "schedule" }, world.deps);
+  assert.ok(world.budgetReads >= 3, "fixture sanity: every run asked about the ceiling");
+  assert.equal(world.spendReads, 0, "and none of them totalled up the run log");
+
+  // With a ceiling set, the total is what decides, so of course it is read.
+  world.budget = 500_000;
+  world.monthToDateTokens = 0;
+  await runAutomationTrigger({ automationId: "a1", kind: "schedule" }, world.deps);
+  assert.ok(world.spendReads > 0, "a ceiling that exists is compared against something");
+}
+
+// --- an unset budget never stops anything -----------------------------------
+{
+  resetAutomationQueueForTests();
+  const world = threePlaceWorld();
+  world.monthToDateTokens = 50_000_000;
+
+  const runs = await runAutomationTrigger(
+    { automationId: "a1", kind: "schedule" },
+    world.deps
+  );
+  assert.equal(runs.length, 3, "a number nobody chose must not pause anybody's coaches");
+  assert.equal(world.pause, null);
+}
+
+
+// ---------------------------------------------------------------------------
+// Where two phase-3 features meet
+// ---------------------------------------------------------------------------
+// Each of these is one feature reaching into another's state. Neither suite
+// that owns the halves would notice, because each half is correct on its own.
+
+// --- a working COROS session must not clear a *budget* pause ---------------
+{
+  // Reachable: a budget pause holds the gate, "Run now" bypasses the gate, and
+  // the run then passes the COROS check. Clearing there took the banner down
+  // and let one more unattended run through before guard rail 4b put it back.
+  resetAutomationQueueForTests();
+  const world = threePlaceWorld();
+  world.budget = 500_000;
+  world.monthToDateTokens = 500_000;
+  await runAutomationTrigger({ automationId: "a1", kind: "schedule" }, world.deps);
+  assert.equal(world.pause.reason, "budget", "fixture sanity: paused on the ceiling");
+
+  const [manual] = await runAutomationNow("a1", ["b1"], world.deps);
+  assert.equal(manual.status, "success", "the athlete's own button still runs");
+  assert.equal(
+    world.pause?.reason,
+    "budget",
+    "and a COROS session that answered says nothing about the athlete's money"
+  );
+
+  // The 2FA pause it is modelled on still lifts on the same path.
+  world.pause = { reason: "two-factor-required", since: world.now.toISOString() };
+  await runAutomationNow("a1", ["b1"], world.deps);
+  assert.equal(world.pause, null, "which is the pause a COROS session *does* answer");
+}
+
+// --- Stop before the provider must not clear a backoff streak --------------
+{
+  // The backoff is a claim about the provider. A run cancelled while it was
+  // still being prepared never asked the provider anything, so it cannot report
+  // one healthy — an athlete pressing Stop would otherwise reset the hold on a
+  // binding that is failing, and the storm starts again.
+  // Two places, because the window only opens for a run the token has something
+  // to be cancelled *by*: the first place produces the id Stop is pressed on,
+  // and the second is the one still getting itself ready when it lands.
+  resetAutomationQueueForTests();
+  let corosChecks = 0;
+  const world = createWorld({
+    ensureCorosSession: async () => {
+      corosChecks += 1;
+      if (corosChecks === 2) {
+        cancelAutomationRun(world.runs[0].id, world.deps);
+      }
+      return { ok: true };
+    }
+  });
+  addAutomation(world, "a1", { conditions: NO_LIMITS });
+  addSession(world, "s1");
+  addSession(world, "s2");
+  addBinding(world, "b1", { sessionId: "s1" });
+  addBinding(world, "b2", {
+    sessionId: "s2",
+    backoffLevel: 2,
+    backoffUntil: new Date(world.now.getTime() - MINUTE).toISOString()
+  });
+
+  const runs = await withDeadline(
+    runAutomationNow("a1", undefined, world.deps),
+    2_000,
+    "a cancelled run still has to return"
+  );
+  assert.deepEqual(runs.map((run) => run.status), ["success", "cancelled"]);
+  assert.equal(
+    world.streamCalls.length,
+    1,
+    "fixture sanity: the second run never reached the provider"
+  );
+  assert.equal(
+    world.bindings.get("b2").backoffLevel,
+    2,
+    "so its streak survives — a Stop is not a provider reporting itself healthy"
+  );
+  // And the one that *did* reach the provider cleared its own, as it should.
+  assert.equal(world.bindings.get("b1").backoffLevel, undefined);
 }
 
 Module._load = originalLoad;

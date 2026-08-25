@@ -441,6 +441,24 @@ export function initializeDatabase(userDataPath: string): Database.Database {
 
     CREATE INDEX IF NOT EXISTS idx_automation_runs_binding
       ON coach_automation_runs (binding_id, started_at DESC);
+
+    -- The monthly spend (13) asks "what did every automation cost since the
+    -- 1st", which narrows by nothing but the date. The two indexes above are
+    -- both prefixed by an id, so neither can serve it — without this the budget
+    -- guard rail scans the whole run log on every run.
+    CREATE INDEX IF NOT EXISTS idx_automation_runs_started
+      ON coach_automation_runs (started_at);
+
+    -- 3.3: the two series a threshold metric needs and the app does not
+    -- otherwise keep. COROS owns resting HR and sleep; the activity watcher
+    -- snapshots them here on its slow poll so the scheduler's 60-second tick
+    -- can evaluate a threshold without a request of its own.
+    CREATE TABLE IF NOT EXISTS coach_daily_samples (
+      day           TEXT PRIMARY KEY,   -- local "YYYYMMDD", as COROS keys it
+      resting_hr    REAL,
+      sleep_minutes REAL,
+      captured_at   TEXT NOT NULL
+    );
   `);
 
   ensureColumn(db, "generated_routes", "activity_type", "TEXT");
@@ -450,6 +468,12 @@ export function initializeDatabase(userDataPath: string): Database.Database {
   migrateChatSessionProviderConstraint(db);
   // pinned_at holds the ISO timestamp a conversation was pinned; NULL = unpinned.
   ensureColumn(db, "chat_sessions", "pinned_at", "TEXT");
+  // 5.7: the rolling summary that stands in for the head of a long transcript,
+  // and how many entries of that head it accounts for. On the conversation
+  // rather than the binding, because five automations can be attached to one
+  // conversation and the summary is a fact about the conversation.
+  ensureColumn(db, "chat_sessions", "coach_summary", "TEXT");
+  ensureColumn(db, "chat_sessions", "coach_summary_through", "INTEGER");
   // coach_seen_at marks a row as already considered by the automation activity
   // watcher. NULL = not yet processed, so a re-synced activity is re-evaluated
   // only if the re-sync clears the stamp.
@@ -458,6 +482,21 @@ export function initializeDatabase(userDataPath: string): Database.Database {
   // this binding has already analysed. NULL = it never analysed one, in which
   // case the attach time acts as the floor instead.
   ensureColumn(db, "coach_automation_bindings", "last_activity_at", "INTEGER");
+  // backoff_until / backoff_level are section 10's per-binding backoff. A failed
+  // run leaves the other two clocks alone on purpose, so this is the only thing
+  // holding a dead provider off; NULL/0 mean the binding is healthy.
+  ensureColumn(db, "coach_automation_bindings", "backoff_until", "TEXT");
+  ensureColumn(db, "coach_automation_bindings", "backoff_level", "INTEGER");
+  // threshold_firing is 3.3's per-binding transition state, and its three
+  // values all matter: NULL = never evaluated, 0 = the condition was false last
+  // tick, 1 = it was true. NULL is what stops a binding attached today firing
+  // on a condition that has held all week.
+  ensureColumn(db, "coach_automation_bindings", "threshold_firing", "INTEGER");
+  // What each run cost (13). NULL means the provider reported
+  // nothing, which is not the same as a run that cost nothing — the budget has
+  // to be able to say what it cannot see.
+  ensureColumn(db, "coach_automation_runs", "input_tokens", "INTEGER");
+  ensureColumn(db, "coach_automation_runs", "output_tokens", "INTEGER");
   migrateChatTranscriptsToSessions(db);
 
   // Seed the built-in COROS MCP server so existing users get a registry entry
@@ -943,6 +982,42 @@ export interface ChatSessionRow {
   pinned_at: string | null;
 }
 
+/** 5.7's stored summary for one conversation, and what it covers. */
+export interface ChatSessionCoachSummaryRow {
+  coach_summary: string | null;
+  coach_summary_through: number | null;
+}
+
+export function getChatSessionCoachSummaryRow(
+  id: string
+): ChatSessionCoachSummaryRow | undefined {
+  return requireDatabase()
+    .prepare(
+      "SELECT coach_summary, coach_summary_through FROM chat_sessions WHERE id = ?"
+    )
+    .get(id) as ChatSessionCoachSummaryRow | undefined;
+}
+
+/**
+ * Written on its own rather than through `updateSession`, which rewrites the
+ * whole transcript: rolling the summary changes nothing the athlete wrote, and
+ * a run that also rewrote `messages_json` would race the window's own saves
+ * (5.6b) for no reason.
+ */
+export function setChatSessionCoachSummaryRow(
+  id: string,
+  summary: string | null,
+  through: number | null
+): void {
+  requireDatabase()
+    .prepare(
+      `UPDATE chat_sessions
+       SET coach_summary = ?, coach_summary_through = ?
+       WHERE id = ?`
+    )
+    .run(summary, through, id);
+}
+
 export function listChatSessionRows(provider: string): ChatSessionRow[] {
   return requireDatabase()
     .prepare(
@@ -1124,11 +1199,16 @@ export interface CoachAutomationBindingRow {
   last_run_at: string | null;
   next_run_at: string | null;
   last_activity_at: number | null;
+  backoff_until: string | null;
+  backoff_level: number | null;
+  /** NULL = never evaluated; 0/1 = the condition last tick (3.3). */
+  threshold_firing: number | null;
   created_at: string;
 }
 
 const COACH_BINDING_COLUMNS = `id, automation_id, mode, session_id, title_template,
-         enabled, sort_order, last_run_at, next_run_at, last_activity_at, created_at`;
+         enabled, sort_order, last_run_at, next_run_at, last_activity_at,
+         backoff_until, backoff_level, threshold_firing, created_at`;
 
 export function listCoachAutomationBindingRows(
   automationId: string
@@ -1175,11 +1255,12 @@ export function insertCoachAutomationBindingRow(
     .prepare(
       `INSERT INTO coach_automation_bindings
          (id, automation_id, mode, session_id, title_template, enabled,
-          sort_order, last_run_at, next_run_at, last_activity_at, created_at)
+          sort_order, last_run_at, next_run_at, last_activity_at,
+          backoff_until, backoff_level, threshold_firing, created_at)
        VALUES
          (@id, @automation_id, @mode, @session_id, @title_template, @enabled,
           @sort_order, @last_run_at, @next_run_at, @last_activity_at,
-          @created_at)`
+          @backoff_until, @backoff_level, @threshold_firing, @created_at)`
     )
     .run(row);
 }
@@ -1193,7 +1274,9 @@ export function updateCoachAutomationBindingRow(
        SET mode = @mode, session_id = @session_id,
            title_template = @title_template, enabled = @enabled,
            sort_order = @sort_order, last_run_at = @last_run_at,
-           next_run_at = @next_run_at, last_activity_at = @last_activity_at
+           next_run_at = @next_run_at, last_activity_at = @last_activity_at,
+           backoff_until = @backoff_until, backoff_level = @backoff_level,
+           threshold_firing = @threshold_firing
        WHERE id = @id`
     )
     .run(row);
@@ -1203,6 +1286,99 @@ export function deleteCoachAutomationBindingRow(id: string): void {
   requireDatabase()
     .prepare("DELETE FROM coach_automation_bindings WHERE id = ?")
     .run(id);
+}
+
+export interface CoachDailySampleRow {
+  day: string;
+  resting_hr: number | null;
+  sleep_minutes: number | null;
+}
+
+/**
+ * 3.3's local cache, upserted column by column. A snapshot that reached COROS
+ * for resting HR and failed on sleep must not blank the sleep it already had,
+ * so each column keeps its stored value when the incoming row says nothing.
+ */
+export function upsertCoachDailySamples(
+  rows: CoachDailySampleRow[],
+  capturedAt: string
+): void {
+  if (!rows.length) {
+    return;
+  }
+  const database = requireDatabase();
+  const statement = database.prepare(
+    `INSERT INTO coach_daily_samples (day, resting_hr, sleep_minutes, captured_at)
+     VALUES (@day, @resting_hr, @sleep_minutes, @captured_at)
+     ON CONFLICT(day) DO UPDATE SET
+       resting_hr = COALESCE(excluded.resting_hr, coach_daily_samples.resting_hr),
+       sleep_minutes =
+         COALESCE(excluded.sleep_minutes, coach_daily_samples.sleep_minutes),
+       captured_at = excluded.captured_at`
+  );
+  const transaction = database.transaction((batch: CoachDailySampleRow[]) => {
+    for (const row of batch) {
+      statement.run({ ...row, captured_at: capturedAt });
+    }
+  });
+  transaction(rows);
+}
+
+/** Samples from `fromDay` (inclusive) onward, ascending. */
+export function listCoachDailySamples(fromDay: string): CoachDailySampleRow[] {
+  return requireDatabase()
+    .prepare(
+      `SELECT day, resting_hr, sleep_minutes
+       FROM coach_daily_samples
+       WHERE day >= ?
+       ORDER BY day ASC`
+    )
+    .all(fromDay) as CoachDailySampleRow[];
+}
+
+export interface CoachThresholdLoadRow {
+  start_time: number;
+  training_load: number;
+}
+
+/** Activities carrying a training load since `fromEpochSeconds`, for 3.3. */
+export function listCoachThresholdLoads(
+  fromEpochSeconds: number
+): CoachThresholdLoadRow[] {
+  return requireDatabase()
+    .prepare(
+      `SELECT start_time, training_load
+       FROM training_activities
+       WHERE start_time IS NOT NULL
+         AND start_time >= ?
+         AND training_load IS NOT NULL
+       ORDER BY start_time ASC`
+    )
+    .all(fromEpochSeconds) as CoachThresholdLoadRow[];
+}
+
+export interface CoachThresholdSlotRow {
+  happen_day: string;
+  matched: number;
+}
+
+/**
+ * Scheduled workouts from `fromDay` onward and whether one was ever matched.
+ *
+ * `skipped` and `rescheduled` are excluded: the athlete moved those on purpose,
+ * and a rule about adherence that fires on a deliberate rest day is a rule the
+ * athlete switches off.
+ */
+export function listCoachThresholdSlots(fromDay: string): CoachThresholdSlotRow[] {
+  return requireDatabase()
+    .prepare(
+      `SELECT happen_day, (activity_id IS NOT NULL) AS matched
+       FROM training_activity_matches
+       WHERE happen_day >= ?
+         AND status NOT IN ('skipped', 'rescheduled')
+       ORDER BY happen_day ASC`
+    )
+    .all(fromDay) as CoachThresholdSlotRow[];
 }
 
 export interface CoachAutomationRunRow {
@@ -1219,13 +1395,56 @@ export interface CoachAutomationRunRow {
   error: string | null;
   skip_reason: string | null;
   seen_at: string | null;
+  input_tokens: number | null;
+  output_tokens: number | null;
   started_at: string;
   finished_at: string | null;
 }
 
+export interface CoachAutomationTokenTotals {
+  inputTokens: number;
+  outputTokens: number;
+  /** Runs that reported a cost, and runs that reached the provider at all. */
+  countedRuns: number;
+  providerRuns: number;
+}
+
+/**
+ * What the automations have spent since `sinceIso`.
+ *
+ * `countedRuns` and `providerRuns` are both reported so the UI can say when a
+ * total is short of the truth. A provider that does not report usage — a local
+ * server without `stream_options`, say — would otherwise make a budget read as
+ * comfortably under when nobody has any idea.
+ */
+export function sumCoachAutomationTokensSince(
+  sinceIso: string
+): CoachAutomationTokenTotals {
+  const row = requireDatabase()
+    .prepare(
+      `SELECT
+         COALESCE(SUM(input_tokens), 0) AS inputTokens,
+         COALESCE(SUM(output_tokens), 0) AS outputTokens,
+         SUM(CASE WHEN input_tokens IS NOT NULL
+                    OR output_tokens IS NOT NULL THEN 1 ELSE 0 END) AS countedRuns,
+         COUNT(*) AS providerRuns
+       FROM coach_automation_runs
+       WHERE started_at >= ?
+         AND status IN ('success', 'silent', 'failed', 'cancelled')`
+    )
+    .get(sinceIso) as CoachAutomationTokenTotals;
+  return {
+    inputTokens: row.inputTokens ?? 0,
+    outputTokens: row.outputTokens ?? 0,
+    countedRuns: row.countedRuns ?? 0,
+    providerRuns: row.providerRuns ?? 0
+  };
+}
+
 const COACH_RUN_COLUMNS = `id, automation_id, binding_id, status, trigger_kind,
          trigger_payload_json, session_id, summary, model, effort, error,
-         skip_reason, seen_at, started_at, finished_at`;
+         skip_reason, seen_at, input_tokens, output_tokens,
+         started_at, finished_at`;
 
 export function listCoachAutomationRunRows(
   filter: CoachAutomationRunQuery = {}
@@ -1287,11 +1506,13 @@ export function insertCoachAutomationRunRow(row: CoachAutomationRunRow): void {
       `INSERT INTO coach_automation_runs
          (id, automation_id, binding_id, status, trigger_kind,
           trigger_payload_json, session_id, summary, model, effort, error,
-          skip_reason, seen_at, started_at, finished_at)
+          skip_reason, seen_at, input_tokens, output_tokens,
+          started_at, finished_at)
        VALUES
          (@id, @automation_id, @binding_id, @status, @trigger_kind,
           @trigger_payload_json, @session_id, @summary, @model, @effort, @error,
-          @skip_reason, @seen_at, @started_at, @finished_at)`
+          @skip_reason, @seen_at, @input_tokens, @output_tokens,
+          @started_at, @finished_at)`
     )
     .run(row);
 }
@@ -1390,7 +1611,8 @@ export function updateCoachAutomationRunRow(row: CoachAutomationRunRow): void {
        SET status = @status, trigger_payload_json = @trigger_payload_json,
            session_id = @session_id, summary = @summary, model = @model,
            effort = @effort, error = @error, skip_reason = @skip_reason,
-           seen_at = @seen_at, finished_at = @finished_at
+           seen_at = @seen_at, input_tokens = @input_tokens,
+           output_tokens = @output_tokens, finished_at = @finished_at
        WHERE id = @id`
     )
     .run(row);
