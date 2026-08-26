@@ -278,9 +278,18 @@ const advance = (world, minutes) => {
   assert.deepEqual(world.unseenIds(), [], "stamped once it fired");
   assert.deepEqual(watcher.pendingBatchSizes(), {});
 
-  // The same activity is never fired twice.
+  // The trigger *does* come round again — and that is the point, not a leak.
+  // Section 4 promises that a refused activity is still owed on the next poll,
+  // and it was not: the rows were stamped at flush, so the watcher's "is there
+  // anything unseen" firing condition never fired again and the activity was
+  // dropped. This block used to assert the opposite ("the same activity is
+  // never fired twice"), which is a claim the watcher is in no position to
+  // make: 3.2 gives it *when*, and which activities a binding still owes is the
+  // runner's answer from that binding's own watermark.
   await watcher.tick();
-  assert.equal(world.triggers.length, 1);
+  assert.equal(world.triggers.length, 2, "the tick asks again");
+  assert.equal(world.triggers[1].payload, undefined, "payload-free, like the first");
+  assert.deepEqual(watcher.pendingBatchSizes(), {}, "and it opens no new batch");
 }
 
 // batchWindowMin 0 fires on the same tick.
@@ -580,5 +589,87 @@ assert.equal(
   60_000,
   "the shipped bound is a minute, whatever the fixture above uses"
 );
+
+
+// ---------------------------------------------------------------------------
+// Section 4's promise: a refused activity is still owed on the next poll
+// ---------------------------------------------------------------------------
+// `coach_seen_at` is stamped at flush, before the runner answers and whatever it
+// answers — right, because the flag means "the watcher has looked". But the
+// watcher's firing condition was "is anything unseen", so a run refused for any
+// reason left the activity owed by the binding's watermark and asked for by
+// nobody. With `multiActivity` off, which is the default, the next activity to
+// arrive replaced it and it was never analysed at all.
+
+{
+  const world = createWorld();
+  world.markInitialized();
+  world.automations = [
+    activityAutomation({}, { conditions: { batchWindowMin: 0, cooldownMin: 0, maxRunsPerDay: 9 } })
+  ];
+  world.addActivity({ activity_id: "act-1" });
+
+  const watcher = new CoachActivityWatcher(world.deps);
+  await watcher.tick();
+  assert.equal(world.triggers.length, 1, "fired once for the new activity");
+  assert.deepEqual(world.unseenIds(), [], "and stamped it, as it should");
+
+  // The runner declined — quiet hours, a cooldown, a backoff, either pause, a
+  // signed-out provider. The watcher does not know and must not need to.
+  advance(world, 15);
+  await watcher.tick();
+  assert.equal(world.triggers.length, 2, "the next poll asks again");
+
+  advance(world, 15);
+  await watcher.tick();
+  assert.equal(world.triggers.length, 3, "and the one after that");
+}
+
+// A binding with nothing owed costs nothing: the trigger still goes, the runner
+// plans nothing, and a non-manual trigger with an empty plan logs no row. The
+// watcher cannot tell the two apart and 3.2 says it should not try.
+{
+  const world = createWorld();
+  world.markInitialized();
+  world.automations = [activityAutomation()];
+
+  const watcher = new CoachActivityWatcher(world.deps);
+  await watcher.tick();
+  assert.equal(world.triggers.length, 1, "asked even with no activity on disk");
+  assert.deepEqual(world.refreshes.length, 1, "and still only one index refresh");
+}
+
+// A batch still inside its window is not jumped. Firing the catch-up there would
+// analyse the activities the window is deliberately holding, which is the one
+// thing batching exists for.
+{
+  const world = createWorld();
+  world.markInitialized();
+  world.automations = [activityAutomation()];
+  world.addActivity({ activity_id: "act-1" });
+
+  const watcher = new CoachActivityWatcher(world.deps);
+  await watcher.tick();
+  assert.deepEqual(world.triggers, [], "inside the batch window");
+  assert.deepEqual(watcher.pendingBatchSizes(), { a1: 1 }, "and still collecting");
+
+  advance(world, 5);
+  await watcher.tick();
+  assert.deepEqual(world.triggers, [], "still held, not asked around");
+  assert.deepEqual(watcher.pendingBatchSizes(), { a1: 1 });
+}
+
+// The cold start still says nothing at all: stamping the back catalogue and then
+// immediately asking about it would replay the athlete's history, which is the
+// one thing that stamp exists to stop.
+{
+  const world = createWorld();
+  world.automations = [activityAutomation()];
+  world.addActivity({ activity_id: "old-1" });
+
+  const watcher = new CoachActivityWatcher(world.deps);
+  await watcher.tick();
+  assert.deepEqual(world.triggers, [], "switching the feature on runs nothing");
+}
 
 console.log("coach activity watcher tests passed");

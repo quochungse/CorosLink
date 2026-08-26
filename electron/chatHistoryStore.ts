@@ -1043,12 +1043,21 @@ export function createChatSession(
  */
 function foreignTail(
   storedJson: string,
-  knownEntryCount: number | undefined
+  knownEntryCount: number | undefined,
+  incomingCount: number
 ): PersistedChatEntry[] {
   if (knownEntryCount === undefined || !Number.isFinite(knownEntryCount)) {
     return [];
   }
-  const known = Math.max(0, Math.floor(knownEntryCount));
+  // Clamped to what the caller actually sent. The count says "my array accounts
+  // for this many of the row's entries", so a caller claiming more than it sent
+  // is asserting a deletion — and nothing deletes entries: the window only ever
+  // appends to its own timeline or rewrites it in place. Honouring the claim
+  // would drop the entries between the two numbers with nothing to notice it,
+  // which is the wrong direction for a guard whose whole point is that the
+  // accident fails harmlessly.
+  const claimed = Math.max(0, Math.floor(knownEntryCount));
+  const known = Math.min(claimed, incomingCount);
   const stored = parseChatTranscriptJson(storedJson);
   return stored.length > known ? stored.slice(known) : [];
 }
@@ -1072,7 +1081,7 @@ export function saveChatSession(
 
   const normalizedEntries = normalizeEntries([
     ...entries,
-    ...foreignTail(row.messages_json, options.knownEntryCount)
+    ...foreignTail(row.messages_json, options.knownEntryCount, entries.length)
   ]);
   const title =
     row.title === DEFAULT_SESSION_TITLE

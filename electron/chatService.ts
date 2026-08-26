@@ -1125,12 +1125,15 @@ export function createCollectorSink(
     }
   };
 
-  const handleDone = (payload: Record<string, unknown>) => {
-    isFinished = true;
-    // Recorded even on a cancelled turn: the tokens were spent before the
-    // athlete pressed Stop, and a budget that forgave them would let a fan-out
-    // stopped halfway cost nothing on paper.
-    const reported = payload.usage as ChatTokenUsage | undefined;
+  /**
+   * What the turn cost, from whichever event carried it. Recorded even on a
+   * cancelled turn and even on a failed one: the tokens were spent before the
+   * athlete pressed Stop or before the provider broke, and a budget that
+   * forgave either would let a fan-out stopped halfway — or a provider that
+   * always throws — cost nothing on paper (13).
+   */
+  const recordUsage = (value: unknown): void => {
+    const reported = value as ChatTokenUsage | undefined;
     if (
       reported &&
       typeof reported.inputTokens === "number" &&
@@ -1138,6 +1141,11 @@ export function createCollectorSink(
     ) {
       tokenUsage = reported;
     }
+  };
+
+  const handleDone = (payload: Record<string, unknown>) => {
+    isFinished = true;
+    recordUsage(payload.usage);
     // ChatView reads the final text off the done payload; fall back to the
     // accumulated tokens so a provider that omits it cannot lose the answer.
     const fullText =
@@ -1206,6 +1214,11 @@ export function createCollectorSink(
             ? record.message
             : "Chat request failed.";
         failureWasAuth = record.authError === true;
+        // A failed turn spent whatever its completed rounds spent, and 13 says
+        // it is recorded on every exit that reached the model — not only the
+        // ones that got as far as `chat:streamDone`. Without this a provider
+        // that always breaks runs through the month's ceiling for free.
+        recordUsage(record.usage);
         reset();
       }
     },
@@ -1246,6 +1259,26 @@ export async function streamChat(
   };
   const send = (channel: string, payload: unknown) => {
     sink.emit(channel, payload);
+  };
+  /**
+   * The one way this turn reports a failure. Everything it spent before it
+   * broke rides along: 13 records a cost on every exit that reached the model,
+   * and a failed turn is not a refund — a provider that reliably breaks would
+   * otherwise run an automation through the month's ceiling for free.
+   *
+   * It is a function rather than a rule to remember at each throw site because
+   * dropping the usage on one of them type-checks and compiles into a send that
+   * quietly under-reports.
+   */
+  const sendStreamError = (payload: {
+    message: string;
+    authError?: boolean;
+  }): void => {
+    send("chat:streamError", {
+      requestId,
+      ...payload,
+      ...(usage ? { usage } : {})
+    });
   };
 
   const controller = new AbortController();
@@ -1666,11 +1699,7 @@ export async function streamChat(
         settings.chatgpt.model
       );
       if ("error" in opened) {
-        send("chat:streamError", {
-          requestId,
-          message: opened.error,
-          authError: opened.authError
-        });
+        sendStreamError({ message: opened.error, authError: opened.authError });
         return;
       }
 
@@ -1817,8 +1846,7 @@ export async function streamChat(
       const authError = Boolean(
         (error as Error & { authError?: boolean }).authError
       );
-      send("chat:streamError", {
-        requestId,
+      sendStreamError({
         message: error instanceof Error ? error.message : "Chat request failed.",
         authError
       });

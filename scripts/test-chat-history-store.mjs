@@ -699,16 +699,23 @@ assert.deepEqual(
     deleteChatSession(session.id, db);
   }
 
-  // 6. Junk counts do not corrupt the row: a count past the end has no tail,
-  // and a nonsensical one is treated as no claim at all.
+  // 6. Junk counts do not corrupt the row. Both directions of nonsense fail the
+  // same way — towards keeping what nobody accounted for.
   {
     const session = race();
     saveChatSession(session.id, [athleteOpening, ...runEntries], db);
     saveChatSession(session.id, [athleteReply], db, { knownEntryCount: 99 });
+    // A count *larger* than the array the caller sent is a claim to have
+    // accounted for entries it did not send — which is an assertion that they
+    // were deleted, and nothing deletes entries: the window only appends to its
+    // own timeline or rewrites it in place. This block used to assert the
+    // opposite ("a count past the end leaves no tail to keep"), and that is
+    // precisely the loss 5.6b exists to prevent: one over-claiming save wiped
+    // the coach's answer out of the conversation with nothing to notice it.
     assert.deepEqual(
       getChatSession(session.id, db).map((entry) => entry.content),
-      ["Thanks."],
-      "a count past the end leaves no tail to keep"
+      ["Thanks.", "Debrief the session.", "Easy week, hold it there."],
+      "a count past what was sent is clamped to it, so the run's tail survives"
     );
 
     // Four stored entries against a count of -3, so a count used unclamped

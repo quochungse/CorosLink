@@ -50,7 +50,7 @@ const {
   toDayKey
 } = require(path.join(repoRoot, "dist-electron", "coachThresholdMetrics.js"));
 
-const { CoachAutomationScheduler } = require(
+const { CoachAutomationScheduler, THRESHOLD_RETRY_INTERVAL_MS } = require(
   path.join(repoRoot, "dist-electron", "coachAutomationScheduler.js")
 );
 
@@ -396,19 +396,30 @@ const thresholdBinding = (patch = {}) => ({
  * metric maths is settled above; what is under test here is what the scheduler
  * does with the answer, and the state it keeps to decide.
  */
-function harness({ automations, bindings, firing = false }) {
+function harness({ automations, bindings, firing = false, outcome }) {
   const rows = new Map(bindings.map((row) => [row.id, { ...row }]));
   const state = {
     firing,
+    /** The scheduler copies its deps on construction, so the clock is read
+     * through the closure rather than replaced on `deps` afterwards. */
+    clock: NOW,
     triggers: [],
     writes: [],
     snapshotReads: 0,
     errors: [],
-    order: []
+    order: [],
+    /**
+     * What the runner answers. Two facts the first version of this fake
+     * collapsed into one empty array: whether the trigger reached the runner,
+     * and whether the runner *ran* it. Guard rails 1-8 belong to the runner, so
+     * a crossing handed over can still come back refused — and the scheduler
+     * has to treat that differently from one that was announced.
+     */
+    outcome: outcome ?? [{ id: "run-1", status: "success" }]
   };
 
   const deps = {
-    now: () => NOW,
+    now: () => state.clock,
     listAutomations: () => automations,
     listActiveBindings: (automationId) =>
       [...rows.values()].filter(
@@ -419,7 +430,7 @@ function harness({ automations, bindings, firing = false }) {
     runTrigger: async (event) => {
       state.order.push("run");
       state.triggers.push(event);
-      return [];
+      return state.outcome;
     },
     readThresholdSnapshot: () => {
       state.snapshotReads += 1;
@@ -659,6 +670,254 @@ function harness({ automations, bindings, firing = false }) {
   assert.deepEqual(h.state.triggers, []);
   assert.deepEqual(h.state.writes, [], "a switched-off rule keeps no state either");
   assert.equal(h.state.snapshotReads, 0, "and costs no read");
+}
+
+// ---------------------------------------------------------------------------
+// A crossing the runner refused is still owed
+// ---------------------------------------------------------------------------
+// The state is written before the run so a crash cannot re-announce (3.3), and
+// nothing wrote it back when the run never happened. Guard rails 1-8 belong to
+// the runner, so a crossing handed over comes back refused on any of them — and
+// the rule then recorded the announcement it never made. A metric that stays
+// true, which is the only kind a threshold rule watches, never fires again.
+
+/** The scheduler's clock starts at `NOW`; move the harness forward by `ms`. */
+const advance = (h, ms) => {
+  h.state.clock = new Date(NOW.getTime() + ms);
+  return h.state.clock;
+};
+
+const REFUSED = [{ id: "run-1", status: "skipped", skipReason: "cooldown" }];
+
+// --- a guard rail refusing does not spend the crossing ----------------------
+{
+  const h = harness({
+    automations: [thresholdAutomation()],
+    bindings: [thresholdBinding({ thresholdFiring: false })],
+    firing: true,
+    outcome: REFUSED
+  });
+
+  await h.scheduler.tick();
+  assert.equal(h.state.triggers.length, 1, "the crossing was handed over");
+  assert.equal(
+    h.rows.get("bind-1").thresholdFiring,
+    false,
+    "and put back, because nothing was announced"
+  );
+
+  // Not on the very next tick, though: the refusal will not have changed in
+  // sixty seconds, and one identical skip a minute is the run log section 10
+  // built the pause to stop filling.
+  await h.scheduler.tick();
+  await h.scheduler.tick();
+  assert.equal(h.state.triggers.length, 1, "and it is not re-offered every tick");
+
+  // On its own rhythm, it is.
+  advance(h, THRESHOLD_RETRY_INTERVAL_MS + 1_000);
+  await h.scheduler.tick();
+  assert.equal(h.state.triggers.length, 2, "the crossing is still owed, and re-offered");
+}
+
+// --- and once it lands, it is spent ----------------------------------------
+{
+  const h = harness({
+    automations: [thresholdAutomation()],
+    bindings: [thresholdBinding({ thresholdFiring: false })],
+    firing: true,
+    outcome: REFUSED
+  });
+
+  await h.scheduler.tick();
+  h.state.outcome = [{ id: "run-2", status: "success" }];
+  advance(h, THRESHOLD_RETRY_INTERVAL_MS + 1_000);
+  await h.scheduler.tick();
+  assert.equal(h.state.triggers.length, 2);
+  assert.equal(
+    h.rows.get("bind-1").thresholdFiring,
+    true,
+    "the coach looked, so the athlete has been told"
+  );
+
+  // Which is 3.3's headline again: an hour of ticks says nothing more.
+  for (let tick = 0; tick < 60; tick += 1) {
+    advance(h, THRESHOLD_RETRY_INTERVAL_MS * (tick + 2));
+    await h.scheduler.tick();
+  }
+  assert.equal(h.state.triggers.length, 2, "a metric that stays true is still one run");
+}
+
+// --- a run that reached the provider and failed is not a refusal ------------
+{
+  // Section 10's backoff already owns that retry, and it holds the binding off
+  // for minutes rather than seconds. Re-offering here would loop the crossing
+  // against a provider that is known to be down.
+  const h = harness({
+    automations: [thresholdAutomation()],
+    bindings: [thresholdBinding({ thresholdFiring: false })],
+    firing: true,
+    outcome: [{ id: "run-1", status: "failed", error: "the provider fell over" }]
+  });
+
+  await h.scheduler.tick();
+  assert.equal(
+    h.rows.get("bind-1").thresholdFiring,
+    true,
+    "the model was asked; what happened next is the backoff's business"
+  );
+}
+
+// --- the pause holding the trigger at the gate is a refusal too -------------
+{
+  // A held trigger produces no runs and logs nothing (10), so the empty answer
+  // is all the scheduler gets — and it means the crossing was never announced.
+  const h = harness({
+    automations: [thresholdAutomation()],
+    bindings: [thresholdBinding({ thresholdFiring: false })],
+    firing: true,
+    outcome: []
+  });
+
+  await h.scheduler.tick();
+  assert.equal(
+    h.rows.get("bind-1").thresholdFiring,
+    false,
+    "COROS wanting a login code must not cost the athlete the crossing"
+  );
+}
+
+// --- quiet hours defer a crossing, they do not swallow it -------------------
+{
+  // The same rule 3.1 follows for a slot. Deferred in the scheduler rather than
+  // skipped in the runner, so the night writes no rows at all: a quiet window
+  // is hours long, and one skip a minute through it is the log this is avoiding.
+  const quiet = thresholdAutomation({
+    conditions: {
+      batchWindowMin: 0,
+      cooldownMin: 0,
+      maxRunsPerDay: 9,
+      quietHours: { start: "22:00", end: "07:00" }
+    }
+  });
+  const h = harness({
+    automations: [quiet],
+    bindings: [thresholdBinding({ thresholdFiring: false })],
+    firing: true
+  });
+  // 23:30 local, inside the window.
+  const night = new Date(NOW);
+  night.setHours(23, 30, 0, 0);
+  h.state.clock = night;
+
+  await h.scheduler.tick();
+  assert.deepEqual(h.state.triggers, [], "nobody is spoken to at half past eleven");
+  assert.deepEqual(h.state.writes, [], "and nothing is recorded as announced");
+
+  // Morning: the condition still holds, so it is the identical transition.
+  const morning = new Date(NOW);
+  morning.setHours(7, 30, 0, 0);
+  morning.setDate(morning.getDate() + 1);
+  h.state.clock = morning;
+  await h.scheduler.tick();
+  assert.equal(h.state.triggers.length, 1, "and it is still news when the window closes");
+  assert.equal(h.rows.get("bind-1").thresholdFiring, true);
+}
+
+// --- recovering is still recorded, quiet hours or not -----------------------
+{
+  // Falling back announces nothing, so there is nothing to defer — and it is
+  // what re-arms the rule, so deferring it would be the crossing lost twice.
+  const quiet = thresholdAutomation({
+    conditions: {
+      batchWindowMin: 0,
+      cooldownMin: 0,
+      maxRunsPerDay: 9,
+      quietHours: { start: "22:00", end: "07:00" }
+    }
+  });
+  const h = harness({
+    automations: [quiet],
+    bindings: [thresholdBinding({ thresholdFiring: true })],
+    firing: false
+  });
+  const night = new Date(NOW);
+  night.setHours(23, 30, 0, 0);
+  h.state.clock = night;
+
+  await h.scheduler.tick();
+  assert.deepEqual(h.state.triggers, []);
+  assert.deepEqual(h.state.writes, [{ bindingId: "bind-1", firing: false }]);
+}
+
+// --- a detached binding takes its retry hold with it ------------------------
+{
+  // Detach deletes the row and a re-attach is a new one (2.4), so a hold keyed
+  // by binding id can never be claimed again. Left alone it sits in the map for
+  // the life of the process, and the process is meant to run for weeks.
+  //
+  // White-box on purpose, and the one kind of assertion that earns it: a hold
+  // nobody can claim has no behavioural shadow to observe. There is nothing to
+  // drive and nothing to watch — only the map itself says whether the entry
+  // went. Everything else in this block is driven through the tick.
+  const h = harness({
+    automations: [thresholdAutomation()],
+    bindings: [
+      thresholdBinding({ thresholdFiring: false }),
+      thresholdBinding({ id: "bind-2", thresholdFiring: false })
+    ],
+    firing: true,
+    outcome: REFUSED
+  });
+
+  await h.scheduler.tick();
+  assert.equal(h.state.triggers.length, 2, "both places were offered the crossing");
+
+  h.rows.delete("bind-1");
+  await h.scheduler.tick();
+
+  // The surviving binding still holds; the detached one left nothing behind.
+  assert.equal(
+    h.scheduler.retryAfter.has("bind-2"),
+    true,
+    "the place that is still there keeps its hold"
+  );
+  assert.equal(
+    h.scheduler.retryAfter.has("bind-1"),
+    false,
+    "and the one that is gone does not linger"
+  );
+}
+
+// --- a re-attached binding is a new place, and starts silent ----------------
+{
+  // Its row is new, so `threshold_firing` is NULL — never evaluated. 3.3's seed
+  // rule then does the right thing on its own: a coach attached this morning
+  // must not fire on a condition that has held all week, and re-attaching is
+  // attaching.
+  const h = harness({
+    automations: [thresholdAutomation()],
+    bindings: [thresholdBinding({ thresholdFiring: true })],
+    firing: true
+  });
+
+  h.rows.delete("bind-1");
+  h.rows.set("bind-2", {
+    id: "bind-2",
+    automationId: "auto-1",
+    mode: "dedicated",
+    sessionId: "sess-1",
+    enabled: true,
+    sortOrder: 0,
+    createdAt: NOW.toISOString()
+  });
+
+  await h.scheduler.tick();
+  assert.deepEqual(h.state.triggers, [], "the new place says nothing on its first look");
+  assert.deepEqual(
+    h.state.writes,
+    [{ bindingId: "bind-2", firing: true }],
+    "it records where things stand instead"
+  );
 }
 
 Module._load = originalLoad;

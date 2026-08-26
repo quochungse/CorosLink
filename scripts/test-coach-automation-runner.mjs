@@ -299,6 +299,8 @@ function createWorld(overrides = {}) {
     rolls: [],
     /** What the summariser comes back with; null is a roll that failed. */
     rollResult: "Rolled summary.",
+    /** What that roll cost. A roll is a provider turn and 13 counts it. */
+    rollUsage: undefined,
     cancelledRunIds: []
   };
 
@@ -384,9 +386,12 @@ function createWorld(overrides = {}) {
       state.summaries.set(sessionId, { summary, through });
       state.summaryWrites.push({ sessionId, summary, through });
     },
-    rollSummary: async (previous, entries) => {
-      state.rolls.push({ previous, count: entries.length });
-      return state.rollResult;
+    rollSummary: async (previous, entries, runtime) => {
+      state.rolls.push({ previous, count: entries.length, runtime });
+      return {
+        summary: state.rollResult,
+        ...(state.rollUsage ? { usage: state.rollUsage } : {})
+      };
     },
     createSession: () => {
       sessionSeq += 1;
@@ -2999,4 +3004,476 @@ const lastWire = (world) =>
 }
 
 Module._load = originalLoad;
+
+// --- the roll's tokens belong to the run that asked for it ------------------
+{
+  // 5.7 is the one feature built to make a long conversation affordable, and it
+  // pays for that with a provider turn of its own. Reading only the run's own
+  // stream left that turn outside 13's month-to-date total, so the budget
+  // under-reported by exactly the thing whose whole purpose is cost.
+  resetAutomationQueueForTests();
+  const world = createWorld();
+  addAutomation(world, "a1", { conditions: NO_LIMITS });
+  addSession(world, "s1", transcript(100));
+  addBinding(world, "b1");
+  world.rollUsage = { inputTokens: 4_000, outputTokens: 300 };
+
+  const [run] = await runAutomationNow("a1", undefined, world.deps);
+  assert.equal(world.rolls.length, 1, "fixture sanity: the transcript needed a roll");
+  assert.equal(run.status, "success");
+  assert.equal(run.inputTokens, 4_000 + 120, "the roll is summed into the run's cost");
+  assert.equal(run.outputTokens, 300 + 45);
+}
+
+// --- a roll that spent and then declined still spent ------------------------
+{
+  // Best-effort means the run carries on, not that the tokens came back.
+  resetAutomationQueueForTests();
+  const world = createWorld();
+  addAutomation(world, "a1", { conditions: NO_LIMITS });
+  addSession(world, "s1", transcript(100));
+  addBinding(world, "b1");
+  world.rollResult = null;
+  world.rollUsage = { inputTokens: 4_000, outputTokens: 12 };
+
+  const [run] = await runAutomationNow("a1", undefined, world.deps);
+  assert.deepEqual(world.summaryWrites, [], "fixture sanity: the roll produced nothing");
+  assert.equal(run.inputTokens, 4_000 + 120, "and is still on the bill");
+}
+
+// --- a run that never reached the model still carries what its roll cost ----
+{
+  // The mid-preparation Stop of section 10. Nothing was asked of the provider,
+  // but the roll on the way in already had its turn — and the exit that records
+  // no cost at all is the one where the tokens vanish silently.
+  resetAutomationQueueForTests();
+  let rolls = 0;
+  const world = createWorld();
+  addAutomation(world, "a1", { conditions: NO_LIMITS });
+  addSession(world, "s1");
+  addSession(world, "s2", transcript(100));
+  addBinding(world, "b1", { sessionId: "s1" });
+  addBinding(world, "b2", { sessionId: "s2" });
+  world.rollUsage = { inputTokens: 4_000, outputTokens: 300 };
+  world.deps.rollSummary = async () => {
+    rolls += 1;
+    // Stop lands while this run is still getting itself ready: the roll has
+    // spent, and the run has a row but will never reach the model.
+    cancelAutomationRun(world.runs[0].id, world.deps);
+    return { summary: "Rolled summary.", usage: world.rollUsage };
+  };
+
+  const runs = await withDeadline(
+    runAutomationNow("a1", undefined, world.deps),
+    2_000,
+    "a cancelled run still has to return"
+  );
+  assert.equal(rolls, 1, "fixture sanity: the second place rolled before it was stopped");
+  assert.deepEqual(runs.map((run) => run.status), ["success", "cancelled"]);
+  assert.equal(
+    world.streamCalls.length,
+    1,
+    "fixture sanity: the stopped run never reached the provider"
+  );
+  assert.equal(runs[1].inputTokens, 4_000, "the roll it already paid for is recorded");
+  assert.equal(runs[1].outputTokens, 300);
+}
+
+// --- unreported stays unreported, even with a roll in front of it -----------
+{
+  // Adding a reported number to an unreported one must not invent the missing
+  // half as zero: a total that is short of the truth has to say so (13).
+  resetAutomationQueueForTests();
+  const world = createWorld();
+  addAutomation(world, "a1", { conditions: NO_LIMITS });
+  addSession(world, "s1", transcript(100));
+  addBinding(world, "b1");
+  world.usage = null;
+
+  const [run] = await runAutomationNow("a1", undefined, world.deps);
+  assert.equal(world.rolls.length, 1, "fixture sanity: it rolled");
+  assert.equal(
+    run.inputTokens,
+    undefined,
+    "a roll nobody counted plus a turn nobody counted is still nobody counting"
+  );
+}
+
+// --- the daily cap is one binding's business, not everybody's ---------------
+{
+  // Guard rail 7 records the same `budget` code as 4b, and the runner used to
+  // raise the app-wide pause on either. So a coach that had already run its
+  // three times today held *every* automation the athlete has — and stopped the
+  // rest of its own fan-out on the way out.
+  resetAutomationQueueForTests();
+  const world = threePlaceWorld();
+  world.automations.get("a1").conditions = {
+    batchWindowMin: 0,
+    cooldownMin: 0,
+    maxRunsPerDay: 1
+  };
+  // b1 has had its one run for the day; b2 and b3 have not.
+  world.runs.push({
+    id: "earlier",
+    automationId: "a1",
+    bindingId: "b1",
+    status: "success",
+    triggerKind: "schedule",
+    startedAt: world.now.toISOString()
+  });
+
+  const runs = await runAutomationTrigger(
+    { automationId: "a1", kind: "schedule" },
+    world.deps
+  );
+
+  assert.equal(runs[0].skipReason, "budget", "b1 has had its allowance");
+  assert.match(
+    runs[0].error,
+    /already run 1 times? here today/,
+    "and the row says which of the two `budget` means"
+  );
+  assert.equal(
+    world.pause,
+    null,
+    "one binding's day is not one fact about every automation the athlete has"
+  );
+  assert.deepEqual(
+    runs.map((run) => run.status),
+    ["skipped", "success", "success"],
+    "and the other places this trigger was going to reach still run"
+  );
+}
+
+// --- the month's ceiling still does both ------------------------------------
+{
+  // The half that *is* one fact about everything: it pauses, and the fan-out
+  // that hit it stops there rather than writing the same row per binding.
+  resetAutomationQueueForTests();
+  const world = threePlaceWorld();
+  world.budget = 500_000;
+  world.monthToDateTokens = 500_000;
+
+  const runs = await runAutomationTrigger(
+    { automationId: "a1", kind: "schedule" },
+    world.deps
+  );
+  assert.deepEqual(runs.map((run) => run.skipReason), ["budget"], "one row explains it");
+  assert.equal(world.pause.reason, "budget");
+  assert.equal(world.pause.runId, runs[0].id, "and the banner points at it");
+}
+
+// --- the burst guard counts everything that lands in the conversation -------
+{
+  // 2.3 is counting what reaches the transcript, and a silent run reaches it:
+  // 5.5's trace is persisted exactly the way an answer is, and it cost a full
+  // provider turn to decide on. Counting only `success` let five coaches
+  // conclude "nothing new" into one conversation every hour, for ever, at full
+  // price — the burst the guard exists to stop, minus the words.
+  resetAutomationQueueForTests();
+  const world = createWorld();
+  addAutomation(world, "a1", { conditions: NO_LIMITS });
+  addSession(world, "s1");
+  addBinding(world, "b1");
+  for (let index = 0; index < SESSION_BURST_PER_HOUR; index += 1) {
+    world.runs.push({
+      id: `silent-${index}`,
+      automationId: "a1",
+      bindingId: "b1",
+      sessionId: "s1",
+      status: "silent",
+      triggerKind: "schedule",
+      startedAt: new Date(world.now.getTime() - MINUTE).toISOString()
+    });
+  }
+
+  const [run] = await runAutomationTrigger(
+    { automationId: "a1", kind: "schedule" },
+    world.deps
+  );
+  assert.equal(run.skipReason, "burst", "five traces in an hour is a full conversation");
+  assert.equal(world.streamCalls.length, 0, "and nothing was spent finding that out");
+}
+
+
+// ---------------------------------------------------------------------------
+// The trigger's own state, through every way a run can end (R2 step 3)
+// ---------------------------------------------------------------------------
+
+// --- landing the answer is the last thing that can fail --------------------
+{
+  // The watermark used to move *before* the transcript was written, and the
+  // write was the one step outside the run's own error handling. So a throw
+  // there recorded "analysed" for an answer nobody can read, left this row
+  // saying `running` until the next launch reconciled it, and wrote a second
+  // row as `failed` from the fan-out's handler. Three wrong facts from one
+  // throw, and the activity was gone for good.
+  resetAutomationQueueForTests();
+  const world = createWorld();
+  addAutomation(world, "a1", { trigger: ACTIVITY_TRIGGER, conditions: NO_LIMITS });
+  addSession(world, "s1");
+  addBinding(world, "b1", { sessionId: "s1", lastActivityAt: RUNNER_NOW_EPOCH - 8 * 86_400 });
+  const activity = addActivity(world, "act-1", 1);
+  world.deps.saveSession = () => {
+    throw new Error("the conversation went away under it");
+  };
+
+  const runs = await runAutomationTrigger(
+    { automationId: "a1", kind: "activity" },
+    world.deps
+  );
+
+  assert.equal(runs.length, 1, "one throw is one run, not two rows");
+  assert.equal(runs[0].status, "failed");
+  assert.match(runs[0].error, /went away under it/);
+  assert.equal(
+    world.runs.filter((run) => run.status === "running").length,
+    0,
+    "and nothing is left saying `running` for the next launch to reconcile"
+  );
+  assert.notEqual(
+    world.bindings.get("b1").lastActivityAt,
+    activity.start_time,
+    "the activity was never written, so it is still owed"
+  );
+  // Which is the whole point: the next trigger picks it up again.
+  world.deps.saveSession = (sessionId, entries) => {
+    world.sessions.get(sessionId).entries = entries;
+  };
+  world.bindings.get("b1").backoffUntil = undefined;
+  world.bindings.get("b1").backoffLevel = undefined;
+  const [retry] = await runAutomationTrigger(
+    { automationId: "a1", kind: "activity" },
+    world.deps
+  );
+  assert.equal(retry.status, "success");
+  assert.equal(world.bindings.get("b1").lastActivityAt, activity.start_time);
+}
+
+// --- a run that reached the model and then failed to land still backs off ---
+{
+  // It asked the provider, so the streak is a claim it is entitled to make —
+  // and without it an activity trigger would re-offer the same activity on
+  // every 15-minute poll into a store that keeps refusing it.
+  resetAutomationQueueForTests();
+  const world = createWorld();
+  addAutomation(world, "a1", { conditions: NO_LIMITS });
+  addSession(world, "s1");
+  addBinding(world, "b1");
+  world.deps.saveSession = () => {
+    throw new Error("nope");
+  };
+
+  await runAutomationNow("a1", undefined, world.deps);
+  assert.equal(world.bindings.get("b1").backoffLevel, 1, "the first step of the backoff");
+}
+
+// --- a silent run that cannot land its trace is the same story -------------
+{
+  resetAutomationQueueForTests();
+  const world = createWorld();
+  addAutomation(world, "a1", { trigger: ACTIVITY_TRIGGER, conditions: NO_LIMITS });
+  addSession(world, "s1");
+  addBinding(world, "b1", { sessionId: "s1", lastActivityAt: RUNNER_NOW_EPOCH - 8 * 86_400 });
+  addActivity(world, "act-1", 1);
+  world.outcome = { text: NOTHING_TO_REPORT };
+  world.deps.saveSession = () => {
+    throw new Error("no trace either");
+  };
+
+  const [run] = await runAutomationTrigger(
+    { automationId: "a1", kind: "activity" },
+    world.deps
+  );
+  assert.equal(run.status, "failed", "a trace that never landed is not a silent run");
+  assert.equal(
+    world.bindings.get("b1").lastActivityAt,
+    RUNNER_NOW_EPOCH - 8 * 86_400,
+    "and the activity is still owed"
+  );
+}
+
+// --- a binding detached mid-run leaves its clocks nowhere to be written ----
+{
+  // Detach deletes the row (2.4). The run in flight holds the old copy, so
+  // every clock write it makes afterwards has no row to land on. It must not
+  // throw its way out — the answer is already in the conversation, and a run
+  // that wrote its answer and then crashed on bookkeeping is the worst of both.
+  resetAutomationQueueForTests();
+  const world = createWorld();
+  addAutomation(world, "a1", { trigger: ACTIVITY_TRIGGER, conditions: NO_LIMITS });
+  addSession(world, "s1");
+  addBinding(world, "b1", { sessionId: "s1", lastActivityAt: RUNNER_NOW_EPOCH - 8 * 86_400 });
+  addActivity(world, "act-1", 1);
+  const original = world.deps.streamChat;
+  world.deps.streamChat = async (...args) => {
+    world.bindings.delete("b1");
+    return original(...args);
+  };
+
+  const [run] = await runAutomationTrigger(
+    { automationId: "a1", kind: "activity" },
+    world.deps
+  );
+  assert.equal(run.status, "success", "the answer still lands where it was told to");
+  assert.equal(world.sessions.get("s1").entries.length, 2, "playbook and answer");
+}
+
+
+// ---------------------------------------------------------------------------
+// The conversation cluster (R2 step 4)
+// ---------------------------------------------------------------------------
+
+// --- the roll runs on the coach the athlete chose --------------------------
+{
+  // A roll is a provider turn taken on this automation's behalf: its cost lands
+  // on this run's row (13), and guard rail 3 pre-flighted *this* provider and
+  // no other. It used to go out with no runtime at all, so it silently spent on
+  // whatever the interactive chat happened to be set to — an automation pointed
+  // at a second provider had its summariser billed to the first, on a provider
+  // nothing had checked was even usable.
+  resetAutomationQueueForTests();
+  const world = createWorld();
+  addAutomation(world, "a1", {
+    conditions: NO_LIMITS,
+    runtime: { provider: "claude-api", model: "claude-opus-5", effort: "high" }
+  });
+  addSession(world, "s1", transcript(100));
+  addBinding(world, "b1");
+
+  await runAutomationNow("a1", undefined, world.deps);
+  assert.equal(world.rolls.length, 1, "fixture sanity: it rolled");
+  assert.equal(world.rolls[0].runtime.provider, "claude-api");
+  assert.equal(world.rolls[0].runtime.model, "claude-opus-5");
+  // Effort is the one thing that does not inherit: it is cost rather than
+  // capability (7), and a summariser compressing text it was handed has nothing
+  // to think harder about.
+  assert.equal(
+    world.rolls[0].runtime.effort,
+    "high",
+    "the runner hands the run's resolved runtime over unchanged"
+  );
+  assert.equal(
+    world.streamCalls[0].options.runtime.provider,
+    "claude-api",
+    "and the run itself is on the same provider, which is the whole point"
+  );
+}
+
+// --- a summary with no count describes nothing -----------------------------
+{
+  // 5.7: the pair is one fact and is always written together. A roll only
+  // happens once the uncovered stretch passes LIMIT, so the count it writes can
+  // never be below LIMIT - KEEP — a stored zero is a half-written row, and the
+  // safe reading is *no summary*, the way section 10 reads a half-written pause
+  // as *not paused*. Trusting it sends a summary of turns the model is also
+  // about to read in full, and nothing downstream could notice.
+  const entries = transcript(30);
+  const plan = planTranscriptContext(entries, {
+    summary: "Half a row.",
+    through: 0
+  });
+  assert.equal(plan.summary, undefined, "a count of zero is not a count");
+  assert.equal(plan.tail.length, 30, "so the whole transcript goes, once");
+  assert.deepEqual(plan.toSummarise, []);
+  assert.equal(plan.through, 0);
+
+  // The honest pair is untouched.
+  const good = planTranscriptContext(entries, { summary: "Real.", through: 10 });
+  assert.equal(good.summary, "Real.");
+  assert.equal(good.tail.length, 20);
+}
+
+// --- a roll racing the athlete's turn leaves the pair describing the truth --
+{
+  // The roll is a provider turn, so the athlete can type through it. Its count
+  // is computed against the snapshot the run read, and committed minutes later
+  // against a longer transcript — which is safe only because every other writer
+  // appends: the entries the summary covers are the same entries they were.
+  resetAutomationQueueForTests();
+  const world = createWorld();
+  addAutomation(world, "a1", { conditions: NO_LIMITS });
+  addSession(world, "s1", transcript(100));
+  addBinding(world, "b1");
+  world.deps.rollSummary = async (previous, entries) => {
+    world.rolls.push({ previous, count: entries.length });
+    // The athlete says something while the summariser is thinking.
+    world.sessions.get("s1").entries = [
+      ...world.sessions.get("s1").entries,
+      { kind: "message", role: "user", content: "Quick question." }
+    ];
+    return { summary: "Rolled summary." };
+  };
+
+  await runAutomationNow("a1", undefined, world.deps);
+  assert.deepEqual(world.summaryWrites, [
+    { sessionId: "s1", summary: "Rolled summary.", through: 80 }
+  ]);
+  const landed = world.sessions.get("s1").entries;
+  assert.equal(
+    landed.filter((entry) => entry.content === "Quick question.").length,
+    1,
+    "the athlete's turn survives the run's append, exactly once"
+  );
+
+  // And the pair still accounts for the whole transcript: nothing between the
+  // summary's end and the tail's start, and nothing counted twice.
+  const next = planTranscriptContext(landed, world.summaries.get("s1"));
+  assert.equal(next.summary, "Rolled summary.");
+  assert.equal(
+    next.through + next.tail.length,
+    landed.length,
+    "summary + tail is the whole conversation, still"
+  );
+}
+
+// --- a rebuilt conversation starts with no summary -------------------------
+{
+  // 2.4: a `dedicated` binding whose conversation the athlete deleted builds a
+  // new one. The summary lived on the deleted row and went with it, so the new
+  // conversation must not inherit a count describing a transcript that no
+  // longer exists — 5.7 calls that the one failure nobody can notice by reading
+  // the answer.
+  resetAutomationQueueForTests();
+  const world = createWorld();
+  addAutomation(world, "a1", { conditions: NO_LIMITS });
+  addBinding(world, "b1", { mode: "dedicated", sessionId: "s-gone" });
+  world.summaries.set("s-gone", { summary: "Stale.", through: 80 });
+
+  const [run] = await runAutomationNow("a1", undefined, world.deps);
+  assert.equal(run.status, "success");
+  assert.notEqual(run.sessionId, "s-gone", "it rebuilt rather than wrote nowhere");
+  assert.deepEqual(world.rolls, [], "an empty conversation has nothing to trim");
+  assert.equal(
+    world.summaries.get(run.sessionId),
+    undefined,
+    "and no summary followed it across"
+  );
+  assert.deepEqual(
+    lastWire(world).map((message) => message.role),
+    ["user"],
+    "so the model gets the playbook and nothing standing in for a lost thread"
+  );
+}
+
+// --- a per-run binding never trims, however many runs it has made ----------
+{
+  // Each run gets its own conversation, so the count that says "nothing to
+  // trim" is the same count, every time — no special case needed (5.7).
+  resetAutomationQueueForTests();
+  const world = createWorld();
+  addAutomation(world, "a1", { conditions: NO_LIMITS });
+  addBinding(world, "b1", {
+    mode: "per-run",
+    sessionId: null,
+    titleTemplate: "{{rule.name}} · {{date}}"
+  });
+
+  await runAutomationNow("a1", undefined, world.deps);
+  await runAutomationNow("a1", undefined, world.deps);
+  assert.equal(world.sessions.size, 2, "one conversation per run");
+  assert.deepEqual(world.rolls, []);
+  assert.deepEqual(world.summaryWrites, []);
+}
+
 console.log("coach automation runner tests passed");

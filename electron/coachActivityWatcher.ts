@@ -218,8 +218,11 @@ export class CoachActivityWatcher {
     }
     this.ticking = true;
     try {
-      await this.poll();
-      await this.flushDueBatches();
+      const coldStart = await this.poll();
+      const fired = await this.flushDueBatches();
+      if (!coldStart) {
+        await this.offerOwedActivities(fired);
+      }
     } catch (error) {
       this.deps.onError(error);
     }
@@ -235,7 +238,8 @@ export class CoachActivityWatcher {
     }
   }
 
-  private async poll(): Promise<void> {
+  /** True when this tick was the cold start that stamped the back catalogue. */
+  private async poll(): Promise<boolean> {
     const automations = this.deps
       .listAutomations()
       .filter(
@@ -247,7 +251,7 @@ export class CoachActivityWatcher {
     const firstRun = !this.deps.getSetting(INITIALIZED_SETTING);
 
     if (!this.deps.isCorosAuthenticated()) {
-      return;
+      return false;
     }
 
     const now = this.deps.now();
@@ -258,7 +262,7 @@ export class CoachActivityWatcher {
     if (firstRun) {
       this.deps.markAllSeen();
       this.deps.setSetting(INITIALIZED_SETTING, now.toISOString());
-      return;
+      return true;
     }
 
     if (!automations.length) {
@@ -266,13 +270,13 @@ export class CoachActivityWatcher {
       // next week would fire for everything that landed in the meantime.
       const unseen = this.deps.listUnseenActivities();
       this.deps.markSeen(unseen.map((activity) => activity.activity_id));
-      return;
+      return false;
     }
 
     const lookbackStart = Math.floor(start.getTime() / 1000);
     const unseen = this.deps.listUnseenActivities(lookbackStart);
     if (!unseen.length) {
-      return;
+      return false;
     }
 
     for (const automation of automations) {
@@ -295,6 +299,53 @@ export class CoachActivityWatcher {
         .map((activity) => activity.activity_id)
         .filter((id) => !batched.has(id))
     );
+    return false;
+  }
+
+  /**
+   * Section 4's promise, which nothing was keeping: *"the next poll will find it
+   * still unanalysed because the watermark did not move."*
+   *
+   * It did not. `coach_seen_at` is stamped at flush, before the runner has
+   * answered and whatever it answers — which is right, because the flag means
+   * "the watcher has looked at this" and the watcher did. But the watcher's
+   * *firing* condition was "there are unseen rows", so once a batch was stamped
+   * the trigger never came round again. A run refused for any reason — quiet
+   * hours, a cooldown, a backoff, either pause, a signed-out provider — left
+   * the activity owed by the binding's watermark and asked for by nobody. With
+   * `multiActivity` off, which is the default, the next activity to arrive then
+   * replaced it and it was never analysed at all.
+   *
+   * So the tick asks again. The split of 3.2 is untouched: this says *look
+   * again*, and the runner still decides what is owed. A binding with nothing
+   * pending produces an empty plan, which a non-manual trigger logs nothing for,
+   * so the only automations this costs anything are the ones genuinely waiting.
+   */
+  private async offerOwedActivities(fired: Set<string>): Promise<void> {
+    // Behind the same gate `poll` uses, so the watcher keeps its one rule: it
+    // does no work of any kind while COROS is disconnected. The runner's own
+    // COROS check would try a reconnect on every one of these, and the tick
+    // that finds the connection back re-offers everything anyway — nothing is
+    // lost by waiting for it, which is the whole point of this method.
+    if (!this.deps.isCorosAuthenticated()) {
+      return;
+    }
+    for (const automation of this.deps.listAutomations()) {
+      if (!automation.enabled || automation.trigger.kind !== "activity") {
+        continue;
+      }
+      if (fired.has(automation.id)) {
+        // Already asked this tick, by the batch that just flushed.
+        continue;
+      }
+      if (this.batches.has(automation.id)) {
+        // Still collecting. Firing now would analyse the activities the batch
+        // window is deliberately holding, which is the one thing batching is
+        // for.
+        continue;
+      }
+      await this.deps.runTrigger({ automationId: automation.id, kind: "activity" });
+    }
   }
 
   /**
@@ -383,7 +434,9 @@ export class CoachActivityWatcher {
     }
   }
 
-  private async flushDueBatches(): Promise<void> {
+  /** The automations this flush fired a trigger for. */
+  private async flushDueBatches(): Promise<Set<string>> {
+    const fired = new Set<string>();
     const now = this.deps.now().getTime();
     const automations = new Map(
       this.deps.listAutomations().map((automation) => [automation.id, automation])
@@ -413,8 +466,10 @@ export class CoachActivityWatcher {
       // has its own watermark (a conversation attached yesterday owes a
       // different set than one attached last month), so the runner selects the
       // activities and fills in each run's payload itself.
+      fired.add(automationId);
       await this.deps.runTrigger({ automationId, kind: "activity" });
     }
+    return fired;
   }
 
   /** Test seam: the batches waiting on their window. */

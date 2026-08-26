@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import assert from "node:assert/strict";
 import path from "node:path";
 import { createRequire } from "node:module";
@@ -317,6 +318,70 @@ assert.equal(copies.entries().length, 1);
 const persisted = parseChatTranscriptJson(JSON.stringify(built));
 assert.deepEqual(persisted, built, "every collected entry survives the store");
 assert.deepEqual(persisted[1].automation, marker);
+
+// --- 13: a failed turn is not a refund -------------------------------------
+// Usage used to reach the collector only on `chat:streamDone`, which a stream
+// that errors never sends — so *no* failed automation run ever recorded what it
+// spent, and a provider that reliably breaks could run through the month's
+// ceiling for free. That is the exact hole section 13 says it closed, and the
+// runner's own suite could not see it: its fake collector reported usage on
+// every path, including the one the real collector had nothing to report on.
+{
+  const failed = createCollectorSink();
+  runStream(failed, [
+    ["chat:streamToken", { requestId: "r", delta: "Looking" }],
+    [
+      "chat:streamError",
+      {
+        requestId: "r",
+        message: "the provider fell over",
+        usage: { inputTokens: 900, outputTokens: 40 }
+      }
+    ]
+  ]);
+  assert.equal(failed.error(), "the provider fell over");
+  assert.deepEqual(
+    failed.usage(),
+    { inputTokens: 900, outputTokens: 40 },
+    "a turn that broke on a later round still spent the earlier ones"
+  );
+
+  // And a provider that reports nothing on the way down leaves it unknown
+  // rather than zero, exactly as it does on the way up.
+  const silentAboutCost = createCollectorSink();
+  runStream(silentAboutCost, [
+    ["chat:streamError", { requestId: "r", message: "no idea what that cost" }]
+  ]);
+  assert.equal(
+    silentAboutCost.usage(),
+    undefined,
+    "\"nobody told us\" is still a different fact from \"it was free\""
+  );
+}
+
+// --- and the emitting half, which no suite can execute ----------------------
+// Genuinely about source: driving `streamChat` to a real provider failure needs
+// a provider, a database and a network, and the collector above *is* the stub
+// that would stand in for them. What can rot silently is the send itself —
+// dropping `usage` from an error payload type-checks and compiles into a call
+// that under-reports — so the rule is one function rather than a habit at each
+// throw site, and this asserts the function still carries it.
+{
+  const source = fs.readFileSync(
+    path.join(repoRoot, "electron", "chatService.ts"),
+    "utf8"
+  );
+  assert.match(
+    source,
+    /const sendStreamError = \(payload: \{[\s\S]{0,240}?\.\.\.\(usage \? \{ usage \} : \{\}\)/,
+    "the one error send must carry what the turn spent"
+  );
+  assert.equal(
+    (source.match(/send\("chat:streamError"/g) ?? []).length,
+    1,
+    "and it must be the only one, or the rule is back to being remembered"
+  );
+}
 
 Module._load = originalLoad;
 console.log("chat stream sink tests passed");

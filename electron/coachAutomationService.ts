@@ -48,6 +48,7 @@ import type {
   ChatEntryAutomationMarker,
   ChatMessage,
   ChatProvider,
+  ChatTokenUsage,
   CoachAutomation,
   CoachAutomationBinding,
   CoachAutomationPause,
@@ -414,6 +415,26 @@ export function isOverBudget(spent: number, budget: number | null): boolean {
  * and no ceiling is the default: without this, every athlete who never set a
  * budget pays for that scan on every run to discard the answer.
  */
+/**
+ * 13: what a run cost is the sum of every provider turn it took, and the
+ * rolling summariser (5.7) is one of those turns. Undefined stays undefined —
+ * "nobody reported" is a different fact from "it was free", and adding a
+ * reported number to an unreported one must not quietly invent the missing
+ * half as zero. Two unknowns are still one unknown; one known and one unknown
+ * is the known part, which is the best the run log can honestly claim.
+ */
+function addTokenUsage(
+  left: ChatTokenUsage | undefined,
+  right: ChatTokenUsage | undefined
+): ChatTokenUsage | undefined {
+  if (!left) return right;
+  if (!right) return left;
+  return {
+    inputTokens: left.inputTokens + right.inputTokens,
+    outputTokens: left.outputTokens + right.outputTokens
+  };
+}
+
 function overBudget(deps: CoachAutomationRunnerDeps): boolean {
   const budget = deps.getBudget();
   if (budget === null || budget <= 0) {
@@ -526,13 +547,22 @@ export interface CoachAutomationRunnerDeps {
   getSessionSummary(sessionId: string): StoredTranscriptSummary;
   setSessionSummary(sessionId: string, summary: string, through: number): void;
   /**
-   * 5.7: folds entries into the running summary. Null when it could not — a
-   * roll is best-effort, and the run it is preparing for still has to happen.
+   * 5.7: folds entries into the running summary. A null `summary` means it
+   * could not — a roll is best-effort, and the run it is preparing for still
+   * has to happen.
+   *
+   * `usage` comes back separately because a roll is a full provider turn and
+   * 13 counts every one of them. It is reported whether or not the roll
+   * produced anything: a summariser that spent its tokens and then declined
+   * still spent them, and a budget that could not see the one feature built to
+   * make long conversations affordable would under-report exactly where it
+   * matters most.
    */
   rollSummary(
     previous: string | undefined,
-    entries: PersistedChatEntry[]
-  ): Promise<string | null>;
+    entries: PersistedChatEntry[],
+    runtime: AutomationRuntime
+  ): Promise<{ summary: string | null; usage?: ChatTokenUsage }>;
   createSession(provider: ChatProvider): string;
   saveSession(sessionId: string, entries: PersistedChatEntry[]): void;
   setSessionTitle(sessionId: string, title: string): void;
@@ -636,7 +666,7 @@ function createDefaultDeps(): CoachAutomationRunnerDeps {
     setSessionSummary: (sessionId, summary, through) => {
       setChatSessionCoachSummaryRow(sessionId, summary, through);
     },
-    rollSummary: async (previous, entries) => {
+    rollSummary: async (previous, entries, runtime) => {
       // Its own request id, not the run's: this happens while the run is being
       // prepared and has no row yet, so there is nothing for Stop to aim at.
       // The bound below is what ends it either way.
@@ -649,6 +679,13 @@ function createDefaultDeps(): CoachAutomationRunnerDeps {
           collector.emit(channel, payload);
         }
       };
+      // Whatever the roll spent goes back with it on every exit, including the
+      // ones that produce nothing. A roll is a full provider turn (13) and the
+      // caller folds it into the run it was preparing for.
+      const spent = () => {
+        const usage = collector.usage();
+        return usage ? { usage } : {};
+      };
       try {
         const streaming = streamChat(
           sink,
@@ -658,7 +695,17 @@ function createDefaultDeps(): CoachAutomationRunnerDeps {
             // Nothing to look up: it is compressing text it was handed, and a
             // tool round-trip here is both slower and a way to wander off.
             toolPolicy: "none",
-            runtime: { effort: AUTOMATION_DEFAULT_EFFORT }
+            // The run's own provider and model (decision 2), not the
+            // interactive chat's. A roll is a turn taken on this automation's
+            // behalf: its cost lands on this run's row (13), guard rail 3
+            // pre-flighted *this* provider and no other, and an automation
+            // pointed at a second provider must not quietly spend on the first.
+            //
+            // Effort is the one thing that does not inherit. It is cost rather
+            // than capability (7), and a summariser compressing text it was
+            // handed has nothing to think harder about — so a coach set to
+            // `high` gets a `high` answer and a `low` summary.
+            runtime: { ...runtime, effort: AUTOMATION_DEFAULT_EFFORT }
           }
         );
         streaming.catch(() => undefined);
@@ -671,14 +718,14 @@ function createDefaultDeps(): CoachAutomationRunnerDeps {
         ]);
         if (timedOut) {
           cancelChat(requestId);
-          return null;
+          return { summary: null, ...spent() };
         }
         if (collector.error() || collector.cancelled()) {
-          return null;
+          return { summary: null, ...spent() };
         }
-        return collector.text().trim() || null;
+        return { summary: collector.text().trim() || null, ...spent() };
       } catch {
-        return null;
+        return { summary: null, ...spent() };
       } finally {
         watchdog.stop();
       }
@@ -928,12 +975,12 @@ function checkRateGuards(
     return null;
   }
 
-  // 13. Before the backoff, because it is the one refusal here that is
-  // about the athlete's money rather than about this binding's luck — and the
-  // only one that will not fix itself with time inside the month.
-  if (overBudget(deps)) {
-    return "budget";
-  }
+  // Guard rail 4b — the month's ceiling — is *not* here. It reads the same
+  // `budget` skip code as the daily cap below, and folding the two into one
+  // return value meant the runner could not tell them apart: exhausting one
+  // binding's three runs for the day raised the app-wide pause and held every
+  // other automation the athlete has. It is its own branch in `runOneBinding`,
+  // which is also where section 4 numbers it.
 
   // Backoff comes first because it outlives the others and explains more: a
   // binding that is both inside quiet hours and backed off is backed off for a
@@ -972,10 +1019,16 @@ function checkRateGuards(
   }
 
   if (sessionId) {
+    // Both statuses that write to the transcript, which is what 2.3 is counting
+    // — "five automation messages per conversation per hour". A silent run is
+    // not nothing: it persists 5.5's trace, it took a full provider turn to
+    // decide it had nothing to say, and five coaches concluding that in the
+    // same hour is exactly the wall of chips the guard exists to stop. It is
+    // also the same pair 9.3 counts for the unread dot, for the same reason.
     const lastHour = deps.listRuns({
       sessionId,
       since: new Date(now.getTime() - 3_600_000).toISOString(),
-      statuses: ["success"]
+      statuses: ["success", "silent"]
     });
     if (lastHour.length >= SESSION_BURST_PER_HOUR) {
       return "burst";
@@ -1167,7 +1220,18 @@ export function planTranscriptContext(
   entries: PersistedChatEntry[],
   stored: StoredTranscriptSummary
 ): TranscriptContextPlan {
-  const valid = stored.through >= 0 && stored.through <= entries.length;
+  // A count past the end describes a conversation that is no longer there, and
+  // a summary with no count at all — or a count of zero — describes nothing: a
+  // real roll only happens once the uncovered stretch passes LIMIT, so the
+  // count it writes can never be less than `LIMIT - KEEP`. Either way the pair
+  // is half-written, and 5.7 is explicit that the two are one fact. The safe
+  // reading is *no summary*, the same way section 10 reads a half-written pause
+  // as *not paused*: trusting it would send a summary of turns the model is
+  // also about to read in full, and nothing downstream could notice.
+  const valid =
+    stored.through > 0 &&
+    stored.through <= entries.length &&
+    Boolean(stored.summary);
   const through = valid ? stored.through : 0;
   const summary = valid ? stored.summary : undefined;
 
@@ -1414,23 +1478,46 @@ async function runOneBinding(
     resolved.setPause(null);
   }
 
+  // 4b. The month's allowance (13). Its own branch rather than one more rate
+  // guard, because it is the only refusal here that is not a fact about this
+  // binding: it is one fact about every automation the athlete has, so it
+  // raises the pause the same way section 10's 2FA demand does, and one skip
+  // per binding per poll until the 1st is the run log that already learned not
+  // to fill.
+  if (!event.bypassGuards && overBudget(resolved)) {
+    const declined = skip(
+      step,
+      "budget",
+      resolved,
+      knownSessionId,
+      "This month's token budget is spent."
+    );
+    resolved.setPause({
+      reason: "budget",
+      since: resolved.now().toISOString(),
+      runId: declined.id
+    });
+    return declined;
+  }
+
   // 5-8. Rate guards. A conversation that does not exist yet cannot be busy,
   // so the burst guard only applies to one the binding already writes into.
+  //
+  // Guard 7 shares the `budget` code with 4b above and nothing else: it is this
+  // binding's own three-runs-a-day, it clears at midnight without the athlete
+  // doing anything, and it says nothing about the other automations. The reason
+  // in words is what keeps the run log able to tell the two apart.
   const rateSkip = checkRateGuards(step, knownSessionId ?? null, resolved);
   if (rateSkip) {
-    const declined = skip(step, rateSkip, resolved, knownSessionId);
-    if (rateSkip === "budget") {
-      // 13, the same shape as the 2FA demand of section 10: the
-      // month's allowance is one fact about every automation the athlete has,
-      // and one skip per binding per poll until the 1st is the run log this
-      // already learned not to fill.
-      resolved.setPause({
-        reason: "budget",
-        since: resolved.now().toISOString(),
-        runId: declined.id
-      });
-    }
-    return declined;
+    return skip(
+      step,
+      rateSkip,
+      resolved,
+      knownSessionId,
+      rateSkip === "budget"
+        ? `This coach has already run ${automation.conditions.maxRunsPerDay} times here today.`
+        : undefined
+    );
   }
 
   // Every guard passed: only now is it worth putting a conversation on disk.
@@ -1450,11 +1537,22 @@ async function runOneBinding(
   const plan = planTranscriptContext(session.entries, stored);
   let summary = plan.summary;
   let tail = plan.tail;
+  // A roll is a provider turn on this run's behalf, so its tokens belong to
+  // this run's row (13). Held here because the roll happens before the row
+  // exists, and folded into whatever the run ends up recording — including the
+  // exits that never reach the model, which is exactly when a roll that has
+  // already spent would otherwise vanish from the month's total.
+  let rollUsage: ChatTokenUsage | undefined;
   if (plan.toSummarise.length) {
-    const rolled = await resolved.rollSummary(plan.summary, plan.toSummarise);
-    if (rolled) {
-      summary = rolled;
-      resolved.setSessionSummary(session.sessionId, rolled, plan.through);
+    const rolled = await resolved.rollSummary(
+      plan.summary,
+      plan.toSummarise,
+      resolveAutomationRuntime(automation)
+    );
+    rollUsage = rolled.usage;
+    if (rolled.summary) {
+      summary = rolled.summary;
+      resolved.setSessionSummary(session.sessionId, rolled.summary, plan.through);
     } else {
       // Best-effort, and a failure must neither fail the run nor drop the
       // middle of the conversation on the floor. The run sends what it would
@@ -1463,6 +1561,13 @@ async function runOneBinding(
       tail = [...plan.toSummarise, ...plan.tail];
     }
   }
+  /** What to record on a run that ended here, roll included. */
+  const costOf = (streamUsage: ChatTokenUsage | undefined) => {
+    const total = addTokenUsage(rollUsage, streamUsage);
+    return total
+      ? { inputTokens: total.inputTokens, outputTokens: total.outputTokens }
+      : {};
+  };
 
   // Section 7's default is resolved once, here, so the run log records what the
   // run actually used rather than what the definition happened to leave blank.
@@ -1527,7 +1632,9 @@ async function runOneBinding(
   // asked of the provider, so this must not clear a backoff streak: an athlete
   // pressing Stop would otherwise reset the hold on a binding that is failing.
   if (cancellation?.cancelled()) {
-    return finish({ status: "cancelled" }, false);
+    // Nothing was asked of the model, but a roll on the way in may already have
+    // spent — and it is spent whether or not this run got anywhere.
+    return finish({ status: "cancelled", ...costOf(undefined) }, false);
   }
 
   let timedOut = false;
@@ -1559,7 +1666,8 @@ async function runOneBinding(
   } catch (error) {
     return finish({
       status: "failed",
-      error: error instanceof Error ? error.message : "Automation run failed."
+      error: error instanceof Error ? error.message : "Automation run failed.",
+      ...costOf(collector.usage())
     });
   } finally {
     watchdog.stop();
@@ -1575,7 +1683,8 @@ async function runOneBinding(
       error: `The provider stopped responding — nothing arrived for ${Math.max(
         1,
         Math.round(resolved.idleTimeoutMs / 60_000)
-      )} minutes.`
+      )} minutes.`,
+      ...costOf(collector.usage())
     });
   }
 
@@ -1586,10 +1695,9 @@ async function runOneBinding(
   });
 
   if (collector.error()) {
-    const usage = collector.usage();
-    const errorCost = usage
-      ? { inputTokens: usage.inputTokens, outputTokens: usage.outputTokens }
-      : {};
+    // A failed turn is not a refund: whatever its completed rounds spent comes
+    // back on `chat:streamError`, and the roll above is added to it (13).
+    const errorCost = costOf(collector.usage());
     return finish(
       collector.authError()
         ? {
@@ -1605,18 +1713,19 @@ async function runOneBinding(
   // reached the provider carries what it cost — a failed or cancelled run spent
   // tokens too, and a budget that forgave those would be a budget a broken
   // provider could run through for free.
-  const spent = collector.usage();
-  const cost = spent
-    ? { inputTokens: spent.inputTokens, outputTokens: spent.outputTokens }
-    : {};
+  const cost = costOf(collector.usage());
 
   if (collector.cancelled()) {
     return finish({ status: "cancelled", ...cost });
   }
 
   // The binding's watermark moves only once the model has actually looked at
-  // the activity. A failed or cancelled run leaves it where it was, so the
-  // activity comes back with the next trigger instead of being lost.
+  // the activity *and* what it said is on disk. A failed or cancelled run
+  // leaves it where it was, so the activity comes back with the next trigger
+  // instead of being lost — and so does a run whose persistence threw, which
+  // is why this is called after the save rather than before it. Moving it
+  // first meant a throw in the store recorded "analysed" for an answer that
+  // was never written, and the activity was gone for good.
   const advanceWatermark = (): void => {
     if (step.activity?.start_time) {
       resolved.setBindingSchedule(binding.id, {
@@ -1625,10 +1734,6 @@ async function runOneBinding(
     }
   };
 
-  // The model looked at the activity, whatever it concluded. Failed and
-  // cancelled runs returned above and leave the watermark where it was.
-  advanceWatermark();
-
   // Re-read rather than reuse the snapshot taken before the stream: a run takes
   // as long as the provider does, and the athlete may well have said something
   // in that conversation meanwhile. Appending to the stale copy would delete
@@ -1636,40 +1741,65 @@ async function runOneBinding(
   const readBack = (): PersistedChatEntry[] =>
     resolved.getSessionEntries(session.sessionId) ?? session.entries;
 
-  const output = parseAutomationOutput(collector.text());
-  if (output.silent) {
-    // The answer itself is a control token the athlete must never read, so
-    // nothing the model wrote is persisted. What lands instead is a one-line
-    // trace saying the coach looked (5.5): a conversation that keeps no record
-    // of a run reads as a broken automation rather than as a considered "no".
+  // Landing the answer is the last thing that can go wrong, and it used to be
+  // the one thing that did not go through `finish`. A throw here — the store,
+  // the conversation vanishing under it, anything — escaped to the fan-out's
+  // own handler, which recorded a *second* row as `failed` and left this one
+  // saying `running` until the next launch reconciled it. Meanwhile the
+  // watermark had already moved, so the activity was gone for good.
+  try {
+    const output = parseAutomationOutput(collector.text());
+    if (output.silent) {
+      // The answer itself is a control token the athlete must never read, so
+      // nothing the model wrote is persisted. What lands instead is a one-line
+      // trace saying the coach looked (5.5): a conversation that keeps no
+      // record of a run reads as a broken automation rather than as a
+      // considered "no".
+      resolved.saveSession(session.sessionId, [
+        ...readBack(),
+        {
+          kind: "automationSilent",
+          automation: marker,
+          at: resolved.now().getTime()
+        }
+      ]);
+      advanceWatermark();
+      return finish({ status: "silent", ...cost });
+    }
+
+    const produced = collector.entries().map((entry) =>
+      entry.kind === "message" ? { ...entry, automation: marker } : entry
+    );
+    const existing = readBack();
+    // 5.6: the synthetic user turn carries the playbook and the same marker, so
+    // the UI can render it as a chip rather than an athlete bubble.
     resolved.saveSession(session.sessionId, [
-      ...readBack(),
-      {
-        kind: "automationSilent",
-        automation: marker,
-        at: resolved.now().getTime()
-      }
+      ...existing,
+      { kind: "message", role: "user", content: playbook, automation: marker },
+      ...produced
     ]);
-    return finish({ status: "silent", ...cost });
+    advanceWatermark();
+
+    return finish({
+      status: "success",
+      ...cost,
+      ...(output.summary ? { summary: output.summary } : {})
+    });
+  } catch (error) {
+    // One row, `failed`, and the watermark left where it was — so the activity
+    // comes back with the next trigger rather than being recorded as analysed
+    // by a run whose answer nobody can read. The backoff applies exactly as it
+    // does to a provider that threw: this run reached the model, so the streak
+    // is a claim it is entitled to make.
+    return finish({
+      status: "failed",
+      error:
+        error instanceof Error
+          ? error.message
+          : "The run could not be written to its conversation.",
+      ...cost
+    });
   }
-
-  const produced = collector.entries().map((entry) =>
-    entry.kind === "message" ? { ...entry, automation: marker } : entry
-  );
-  const existing = readBack();
-  // 5.6: the synthetic user turn carries the playbook and the same marker, so
-  // the UI can render it as a chip rather than an athlete bubble.
-  resolved.saveSession(session.sessionId, [
-    ...existing,
-    { kind: "message", role: "user", content: playbook, automation: marker },
-    ...produced
-  ]);
-
-  return finish({
-    status: "success",
-    ...cost,
-    ...(output.summary ? { summary: output.summary } : {})
-  });
 }
 
 /**
@@ -1858,10 +1988,13 @@ export async function runAutomationTrigger(
         // the pause this run just set means the next poll will not even ask —
         // so the log carries the one row that explains it rather than one per
         // binding.
-        if (
-          run.skipReason === "two-factor-required" ||
-          run.skipReason === "budget"
-        ) {
+        //
+        // Asked of the pause rather than of the skip code: guard 7's daily cap
+        // records `budget` too, and it is a fact about one binding that must
+        // not silence the other places this trigger was going to reach. The
+        // pause naming *this* run is the only thing that means "and everything
+        // after it would say the same".
+        if (resolved.getPause()?.runId === run.id) {
           stopped = true;
           break;
         }
