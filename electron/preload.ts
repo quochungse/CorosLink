@@ -1073,6 +1073,17 @@ const api = {
     ipcRenderer.on("coachAutomation:runUpdate", listener);
     return () => ipcRenderer.removeListener("coachAutomation:runUpdate", listener);
   },
+  onCoachAutomationBindingUpdate: (
+    callback: (binding: CoachAutomationBinding) => void
+  ): (() => void) => {
+    const listener = (
+      _event: Electron.IpcRendererEvent,
+      binding: CoachAutomationBinding
+    ) => callback(binding);
+    ipcRenderer.on("coachAutomation:bindingUpdate", listener);
+    return () =>
+      ipcRenderer.removeListener("coachAutomation:bindingUpdate", listener);
+  },
   onCoachAutomationPauseUpdate: (
     callback: (pause: CoachAutomationPause | null) => void
   ): (() => void) => {

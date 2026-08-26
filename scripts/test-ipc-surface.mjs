@@ -61,21 +61,61 @@ for (const channel of SECTION_8_CHANNELS) {
   assert.ok(invoked.has(channel), `preload.ts never invokes ${channel}`);
 }
 
-// The one push channel: emitted by the runner, listened for in preload.
-assert.ok(
-  listened.has("coachAutomation:runUpdate"),
-  "preload does not subscribe to coachAutomation:runUpdate"
+// --- the push channels ------------------------------------------------------
+// The half of the bridge with no invoke to pair it up. A push channel is a
+// plain string in two files that never run in the same process, and the
+// renderer harness cannot see the mismatch: it keys its fake listeners on the
+// *preload method* name, so a typo in either channel string leaves every test
+// green and the push silently dead. This is the check that says otherwise.
+const serviceSource = read("electron/coachAutomationService.ts");
+
+const emitted = new Set(
+  [...serviceSource.matchAll(/emitToAnyWindow\(\s*\n?\s*"([^"]+)"/g)].map(
+    (match) => match[1]
+  )
 );
-assert.match(
-  read("electron/coachAutomationService.ts"),
-  /"coachAutomation:runUpdate"/,
-  "nothing emits coachAutomation:runUpdate"
-);
-assert.equal(
-  handled.has("coachAutomation:runUpdate"),
-  false,
-  "a push channel must not also be an invoke handler"
-);
+assert.ok(emitted.size >= 3, "push emit scrape found too little; the regex has drifted");
+
+for (const channel of emitted) {
+  assert.ok(
+    listened.has(channel),
+    `${channel} is emitted but preload never subscribes to it`
+  );
+  assert.equal(
+    handled.has(channel),
+    false,
+    `${channel} is a push channel and must not also be an invoke handler`
+  );
+}
+
+// And the other direction: a listener whose emitter was renamed away is a
+// subscription that can never fire.
+for (const channel of listened) {
+  if (!channel.startsWith("coachAutomation:")) continue;
+  assert.ok(
+    emitted.has(channel),
+    `preload subscribes to ${channel} but nothing emits it`
+  );
+}
+
+// --- and the three writers that have to reach for the binding push ---------
+// Source about source, and the only kind of check available: every one of these
+// lives in a `createDefaultDeps`, which no suite executes — the runner and the
+// scheduler are both driven through injected fakes, so the default wiring is
+// exactly the code a test can never reach. Dropping one of these wrappers
+// compiles, type-checks and leaves every suite green, and the athlete's card
+// silently stops saying when it next fires.
+for (const [file, call] of [
+  ["electron/coachAutomationScheduler.ts", "setCoachAutomationBindingSchedule"],
+  ["electron/coachAutomationService.ts", "setCoachAutomationBindingSession"],
+  ["electron/coachAutomationService.ts", "setCoachAutomationBindingEnabled"]
+]) {
+  assert.match(
+    read(file),
+    new RegExp(`emitAutomationBindingUpdate\\(\\s*\\n?\\s*${call}\\(`),
+    `${file} must announce the binding it changed via ${call}`
+  );
+}
 
 // --- preload's shape and the renderer's view of it must agree --------------
 // electron/preload.ts exports `CorosLinkApi = typeof api` while

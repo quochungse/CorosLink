@@ -176,6 +176,30 @@ export function CoachAutomationDetail({
     });
   }, [api, automationId]);
 
+  /**
+   * The "where it runs" rows, which have no run to follow.
+   *
+   * `binding.enabled`, its conversation and the broken marker all change in the
+   * main process with the tab open: guard rail 2 disables a binding whose
+   * conversation the athlete deleted, and a `dedicated` binding adopts the one
+   * it just rebuilt (2.4). The run-log tab said so on the next push and this
+   * one, a tab away, went on showing the toggle on and no broken marker.
+   *
+   * Deliberately narrower than `refresh()`: that also re-reads the definition,
+   * and a background run landing while the athlete is part-way through editing
+   * a playbook must not touch what they have typed.
+   */
+  useEffect(() => {
+    if (!api?.onCoachAutomationBindingUpdate) return;
+    return api.onCoachAutomationBindingUpdate((binding) => {
+      if (binding.automationId !== automationId) return;
+      void api
+        .listCoachAutomationBindings(automationId)
+        .then(setBindings)
+        .catch(() => undefined);
+    });
+  }, [api, automationId]);
+
   const patchDraft = (patch: Partial<CoachAutomationInput>) => {
     setDraft((current) => (current ? { ...current, ...patch } : current));
   };

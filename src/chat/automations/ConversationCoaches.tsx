@@ -101,6 +101,16 @@ export function ConversationCoaches({
     });
   }, [api, refresh]);
 
+  // A binding can change with no run behind it: guard rail 2 breaks one whose
+  // conversation the athlete deleted, and a `dedicated` binding adopts the
+  // conversation it just rebuilt. Both are rows in this popover.
+  useEffect(() => {
+    if (!api?.onCoachAutomationBindingUpdate) return;
+    return api.onCoachAutomationBindingUpdate(() => {
+      void refresh();
+    });
+  }, [api, refresh]);
+
   useEffect(() => {
     if (!open) return;
     const onPointerDown = (event: MouseEvent) => {

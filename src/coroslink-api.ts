@@ -693,6 +693,10 @@ export interface CorosLinkApi {
     CoachAutomationSessionAttention[]
   >;
   markCoachAutomationSessionSeen: (sessionId: string) => Promise<number>;
+  /** A binding whose rendered state changed with no run to carry the news. */
+  onCoachAutomationBindingUpdate: (
+    callback: (binding: CoachAutomationBinding) => void
+  ) => () => void;
   onCoachAutomationRunUpdate: (
     callback: (run: CoachAutomationRun) => void
   ) => () => void;

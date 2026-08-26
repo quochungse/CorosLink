@@ -1,4 +1,5 @@
 import {
+  emitAutomationBindingUpdate,
   emitAutomationRunUpdate,
   isWithinQuietHours,
   parseTimeOfDay,
@@ -90,7 +91,13 @@ function createDefaultDeps(): CoachAutomationSchedulerDeps {
     listActiveBindings: (automationId) =>
       listActiveCoachAutomationBindings(automationId),
     setBindingNextRun: (bindingId, nextRunAt) => {
-      setCoachAutomationBindingSchedule(bindingId, { nextRunAt });
+      // 9.1's next-run line, which is booked on a timer with nobody watching
+      // and rendered by a card that was listening for runs. Booking is rare —
+      // seeding a new binding, firing a slot, writing one off as stale, or
+      // deferring one out of quiet hours — so this is not chatter.
+      emitAutomationBindingUpdate(
+        setCoachAutomationBindingSchedule(bindingId, { nextRunAt })
+      );
     },
     recordStaleSlot: ({ automationId, bindingId, sessionId }) => {
       const finishedAt = new Date().toISOString();

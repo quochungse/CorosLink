@@ -693,6 +693,320 @@ async function main() {
     await assertQuietConsole("the budget banner");
   }
 
+  // -------------------------------------------------------------------------
+  // 9.1: the slot the scheduler books, on a timer, with nobody watching
+  // -------------------------------------------------------------------------
+  // "A schedule automation carries when it next fires on the trigger line...
+  // It fires with nobody watching, so the card is the only place the athlete
+  // can check it without opening anything." The scheduler books that slot on
+  // its own tick and there was no run to carry the news, so a briefing created
+  // at lunchtime showed no next-run line at all until something unrelated
+  // refreshed the screen. It is the first thing an athlete does with a schedule
+  // automation and the one question the card exists to answer.
+  {
+    const booked = automation("a1", "Morning briefing");
+    await harness(
+      "mount",
+      "CoachAutomationsPanel",
+      {},
+      {
+        listCoachAutomations: [summary(booked)],
+        getCoachAutomationPause: null,
+        getCoachAutomationSpend: {
+          monthStart: "2026-08-01T00:00:00.000Z",
+          inputTokens: 0,
+          outputTokens: 0,
+          budget: null,
+          countedRuns: 0,
+          providerRuns: 0
+        }
+      }
+    );
+
+    await waitFor(
+      () => harness("exists", ".coach-automation-card-trigger"),
+      "the card renders"
+    );
+    const before = await harness("text", ".coach-automation-card-trigger");
+    assert.doesNotMatch(
+      before ?? "",
+      / · next /,
+      "fixture sanity: no slot has been booked yet"
+    );
+
+    // 60 seconds later, in the main process, with this screen open: the
+    // scheduler's tick books the slot and pushes.
+    await harness("setScript", {
+      listCoachAutomations: [
+        summary(booked, { nextRunAt: "2026-08-25T18:00:00.000Z" })
+      ]
+    });
+    assert.equal(
+      await harness("emit", "onCoachAutomationBindingUpdate", binding("b1", {
+        nextRunAt: "2026-08-25T18:00:00.000Z"
+      })),
+      1,
+      "the card has to be listening for it"
+    );
+
+    await waitFor(
+      async () =>
+        / · next /.test((await harness("text", ".coach-automation-card-trigger")) ?? ""),
+      "the card says when it next fires"
+    );
+    await assertQuietConsole("the booked slot");
+  }
+
+  // -------------------------------------------------------------------------
+  // 2.4: a binding broken while its own tab is open
+  // -------------------------------------------------------------------------
+  // Guard rail 2 disables an `existing` binding whose conversation the athlete
+  // deleted, and a `dedicated` one adopts the conversation it rebuilt. The run
+  // log tab hears about both on the run push; the rows a tab away read their
+  // bindings once, on mount, and went on showing the toggle on and no broken
+  // marker — half of each row live and half from mount.
+  {
+    const detail = (bindings) => ({
+      automation: automation("a1", "Post-run debrief"),
+      bindings
+    });
+    await harness(
+      "mount",
+      "CoachAutomationDetail",
+      { tab: "bindings" },
+      {
+        __byArg: {
+          listCoachAutomationBindings: {
+            "*": [
+              binding("b1", {
+                enabled: false,
+                sessionMissing: true,
+                sessionTitle: "Tuesday intervals"
+              })
+            ]
+          }
+        },
+        getCoachAutomation: detail([
+          binding("b1", { sessionTitle: "Tuesday intervals" })
+        ]),
+        listCoachAutomationRuns: []
+      }
+    );
+
+    await waitFor(
+      () => harness("exists", ".coach-automation-binding-row"),
+      "the where-it-runs tab renders"
+    );
+    assert.equal(
+      await harness("count", '.coach-automation-binding-row[data-broken="true"]'),
+      0,
+      "fixture sanity: the row starts healthy"
+    );
+    await harness("clearCalls");
+
+    assert.equal(
+      await harness(
+        "emit",
+        "onCoachAutomationBindingUpdate",
+        binding("b1", { enabled: false })
+      ),
+      1,
+      "the tab has to be listening"
+    );
+
+    await waitFor(
+      async () =>
+        (await harness(
+          "count",
+          '.coach-automation-binding-row[data-broken="true"]'
+        )) === 1,
+      "the row goes broken without a reload"
+    );
+    assert.equal(
+      await harness("count", '.coach-automation-binding-row[data-off="true"]'),
+      1,
+      "and greyed, which is 9.2's own word for it"
+    );
+
+    // Narrower than a full refresh on purpose: re-reading the definition would
+    // throw away a playbook the athlete is part-way through typing.
+    assert.equal(
+      await harness("callCount", "getCoachAutomation"),
+      0,
+      "the definition is not re-read underneath an edit"
+    );
+    await assertQuietConsole("the broken binding row");
+  }
+
+  // --- and a binding belonging to a different coach is not this tab's --------
+  {
+    // The negative half. A push that fires for everything passes every "did it
+    // fire" test, and this screen is one of several open on the same channel.
+    await harness(
+      "mount",
+      "CoachAutomationDetail",
+      { tab: "bindings" },
+      {
+        __byArg: { listCoachAutomationBindings: { "*": [binding("b1")] } },
+        getCoachAutomation: {
+          automation: automation("a1", "Post-run debrief"),
+          bindings: [binding("b1")]
+        },
+        listCoachAutomationRuns: []
+      }
+    );
+    await waitFor(
+      () => harness("exists", ".coach-automation-binding-row"),
+      "the tab renders"
+    );
+    await harness("clearCalls");
+
+    await harness(
+      "emit",
+      "onCoachAutomationBindingUpdate",
+      binding("b9", { automationId: "a2" })
+    );
+    await settle();
+    assert.equal(
+      await harness("callCount", "listCoachAutomationBindings"),
+      0,
+      "another coach's binding is not this screen's business"
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // The same news, on the conversation side
+  // -------------------------------------------------------------------------
+  {
+    // The popover renders the same rows from the other direction, and an
+    // athlete who never opens the Automations screen sees only this one.
+    await harness(
+      "mount",
+      "ConversationCoaches",
+      {},
+      {
+        listCoachAutomationsForSession: [binding("b1", { sessionTitle: "Daily" })],
+        listCoachAutomations: [summary(automation("a1", "Morning briefing"))],
+        listCoachAutomationRuns: []
+      }
+    );
+    await waitFor(
+      () => harness("exists", ".chat-coaches-pill"),
+      "the header chip renders"
+    );
+    await harness("clearCalls");
+
+    assert.equal(
+      await harness("emit", "onCoachAutomationBindingUpdate", binding("b1")),
+      1,
+      "the popover listens too"
+    );
+    await waitFor(
+      () => harness("callCount", "listCoachAutomationsForSession"),
+      "and re-reads its rows"
+    );
+    await assertQuietConsole("the popover's binding update");
+  }
+
+  // --- a tick that books several slots at once ------------------------------
+  {
+    // The scheduler books on its own tick, and one tick can seed every binding
+    // of an automation the athlete just attached in five places. That is five
+    // pushes in a row into a screen whose refresh sets state that another
+    // effect watches — the shape of the infinite render loop phase 1's second
+    // review found, which announced itself only in the console.
+    const booked = automation("a1", "Morning briefing");
+    await harness(
+      "mount",
+      "CoachAutomationsPanel",
+      {},
+      {
+        listCoachAutomations: [
+          summary(booked, { bindingCount: 5, enabledBindingCount: 5 })
+        ],
+        getCoachAutomationPause: null,
+        getCoachAutomationSpend: {
+          monthStart: "2026-08-01T00:00:00.000Z",
+          inputTokens: 0,
+          outputTokens: 0,
+          budget: null,
+          countedRuns: 0,
+          providerRuns: 0
+        }
+      }
+    );
+    await waitFor(
+      () => harness("exists", ".coach-automation-card-trigger"),
+      "the card renders"
+    );
+    await harness("clearCalls");
+
+    for (const id of ["b1", "b2", "b3", "b4", "b5"]) {
+      await harness("emit", "onCoachAutomationBindingUpdate", binding(id, {
+        nextRunAt: "2026-08-25T18:00:00.000Z"
+      }));
+    }
+    await settle();
+
+    // Five pushes, five reads, and then it stops. A count that kept climbing
+    // after the page settled is the loop this is here to catch.
+    const settledReads = await harness("callCount", "listCoachAutomations");
+    await settle();
+    assert.equal(
+      await harness("callCount", "listCoachAutomations"),
+      settledReads,
+      "the panel settles rather than re-reading itself in a loop"
+    );
+    assert.ok(
+      settledReads <= 5,
+      `one read per push at most, saw ${settledReads}`
+    );
+    await assertQuietConsole("a burst of booked slots");
+  }
+
+  // --- and every other way the popover changes a binding says so too --------
+  {
+    // Found by mutating the suite rather than by reading it: cutting the report
+    // out of the popover's shared mutation wrapper — the switch, the reorder,
+    // the detach — left the whole renderer suite green. The attach path had a
+    // test and these three had only a regex in the bindings suite, which is the
+    // kind of claim section 11 says belongs in the harness now that there is
+    // one. The ⚡ mark is derived from the bindings, so a place paused here and
+    // not reported leaves the mark where it was until the app restarts.
+    await harness(
+      "mount",
+      "ConversationCoaches",
+      {},
+      {
+        listCoachAutomationsForSession: [binding("b1", { sessionTitle: "Daily" })],
+        listCoachAutomations: [summary(automation("a1", "Morning briefing"))],
+        listCoachAutomationRuns: [],
+        setCoachAutomationBindingEnabled: binding("b1", { enabled: false })
+      }
+    );
+    await waitFor(
+      () => harness("exists", ".chat-coaches-pill"),
+      "the header chip renders"
+    );
+    await harness("click", ".chat-coaches-pill");
+    await waitFor(
+      () => harness("exists", ".chat-coaches-row-switch input"),
+      "the popover opens with a row in it"
+    );
+    await harness("clearCalls");
+
+    await harness("click", ".chat-coaches-row-switch input");
+    await waitFor(
+      () => harness("callCount", "setCoachAutomationBindingEnabled"),
+      "the place is paused"
+    );
+    await waitFor(
+      () => harness("callCount", "prop:onChanged"),
+      "and the screen around it is told, or the ⚡ mark never moves"
+    );
+    await assertQuietConsole("pausing a place from the popover");
+  }
+
   console.log("coach automation renderer tests passed");
 }
 

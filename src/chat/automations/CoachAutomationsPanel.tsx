@@ -196,6 +196,17 @@ export function CoachAutomationsPanel({
     });
   }, [api, refresh]);
 
+  // 9.1's next-run line is booked by the scheduler on a timer, with no run to
+  // announce it: "Every day at 07:00 · next in 9h" is the one question this
+  // card exists to answer, and a briefing created at lunchtime showed nothing
+  // at all until something unrelated happened to refresh the screen.
+  useEffect(() => {
+    if (!api?.onCoachAutomationBindingUpdate) return;
+    return api.onCoachAutomationBindingUpdate(() => {
+      void refresh();
+    });
+  }, [api, refresh]);
+
   /**
    * A run outlives the click that started it, and the screen that started it:
    * `runCoachAutomationNow` resolves only once the whole fan-out has finished,

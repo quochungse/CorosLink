@@ -24,6 +24,7 @@ import { UnitSystemProvider } from "../../src/units/UnitSystemProvider";
 import { ChatView } from "../../src/chat/ChatView";
 import { CoachAutomationsPanel } from "../../src/chat/automations/CoachAutomationsPanel";
 import { ConversationCoaches } from "../../src/chat/automations/ConversationCoaches";
+import { CoachAutomationDetail } from "../../src/chat/automations/CoachAutomationDetail";
 import type { CorosLinkApi } from "../../src/coroslink-api";
 
 // ---------------------------------------------------------------------------
@@ -120,6 +121,19 @@ const MOUNTS: Record<string, (options: Record<string, unknown>) => ReactElement>
       onChanged={spy("onChanged")}
     />
   ),
+  CoachAutomationDetail: (options) => (
+    <CoachAutomationDetail
+      api={api}
+      automationId={(options.automationId as string | undefined) ?? "a1"}
+      provider="claude-code"
+      initialTab={
+        (options.tab as "definition" | "bindings" | "runs" | undefined) ??
+        "bindings"
+      }
+      onBack={spy("onBack")}
+      onChanged={spy("onChanged")}
+    />
+  ),
   ConversationCoaches: (options) => (
     <ConversationCoaches
       api={api}
@@ -171,6 +185,18 @@ const harness = {
         <UnitSystemProvider>{MOUNTS[name](options)}</UnitSystemProvider>
       </StrictMode>
     );
+  },
+
+  /**
+   * Changes what main would answer from here on, without remounting.
+   *
+   * The point of a push test is that the *main process* changed and the surface
+   * has to notice — so the driver has to be able to move that world between the
+   * mount read and the push. Merged rather than replaced, so a test says only
+   * what it changed.
+   */
+  setScript(patch: Script) {
+    script = { ...script, ...patch };
   },
 
   unmount() {

@@ -616,6 +616,29 @@ export function emitAutomationPauseUpdate(pause: CoachAutomationPause | null): v
 }
 
 /**
+ * A binding whose *rendered* state changed, with no run to carry the news.
+ *
+ * Three writers had no wire at all. The scheduler books a slot on a timer, and
+ * 9.1's "next fires in 9h" line is the one question the card exists to answer —
+ * so a briefing created at lunchtime showed nothing until something unrelated
+ * refreshed the screen. Guard rail 2 disables a binding whose conversation the
+ * athlete deleted, and a `dedicated` binding adopts the conversation it just
+ * rebuilt; both are rendered by the "where it runs" rows, which read once on
+ * mount.
+ *
+ * Deliberately *not* emitted for the clocks nothing renders — `last_run_at`,
+ * the activity watermark, the backoff pair, `threshold_firing`. A push per
+ * binding per run for state no surface shows is the kind of chatter that makes
+ * the next reviewer distrust the ones that matter.
+ */
+export function emitAutomationBindingUpdate(
+  binding: CoachAutomationBinding | null
+): void {
+  if (!binding) return;
+  emitToAnyWindow("coachAutomation:bindingUpdate", binding);
+}
+
+/**
  * Emits to whatever window exists *at emit time*. A run may start, continue or
  * finish with no window at all, so a reference is never captured up front.
  */
@@ -636,10 +659,19 @@ function createDefaultDeps(): CoachAutomationRunnerDeps {
       setCoachAutomationBindingSchedule(bindingId, schedule);
     },
     setBindingSession: (bindingId, sessionId) => {
-      setCoachAutomationBindingSession(bindingId, sessionId);
+      // A `dedicated` binding adopting its rebuilt conversation (2.4): the row
+      // that names it is on screen and has no other way to hear.
+      emitAutomationBindingUpdate(
+        setCoachAutomationBindingSession(bindingId, sessionId)
+      );
     },
     setBindingEnabled: (bindingId, enabled) => {
-      setCoachAutomationBindingEnabled(bindingId, enabled);
+      // Guard rail 2 breaking a binding whose conversation is gone. The run log
+      // says so on the next push; without this the row one tab away goes on
+      // showing the toggle on and no broken marker.
+      emitAutomationBindingUpdate(
+        setCoachAutomationBindingEnabled(bindingId, enabled)
+      );
     },
     listRuns: (filter) => listCoachAutomationRuns(filter),
     listActivitiesAfter: (after, limit) => listCoachActivityRowsAfter(after, limit),
